@@ -1,0 +1,16 @@
+{
+  "deepseek": {
+    "api_key": "sk-你的DeepSeek-Key",
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-chat"
+  },
+  "dashscope": {
+    "api_key": "sk-你的DashScope-Key",
+    "base_url": "https://dashscope.aliyuncs.com/api/v1"
+  },
+  "tencent": {
+    "api_key": "你的腾讯地图Key"
+  }
+}
+
+

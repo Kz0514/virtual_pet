@@ -1,0 +1,13 @@
+# API Keys — mounted as volume, NEVER in image
+api.json
+
+# Python
+__pycache__
+*.pyc
+.venv
+
+# Git
+.git
+
+# Tests
+tests/

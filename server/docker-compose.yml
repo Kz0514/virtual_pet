@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: virtualpet
+      POSTGRES_USER: virtualpet
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U virtualpet"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://virtualpet:${POSTGRES_PASSWORD:-change-me}@127.0.0.1:5432/virtualpet
+      REDIS_URL: redis://127.0.0.1:6379/0
+      SECRET_KEY: ${SECRET_KEY:-change-me}
+      DASHSCOPE_VOICE_ID: ${DASHSCOPE_VOICE_ID:-qwen-audio-3.0-tts-flash}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./api.json:/app/api.json:ro
+      - ./firmware:/app/firmware
+    ports:
+      - "0.0.0.0:8000:8000"
+
+volumes:
+  postgres_data:
+
+

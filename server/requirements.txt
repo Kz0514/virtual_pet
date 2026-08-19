@@ -1,0 +1,46 @@
+# Virtualpet Server Dependencies
+# Python 3.12+
+
+# Web Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# Database
+sqlalchemy[asyncio]>=2.0.30
+asyncpg>=0.29.0
+alembic>=1.13.0
+
+# Redis
+redis>=5.0.0
+celery[redis]>=5.4.0
+
+# Auth
+python-jose[cryptography]>=3.3.0
+passlib>=1.7.4
+
+# HTTP
+httpx>=0.27.0
+requests>=2.31.0
+websockets>=13.0
+
+# Audio processing
+opuslib>=3.0.1
+pydub>=0.25.1
+
+# Data validation
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# AI / LLM clients
+openai>=1.30.0  # For DeepSeek API (OpenAI-compatible)
+dashscope>=1.20.0  # Alibaba Cloud AI services (ASR/TTS)
+
+# Location & Weather
+# (Tencent Map uses HTTP REST; httpx handles it)
+
+# Observability
+structlog>=24.0.0
+
+
+
