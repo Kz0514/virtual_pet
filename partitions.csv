@@ -1,0 +1,26 @@
+# Virtualpet 分区表
+# Flash: 32MB (W25Q256JVEIQ, 0x2000000)
+# ESP32-S3 bootloader: 0x0000-0x8FFF (保留)
+# 无 factory 分区 — 首次烧录直接写入 ota_0
+#
+# 分区概览:
+#   nvs       24KB    WiFi凭据 / 设备Token / 系统设置
+#   otadata   8KB     OTA状态
+#   phy_init  4KB     射频校准
+#   ota_0     1.5MB   当前固件
+#   ota_1     1.5MB   OTA更新槽位
+#   nvskey    16KB    加密密钥
+#   config    880KB   宠物状态 / 用户设置 (FatFS)
+#   diary     1MB     日记 (FatFS)
+#   assets    27MB    动画帧 / 音效 / 字体 / ESP-SR模型 (SPIFFS)
+
+# Name,      Type,    SubType,    Offset,      Size,        Flags
+nvs,         data,    nvs,        0x9000,      0x6000,
+otadata,     data,    ota,        0xf000,      0x2000,
+phy_init,    data,    phy,        0x11000,     0x1000,
+ota_0,       app,     ota_0,      0x20000,     0x180000,
+ota_1,       app,     ota_1,      0x1A0000,    0x180000,
+nvskey,      data,    nvs_keys,   0x320000,    0x4000,
+config,      data,    fat,        0x324000,    0xDC000,
+data,        data,    fat,        0x400000,    0x100000,
+assets,      data,    spiffs,     0x500000,    0x1B00000,
