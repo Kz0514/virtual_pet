@@ -117,3 +117,37 @@ esp_err_t api_client_init(void)
 
 const char *api_client_get_token(void) { return s_token; }
 bool api_client_is_authenticated(void) { return s_token[0] != '\0'; }
+
+/* ── 设备时区查询 (IP 定位 → 服务端换算偏移秒) ── */
+int32_t api_get_timezone_offset(void)
+{
+    if (!api_client_is_authenticated()) return -1;
+
+    char url[640]; /* host + 512B token + 路径, 防 format-truncation */
+    snprintf(url, sizeof(url), "http://%s:%d/api/v1/location/timezone?token=%s",
+             SERVER_HOST, SERVER_PORT, s_token);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .event_handler = http_event_handler,
+        .timeout_ms = 8000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    s_recv_len = 0;
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGW(TAG, "时区查询失败: err=%d status=%d", err, status);
+        return -1;
+    }
+
+    cJSON *root = cJSON_Parse(s_recv_buf);
+    if (!root) { ESP_LOGW(TAG, "时区响应 JSON 解析失败"); return -1; }
+    cJSON *off = cJSON_GetObjectItem(root, "tz_offset_sec");
+    int32_t res = (cJSON_IsNumber(off)) ? (int32_t)off->valuedouble : -1;
+    cJSON_Delete(root);
+    return res;
+}

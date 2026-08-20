@@ -33,9 +33,9 @@
 
 static const char *TAG = "wifi";
 
-/* 存储 */
-#define WIFI_SAVE_FILE      "/data/wifi.json"
-#define WIFI_SAVE_TMP       "/data/wifi.tmp"
+/* 存储 — /cfg (LittleFS 内部分区, 掉电安全; 由 sensor_logger_init 挂载) */
+#define WIFI_SAVE_FILE      "/cfg/wifi.json"
+#define WIFI_SAVE_TMP       "/cfg/wifi.tmp"
 #define WIFI_MAX_NETWORKS   8
 
 /* 旧 NVS 单网络凭据 (仅迁移用) */
@@ -248,7 +248,9 @@ static void load_wifi_list(void)
             save_wifi_list();
             nvs_handle_t rw;
             if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &rw) == ESP_OK) {
-                nvs_erase_all(rw);
+                nvs_erase_key(rw, NVS_KEY_SSID);
+                nvs_erase_key(rw, NVS_KEY_PASS);
+                nvs_erase_key(rw, "backup");   /* 旧版 NVS 兜底键已废弃, 一并清除 */
                 nvs_commit(rw);
                 nvs_close(rw);
             }
@@ -355,6 +357,7 @@ static void dns_task(void *pv)
 static void dns_start(void)
 {
     if (s_dns_task) return;
+    /* 1.0.224: 回退内部栈 — PSRAM 栈在 flash 写冻结窗口被调度即崩 */
     xTaskCreate(dns_task, "dns53", 4096, NULL, 5, &s_dns_task);
 }
 

@@ -10,6 +10,7 @@
 #include "pet_avatar.h"
 #include "wifi_scanner.h"
 #include "memory_store.h"
+#include "life_log.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -43,6 +44,27 @@ static pet_anim_t parse_anim_name(const char *a) {
     else if (strcmp(a, "scratch") == 0)    return PET_ANIM_SCRATCH;
     else if (strcmp(a, "pointself") == 0)  return PET_ANIM_POINTSELF;
     return PET_ANIM_COUNT;
+}
+
+/* get_memory 读盘结果回调 — 写盘任务上下文执行 (仅 socket 发送, 零 flash 访问)。
+ * WS 任务栈在 PSRAM, flash 读期间同样禁用 cache — 任何 flash 访问都会在
+ * PSRAM 栈上 double exception (1.0.213 修了写, 1.0.214 补上读) */
+static void ws_memory_read_cb(const char *content, size_t len, void *arg)
+{
+    char *rid = (char *)arg;
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "type", "memory_data");
+    if (rid && rid[0]) cJSON_AddStringToObject(resp, "req_id", rid);
+    cJSON_AddNumberToObject(resp, "size", (double)len);
+    cJSON_AddStringToObject(resp, "content", content ? content : "");
+    char *json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    if (json) {
+        ESP_LOGI(TAG, "memory_data: %u B (req=%s)", (unsigned)len, rid ? rid : "?");
+        ws_client_send_json(json);
+        cJSON_free(json);
+    }
+    free(rid);   /* 调用方 strdup 的 req_id, 回调上下文释放 */
 }
 
 static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
@@ -108,24 +130,26 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
                 }
                 /* ── get_memory: 服务端工具 /tools.history 拉取完整对话记忆 ── */
                 else if (cJSON_IsString(type) && strcmp(type->valuestring, "get_memory") == 0) {
-                    char *mem = NULL; size_t mem_len = 0;
-                    memory_store_get(&mem, &mem_len);
-                    cJSON *resp = cJSON_CreateObject();
-                    cJSON_AddStringToObject(resp, "type", "memory_data");
+                    /* 读盘委托写盘任务 (回调在写盘任务上下文) — WS 任务栈在
+                     * PSRAM, memory_store_get 的 stat/fopen 同样是 cache 禁用期
+                     * flash 读, 会 double exception (1.0.214 根因) */
                     cJSON *req_id = cJSON_GetObjectItem(root, "req_id");
-                    if (cJSON_IsString(req_id))
-                        cJSON_AddStringToObject(resp, "req_id", req_id->valuestring);
-                    cJSON_AddNumberToObject(resp, "size", (double)mem_len);
-                    cJSON_AddStringToObject(resp, "content", mem ? mem : "");
-                    char *json = cJSON_PrintUnformatted(resp);
-                    cJSON_Delete(resp);
-                    if (json) {
-                        ESP_LOGI(TAG, "memory_data: %u B (req=%s)", (unsigned)mem_len,
-                                 cJSON_IsString(req_id) ? req_id->valuestring : "?");
-                        ws_client_send_json(json);
-                        cJSON_free(json);
+                    char *rid = NULL;
+                    if (cJSON_IsString(req_id) && req_id->valuestring[0])
+                        rid = strdup(req_id->valuestring);   /* 回调上下文释放 */
+                    if (memory_store_read_async(ws_memory_read_cb, rid) != ESP_OK) {
+                        free(rid);
+                        /* 入队失败仍要应答, 否则服务端工具调用挂起 */
+                        cJSON *resp = cJSON_CreateObject();
+                        cJSON_AddStringToObject(resp, "type", "memory_data");
+                        if (cJSON_IsString(req_id))
+                            cJSON_AddStringToObject(resp, "req_id", req_id->valuestring);
+                        cJSON_AddNumberToObject(resp, "size", 0);
+                        cJSON_AddStringToObject(resp, "content", "");
+                        char *json = cJSON_PrintUnformatted(resp);
+                        cJSON_Delete(resp);
+                        if (json) { ws_client_send_json(json); cJSON_free(json); }
                     }
-                    if (mem) free(mem);
                 }
                 /* ── memory_update: 服务端压缩后下发覆盖 ── */
                 else if (cJSON_IsString(type) && strcmp(type->valuestring, "memory_update") == 0) {
@@ -216,9 +240,20 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
                             strcmp(llm_anim->valuestring, "none") != 0)
                             pet_avatar_play(anim);
 
-                        /* 设备端记忆: 追加本轮对话 (flash 写在 TTS 开播前, 不卡音频) */
+                        /* 设备端记忆: 追加本轮对话 (flash 写在 TTS 开播前, 不卡音频)。
+                         * marker 日志: 崩溃定位 — 若停在 mem_append 之后 / TTS 之前,
+                         * 即为 /cfg 写入 (LittleFS) 卡死或 INTWDT 复位点 */
+                        ESP_LOGI(TAG, "chat: memory_store_append…");
                         if (s_last_user_text[0] && clean[0])
                             memory_store_append(s_last_user_text, clean);
+                        ESP_LOGI(TAG, "chat: memory ok → life_log…");
+
+                        /* 全量交互日志 (USB 直读) — 用户原文 + 萝莉丝回复 */
+                        if (s_last_user_text[0])
+                            life_log_line("[主人] %s", s_last_user_text);
+                        if (clean[0])
+                            life_log_line("[萝莉丝] %s", clean);
+                        ESP_LOGI(TAG, "chat: life_log ok → tts…");
 
                         /* 空文本 = 静默模式 (只做动作不说话) */
                         if (tts_text[0]) {
@@ -270,6 +305,15 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
 static void *cjson_psram_malloc(size_t sz) { return heap_caps_malloc(sz, MALLOC_CAP_SPIRAM); }
 
 esp_err_t ws_client_connect(const char *token) {
+    /* 幂等 + 可重建: 组件内置重连只覆盖"已连接后断开", 不覆盖任务创建
+     * 失败 (注册后 "Error create websocket task") — 主循环 30s 周期调用
+     * 本函数重建客户端。已连则直接跳过, 避免误杀正常连接。 */
+    if (s_connected) return ESP_OK;
+    if (s_client) {
+        esp_websocket_client_destroy(s_client);
+        s_client = NULL;
+    }
+    s_connected = false;
     cJSON_InitHooks(&(cJSON_Hooks){ .malloc_fn = cjson_psram_malloc, .free_fn = free });
     char uri[512];
     snprintf(uri, sizeof(uri), "ws://%s:%d/ws/device?token=%s", SERVER_HOST, SERVER_PORT, token);
@@ -279,7 +323,10 @@ esp_err_t ws_client_connect(const char *token) {
         .pingpong_timeout_sec = 10,
         .reconnect_timeout_ms = 10000,
         .network_timeout_ms = 10000,
-        .task_stack = 16384,              /* cJSON + FatFS 记忆追加调用链深, 12KB 会溢出 */
+        /* 调用链深, 12KB 会溢出; 栈实际由 PSRAM 分配 (vendored 组件已改
+         * xTaskCreatePinnedToCoreWithCaps) — 16384 恰好等于
+         * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, 若用普通 malloc 必走内部 RAM */
+        .task_stack = 16384,
     };
     s_client = esp_websocket_client_init(&cfg);
     if (!s_client) return ESP_FAIL;
