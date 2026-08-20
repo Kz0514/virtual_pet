@@ -40,6 +40,9 @@ idf_component_register(
         "app/home_interaction.c"
         "app/sensor_fusion.c"
         "app/diary_mgr.c"
+        "app/life_log.c"
+        "app/diary_sync.c"
+        "app/usb_storage.c"
         "app/config_mgr.c"
         "app/event_bus.c"
         # Network
@@ -48,8 +51,6 @@ idf_component_register(
         "network/api_client.c"
         "network/ota_client.c"
         "network/asset_client.c"
-        "network/bt_pan_manager.c"
-        "network/net_selector.c"
         # AI
         "ai/wake_word.c"
         "ai/prompt_builder.c"
@@ -93,6 +94,7 @@ idf_component_register(
         driver
         esp_lcd
         esp_timer
+        esp_netif
         esp_psram
         spi_flash
         nvs_flash
@@ -103,6 +105,10 @@ idf_component_register(
         app_update
         json
         lvgl
+        esp_lvgl_port
         fatfs
         spiffs
+        esp_littlefs
+        esp_tinyusb
+        usb
 )

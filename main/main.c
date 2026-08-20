@@ -10,6 +10,7 @@
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "esp_check.h"
+#include "esp_ota_ops.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_spiffs.h"
@@ -57,6 +58,11 @@
 #include "home_interaction.h"
 #include "sensor_logger.h"
 #include "memory_store.h"
+#include "time_manager.h"
+#include "diary_mgr.h"
+#include "life_log.h"
+#include "diary_sync.h"
+#include "usb_storage.h"
 #include "esp_http_client.h"
 #include "cJSON.h"
 #include <math.h>
@@ -74,7 +80,9 @@ void main_screen_note_interaction(void);
 void main_restore_home(void)
 {
     if (s_main_scr) {
+        lvgl_port_lock(0);   /* main 线程调 lv_ API 必须持锁 (见 loading_screen.c 注释) */
         lv_scr_load(s_main_scr);
+        lvgl_port_unlock();
         main_screen_note_interaction();
     }
 }
@@ -223,6 +231,22 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "════════ Virtualpet启动 ════════");
 
+    /* 0a. OTA 回滚确认 — 若是 OTA 升级后的首次启动, 立即确认固件有效,
+     * 否则 bootloader 3 秒后 (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y)
+     * 自动回滚旧固件, 升级永远不生效 */
+    {
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        esp_ota_img_states_t ota_state;
+        if (running && esp_ota_get_state_partition(running, &ota_state) == ESP_OK &&
+            ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+                ESP_LOGI(TAG, "OTA 固件已确认 — 回滚取消");
+            } else {
+                ESP_LOGW(TAG, "OTA 固件确认失败");
+            }
+        }
+    }
+
     /* 0. 尽早硬件复位 LCD + 背光默认下拉 — 清除重启前残留画面 */
     {
         /* 背光引脚内部下拉 — 从硬件上电起就是低电平=屏幕不亮,
@@ -286,9 +310,14 @@ void app_main(void)
     /* 3. Display + LVGL + Pet */
     ESP_ERROR_CHECK(st7789_init());
     lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    /* 低于 TTS(6)/WiFi(5) — 不能抢占 TTS 下载; 但要高于一般后台任务,
-     * 否则渲染被抢占会把一次导航的刷屏拖长到多个面板帧 → 撕裂可见度上升 */
+    /* 1.0.223→1.0.224 教训: LVGL 任务栈曾改 PSRAM (1.0.223), 实测进设置页
+     * 即 Double exception — flash 写期间 cache 冻结 (mem_writer 等任务写
+     * memory.txt/FatFS/LittleFS), 冻结窗口内访问 PSRAM 栈 → 双异常。
+     * 高频访问内存 (任务栈/draw buffer) 必须内部 RAM; 1.0.223 的内存地图
+     * 证明 PSRAM 化 + ALWAYSINTERNAL=4096 后内部堆充裕 (boot 150KB),
+     * 回退后仍 ~80KB, 无内存压力 */
     lvgl_cfg.task_priority = 4;
+    lvgl_cfg.task_stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DEFAULT;
     lvgl_port_init(&lvgl_cfg);
 
     /* LVGL FS 驱动已就绪, 加载 SPIFFS 字体 */
@@ -298,11 +327,18 @@ void app_main(void)
         .panel_handle = st7789_get_panel(),
         /* 84 行 = 2×行高(42px): 设置页导航总是相邻两行变化, LVGL 会
          * 合并成一个 84 行脏区 → 单次渲染、单个 SPI 突发刷完,
-         * 两行同帧原子更新 (分片越多, 与面板异步扫描交叉的撕裂机会越多) */
-        .buffer_size  = DISPLAY_WIDTH * 84,
+         * 两行同帧原子更新 (分片越多, 与面板异步扫描交叉的撕裂机会越多)
+         * 1.0.226: 84 → 42 行 (20KB): U盘模式 enter 需内部堆 (1.0.225
+         * 实测运行期内部堆稳态仅 ~19KB, tinyusb install ~13KB 需栈+初始化
+         * 空间), 40KB draw buffer 占死内部堆。42 行 = 1 行高, 导航两行分
+         * 两次 flush (撕裂轻微, 单缓冲本就逐段扫描); 渲染性能损失可接受 */
+        .buffer_size  = DISPLAY_WIDTH * 42,
         .hres = DISPLAY_WIDTH, .vres = DISPLAY_HEIGHT,
         .monochrome = false,
         .rotation = { .swap_xy = true, .mirror_x = false, .mirror_y = true },
+        /* 1.0.224: 去掉 buff_spiram — draw buffer 每帧高频写, flash 写
+         * 冻结窗口内写 PSRAM 缓冲 → 双异常 (1.0.223 实测进设置页即崩);
+         * 40KB 内部堆负担可接受 (boot 后内部堆 ~80KB 空闲) */
         .flags    = { .buff_dma = true, .swap_bytes = true },
     };
     lvgl_port_add_disp(&disp_cfg);
@@ -324,10 +360,13 @@ void app_main(void)
     es8311_drv_pa_set(true);
     noise_detector_init();
 
-    /* data 分区挂载 + 记忆文件 — 必须先于 pet_engine_init
-     * (宠物存档已迁到 /data/pet.json) */
+    /* 存储挂载 (/cfg LittleFS + /data FatFS + 首启搬移) — 必须先于一切文件读写;
+     * life_log 依赖 /data 可用性 (sensor_logger_data_mounted) */
     sensor_logger_init();
+    life_log_init();
     memory_store_init();
+    diary_mgr_init();
+    diary_sync_init();
 
     tm6604_vibrate(70, 100);
     vTaskDelay(pdMS_TO_TICKS(150));
@@ -348,7 +387,10 @@ void app_main(void)
     tap_detector_init();
     pat_detector_init();
 
-    /* ── 初始化完成: 销毁加载界面, 创建真实 UI ── */
+    /* ── 初始化完成: 销毁加载界面, 创建真实 UI ──
+     * 整段持 LVGL 锁: UI 树构建期间若与渲染任务并发, invalidate
+     * 撞上 rendering_in_progress 会断言死循环 (递归锁, 嵌套安全) */
+    lvgl_port_lock(0);
     loading_screen_destroy();
     pet_avatar_init();
     status_bar_init();
@@ -364,6 +406,7 @@ void app_main(void)
 
     /* 连续会话模式 (VAD 半双工多轮对话) */
     session_mgr_init();
+    lvgl_port_unlock();
 
     /* 6. WiFi */
     /* NVS/PHY 校准诊断 — 排查每次开机 "Saving new calibration data" 循环 */
@@ -388,9 +431,14 @@ void app_main(void)
         }
     }
     wifi_manager_init();
+    /* NTP 校时: 须在 esp_netif_init (wifi_manager 内部) 之后启动 SNTP;
+     * 启动即轮询, WiFi 连上后 60s 内自动同步 */
+    ESP_ERROR_CHECK(time_manager_init());
 
     /* 保存主屏幕引用 (供设置等子界面返回时恢复) */
+    lvgl_port_lock(0);
     s_main_scr = lv_scr_act();
+    lvgl_port_unlock();
 
     /* ════ 主循环 ════ */
     ESP_LOGI(TAG, "启动完成.");
@@ -446,12 +494,14 @@ void app_main(void)
                         s_fade_cancel = false;
                         s_fade_active = true;
                         s_screen_dim = true;   /* 标记进入 dim 态 */
+                        lvgl_port_lock(0);   /* main 线程创建 LVGL 定时器须持锁 */
                         lv_timer_t *t = lv_timer_create(fade_tick, FADE_STEP_MS, NULL);
                         if (t) lv_timer_set_repeat_count(t, FADE_STEPS);
+                        lvgl_port_unlock();
                         ESP_LOGI(TAG, "变暗渐变 %u→%u%% (%lus 无操作)",
                                  bri, target, s_dim_after_ms / 1000);
                     } else if (s_screen_dim && idle > pdMS_TO_TICKS(s_off_after_ms)) {
-                        /* 无操作超时 → 线性渐变息屏 (4s) */
+                        /* 无操作超时 → 线性渐变息屏 */
                         uint8_t cur = s_fade_cur;
                         s_fade_cur    = cur;
                         s_fade_target = 0;
@@ -460,8 +510,10 @@ void app_main(void)
                         if (s_fade_step_size < 1) s_fade_step_size = 1;
                         s_fade_cancel = false;
                         s_fade_active = true;
+                        lvgl_port_lock(0);   /* main 线程创建 LVGL 定时器须持锁 */
                         lv_timer_t *t = lv_timer_create(fade_tick, FADE_STEP_MS, NULL);
                         if (t) lv_timer_set_repeat_count(t, FADE_STEPS);
+                        lvgl_port_unlock();
                         ESP_LOGI(TAG, "息屏渐变 %u→0%% (%lus 无操作)",
                                  cur, s_off_after_ms / 1000);
                     }
@@ -481,7 +533,11 @@ void app_main(void)
                     ESP_LOGI(TAG, "设备已认证");
                     ws_client_connect(api_client_get_token());
                     fetch_weather_once();
-                    xTaskCreate(ota_check_task, "ota_task", 16384, NULL, 8, NULL);
+                    /* OTA 检查 — 同步执行 (曾用 xTaskCreate 任务, 但任务在部分启动
+                     * 场景下从未发出 check 请求, 导致 OTA 永不触发; 改为与
+                     * register 同上下文, 行为已被 7 次注册验证可靠) */
+                    ota_client_check_sync();
+                    /* 栈保持内部 RAM — OTA 写 flash (cache 冻结期 PSRAM 栈会崩) */
                     xTaskCreate(asset_update_task, "asset_up", 8192, NULL, 5, NULL);
                 } else {
                     reg_retry_at = now2 + pdMS_TO_TICKS(20000);
@@ -489,6 +545,21 @@ void app_main(void)
                 }
             }
         }
+
+        /* WS 断线兜底: 组件内置重连不覆盖任务创建失败 (注册后
+         * "Error create websocket task"), 未连接时 30s 周期重建客户端 */
+        if (registered && wifi_is_connected() && !ws_client_is_connected()) {
+            static uint32_t ws_retry_at = 0;
+            uint32_t now3 = xTaskGetTickCount();
+            if (now3 >= ws_retry_at) {
+                ws_retry_at = now3 + pdMS_TO_TICKS(30000);
+                ESP_LOGW(TAG, "WS 未连接 — 重建客户端重试");
+                ws_client_connect(api_client_get_token());
+            }
+        }
+
+        /* 设置页"检查更新": 同步执行 (阻塞期间 LVGL 任务照常渲染进度) */
+        ota_client_check_poll();
 
         /* 摇动/敲击检测分发 (home_interaction: 含震动闸门排空与页面级禁用) */
         home_interaction_poll();
@@ -523,7 +594,9 @@ void app_main(void)
             if (have_env && have_bat && memory_store_writes_safe()) {
                 pet_state_t st = pet_engine_get_state();
                 sensor_snapshot_t ss = {
-                    .timestamp   = st.age_seconds,
+                    /* NTP 同步后写真实 Unix 秒, 未同步回退宠物年龄秒 (避免 0 值污染) */
+                    .timestamp   = time_manager_is_synced() ?
+                                   time_manager_get_unix_sec() : st.age_seconds,
                     .temperature = env.temperature,
                     .humidity    = (uint8_t)env.humidity,
                     .ambient_lux = lux,
@@ -532,6 +605,15 @@ void app_main(void)
                 };
                 sensor_logger_append(&ss);
             }
+
+            /* 每日时区拉取 (自动模式 + 24h 节流, 内部判网, 失败保持当前) */
+            time_manager_daily_tz_tick();
+
+            /* 日记 HTML 同步 (首次连接后 + 每 6h, 内部判条件/节流) */
+            diary_sync_tick();
+
+            /* U盘模式: 拔线检测 + 5min 无枚举超时自动退出 */
+            usb_storage_tick();
 
             /* Upload sensor data to server every 30 seconds */
             {
@@ -567,9 +649,10 @@ void app_main(void)
                 static int mem_probe_cnt = 0;
                 if (++mem_probe_cnt >= 15) {
                     mem_probe_cnt = 0;
-                    ESP_LOGI(TAG, "内存: SRAM空闲 %u KB | PSRAM空闲 %u KB "
+                    ESP_LOGI(TAG, "内存: SRAM空闲 %u KB (最大块 %u KB) | PSRAM空闲 %u KB "
                              "(最大块 %u KB) | 主任务栈水位 %u B",
                              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
                              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
                              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
                              (unsigned)uxTaskGetStackHighWaterMark(NULL));

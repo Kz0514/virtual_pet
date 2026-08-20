@@ -1,7 +1,10 @@
 ## Virtualpet Main Component Dependencies
+# 说明: esp_lvgl_port / esp_tinyusb 含本地补丁 (内部 DMA / 任务栈),
+# 已 vendored 到 components/ (跟随 git), 不在托管列表; 其裸依赖
+# (lvgl, tinyusb) 仍由组件管理器解析
 dependencies:
   lvgl/lvgl: "^9.5.0"
-  espressif/esp_lvgl_port: "^2.4.0"
   espressif/esp_websocket_client: "^1.0"
   espressif/esp_codec_dev: "^1.6.2"
   espressif/esp-sr: "^2.4.6"
+  espressif/esp_littlefs: "^1.9.0"
