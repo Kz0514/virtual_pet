@@ -100,6 +100,41 @@ async def network_location(
     return result
 
 
+# ── 5b. 设备时区 (IP 定位缓存 → Open-Meteo 换算) ──
+@router.get("/timezone")
+async def device_timezone(device: Device = Depends(get_current_device)):
+    """
+    设备时区偏移 (秒)。用 _device_location 缓存的 lat/lng 查 Open-Meteo
+    的 timezone 接口 (免费无 key); 无缓存/查询失败 → 兜底 +8 (东八区)。
+    固件每日拉取一次; 腾讯网络定位仅覆盖中国 (恒 +8), 此换算用于
+    通用场景, 失败兜底保证不阻塞。
+    """
+    from app.services.tool_service import get_device_location
+    tz_offset = 28800
+    loc = get_device_location(str(device.id))
+    if loc and loc.get("lat") and loc.get("lng"):
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": loc["lat"],
+                        "longitude": loc["lng"],
+                        "timezone": "auto",
+                        "current": "temperature_2m",
+                    },
+                )
+                if r.status_code == 200:
+                    tz = (r.json() or {}).get("timezone") or {}
+                    off = tz.get("utc_offset_seconds")
+                    if off is not None:
+                        tz_offset = int(off)
+        except Exception:
+            pass
+    return {"tz_offset_sec": tz_offset, "auto": True}
+
+
 # ── 5. 静态图 ──
 @router.get("/static_map")
 async def static_map(

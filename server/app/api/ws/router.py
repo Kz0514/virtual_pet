@@ -99,6 +99,15 @@ async def device_ws(websocket: WebSocket, token: str = Query("")):
                     cache_sensor(device_id, context)
                 mem_summary = msg.get("mem_summary", "")
                 mem_size = msg.get("mem_size", 0)
+                if mem_summary:
+                    # 重要历史落库 — 压缩态摘要即服务端素材 (覆盖为最新)
+                    try:
+                        from app.services.memory_service import upsert_device_memory
+                        async with AsyncSessionLocal() as db:
+                            await upsert_device_memory(db, str(device_id), mem_summary)
+                            await db.commit()
+                    except Exception as e:
+                        logger.warning(f"Memory upsert fail: {e}")
 
                 async def _chat_impl():
                     """Process chat in background so WS loop can handle scan_result etc."""

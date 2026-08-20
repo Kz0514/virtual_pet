@@ -286,6 +286,16 @@ async def tool_history(device_id: str, params: dict | None = None) -> str:
         new_content = await compact_memory(content)
         if new_content:
             await send_to_device(device_id, {"type": "memory_update", "content": new_content})
+            # 重要历史落库 — 供夜间日记生成作素材 (失败不阻断对话)
+            try:
+                from app.core.database import AsyncSessionLocal
+                from app.services.memory_service import upsert_device_memory
+                async with AsyncSessionLocal() as db:
+                    await upsert_device_memory(db, device_id, new_content)
+                    await db.commit()
+                logger.info(f"Important memory saved for {device_id[:8]}")
+            except Exception as e:
+                logger.warning(f"Memory save fail: {e}")
             return new_content
         logger.warning("Memory compaction failed — returning raw content")
     return content or json.dumps({"_hint": "设备记忆为空"}, ensure_ascii=False)

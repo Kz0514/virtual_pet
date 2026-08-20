@@ -45,8 +45,28 @@ services:
     volumes:
       - ./api.json:/app/api.json:ro
       - ./firmware:/app/firmware
+      - ./doodles:/app/doodles
     ports:
       - "0.0.0.0:8000:8000"
+
+  worker:
+    build: .
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://virtualpet:${POSTGRES_PASSWORD:-change-me}@127.0.0.1:5432/virtualpet
+      REDIS_URL: redis://127.0.0.1:6379/0
+      SECRET_KEY: ${SECRET_KEY:-change-me}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./api.json:/app/api.json:ro
+      - ./doodles:/app/doodles
+    command: ["celery", "-A", "app.core.celery_app", "worker", "--beat", "-l", "INFO"]
 
 volumes:
   postgres_data:

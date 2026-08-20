@@ -14,6 +14,7 @@ alembic>=1.13.0
 # Redis
 redis>=5.0.0
 celery[redis]>=5.4.0
+tzdata>=2024.1  # IANA 时区数据 — Celery beat 的 Asia/Shanghai 调度解析需要
 
 # Auth
 python-jose[cryptography]>=3.3.0
@@ -35,6 +36,9 @@ pydantic-settings>=2.3.0
 # AI / LLM clients
 openai>=1.30.0  # For DeepSeek API (OpenAI-compatible)
 dashscope>=1.20.0  # Alibaba Cloud AI services (ASR/TTS)
+
+# Image processing
+pillow>=10.0.0  # Doodle grid 裁剪 (Qwen-Image 批量贴纸图 → 单张小图)
 
 # Location & Weather
 # (Tencent Map uses HTTP REST; httpx handles it)

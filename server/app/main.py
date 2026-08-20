@@ -45,6 +45,11 @@ UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
+# Doodles directory for diary drawings (Qwen-Image 涂鸦)
+DOODLE_DIR = os.path.join(os.path.dirname(__file__), "..", "doodles")
+os.makedirs(DOODLE_DIR, exist_ok=True)
+app.mount("/doodles", StaticFiles(directory=DOODLE_DIR), name="doodles")
+
 # Register API routers
 app.include_router(v1_router, prefix="/api/v1")
 app.include_router(ws_router, prefix="/ws")

@@ -17,6 +17,7 @@ except (FileNotFoundError, json.JSONDecodeError):
 
 _deepseek = _api_keys.get("deepseek", {})
 _dashscope = _api_keys.get("dashscope", {})
+_dashscope_doodle = _api_keys.get("dashscope_doodle", {})
 _tencent = _api_keys.get("tencent", {})
 
 
@@ -48,9 +49,15 @@ class Settings(BaseSettings):
     deepseek_base_url: str = _deepseek.get("base_url", "https://api.deepseek.com/v1")
     deepseek_model: str = _deepseek.get("model", "deepseek-chat")
 
-    # ── DashScope (ASR + TTS) ──
+    # ── DashScope (ASR + TTS) — ws 实例 ──
     dashscope_api_key: str = _dashscope.get("api_key", "")
     dashscope_base_url: str = _dashscope.get("base_url", "https://dashscope.aliyuncs.com/api/v1")
+
+    # ── DashScope 涂鸦 (Qwen-Image, token-plan 专属实例 + 独立 key) ──
+    doodle_enabled: bool = _dashscope_doodle.get("enabled", False)  # 总开关 (网格效果待调优, 默认关)
+    doodle_api_key: str = _dashscope_doodle.get("api_key", "")
+    doodle_base_url: str = _dashscope_doodle.get("base_url",
+        "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1")
 
     # ── Tencent Map (from api.json or env var) ──
     tencent_api_key: str = _tencent.get("api_key", "")

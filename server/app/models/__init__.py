@@ -42,6 +42,8 @@ class Device(Base):
                                      cascade="all, delete-orphan")
     diary_entries    = relationship("DiaryEntry", back_populates="device",
                                      cascade="all, delete-orphan")
+    memory           = relationship("DeviceMemory", back_populates="device",
+                                     uselist=False, cascade="all, delete-orphan")
 
 
 class Pet(Base):
@@ -114,6 +116,21 @@ class DiaryEntry(Base):
     __table_args__ = (
         UniqueConstraint("device_id", "entry_date"),
     )
+
+
+class DeviceMemory(Base):
+    """设备端记忆压缩结果 (重要历史) — 服务端落库, 供日记生成作素材.
+
+    每次设备端记忆超限压缩后 upsert (device_id 主键, 覆盖为最新摘要);
+    未压缩过的设备无此行 — 此时近三天对话已由 conversations 表覆盖。
+    """
+    __tablename__ = "device_memories"
+
+    device_id  = Column(UUID, ForeignKey("devices.id"), primary_key=True)
+    content    = Column(Text, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    device     = relationship("Device", back_populates="memory")
 
 
 class Firmware(Base):
