@@ -84,9 +84,9 @@ static void set_face(pet_face_t f) {
     }
 }
 
-/* ── 存档 (/data/pet.json — 不再写 NVS, 减轻 24KB NVS 磨损) ── */
-#define SAVE_FILE "/data/pet.json"
-#define SAVE_TMP  "/data/pet.tmp"
+/* ── 存档 (/cfg/pet.json — LittleFS 内部分区, 掉电安全; 不再写 NVS) ── */
+#define SAVE_FILE "/cfg/pet.json"
+#define SAVE_TMP  "/cfg/pet.tmp"
 #define NVS_NS    "pet"      /* 仅用于旧存档一次性迁移 */
 #define NVS_KEY   "state"
 

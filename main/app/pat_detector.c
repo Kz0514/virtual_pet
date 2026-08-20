@@ -5,6 +5,7 @@
  * 按在中间任一电极即可, 无时长门槛. LVGL 定时器 20ms 轮询, 保证
  * 200ms 释放判定精度 (触摸扫描本身 50Hz). */
 #include "pat_detector.h"
+#include "diary_mgr.h"
 #include "touch_fpc.h"
 #include "pet_avatar.h"
 #include "pet_engine.h"
@@ -42,6 +43,7 @@ static void poll_cb(lv_timer_t *t)
             pet_avatar_play_fast(PET_ANIM_PATHEAD);
             /* 养成联动: 摸头即时反馈, 按住期间每 2s 再触发一次 */
             pet_engine_trigger(PET_EVENT_TOUCH);
+            diary_mgr_note_event(DIARY_EVENT_PETTING);  /* 日记互动上报 (3s 节流在内部) */
             s_last_engine_tick = now;
         } else if (pet_avatar_get_current() != PET_ANIM_PATHEAD) {
             /* 被 LLM 等其他来源换掉的动画 — 按住期间夺回控制权 */

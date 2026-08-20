@@ -40,9 +40,7 @@ static uint32_t   s_bucket_t0[NOISE_WIN_COUNT]; /* 每个桶的开始时间戳 *
 static bool       s_ready = false;
 
 /* ── CSV 文件路径 ── */
-#define NOISE_CSV_PATH  "/data/noise.csv"
-
-static FILE *s_csv = NULL;
+#define NOISE_CSV_PATH  "/cfg/noise.csv"
 
 static uint32_t now_sec(void) {
     struct timeval tv;
@@ -130,6 +128,7 @@ static void noise_task(void *pv) {
 void noise_detector_init(void) {
     memset(s_buckets, 0, sizeof(s_buckets));
     memset(s_bucket_t0, 0, sizeof(s_bucket_t0));
+    /* 栈保持内部 RAM — 本任务写 noise.csv (flash 写期间 cache 冻结) */
     xTaskCreate(noise_task, "noise", 8192, NULL, 1, NULL);
     ESP_LOGI(TAG, "噪音检测器就绪 (级联%d层)", NOISE_WIN_COUNT);
 }
@@ -175,12 +174,12 @@ void noise_detector_write_csv(void) {
     }
     if (!any) return;
 
-    /* data 分区不再开机擦除, CSV 会跨开机增长 — 超 256KB 重开 (丢弃旧数据) */
+    /* CSV 会跨开机增长 — 超 256KB 重开 (丢弃旧数据) */
     struct stat st;
-    if (stat("/data/noise.csv", &st) == 0 && st.st_size > 256 * 1024)
-        remove("/data/noise.csv");
+    if (stat(NOISE_CSV_PATH, &st) == 0 && st.st_size > 256 * 1024)
+        remove(NOISE_CSV_PATH);
 
-    FILE *f = fopen("/data/noise.csv", "a");
+    FILE *f = fopen(NOISE_CSV_PATH, "a");
     if (!f) return;
 
     uint32_t now = now_sec();

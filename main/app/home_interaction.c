@@ -8,6 +8,8 @@
  * poll 只排空检测器事件不产生反应, 手势事件直接忽略。
  */
 #include "home_interaction.h"
+#include "diary_mgr.h"
+#include "life_log.h"
 #include "shake_detector.h"
 #include "tap_detector.h"
 #include "tm6604.h"
@@ -79,6 +81,7 @@ void home_interaction_poll(void)
         pet_engine_trigger(hard ? PET_EVENT_HARD_SHAKE : PET_EVENT_SHAKE);
         /* 本地即时反馈: 摇动 → 兴奋动画 */
         pet_avatar_play_fast(PET_ANIM_EXCITED);
+        life_log_line("摇晃 %.2fg (%s)", se.magnitude_g, hard ? "重" : "轻");
         if (ws_client_is_connected()) {
             char evt[160];
             snprintf(evt, sizeof(evt),
@@ -102,6 +105,7 @@ void home_interaction_poll(void)
         /* 本地即时反馈: 敲击不震动(防自激), 改播动画 + 空闲时短句 */
         pet_avatar_play_fast(te.count >= 2 ? PET_ANIM_EXCITED : PET_ANIM_BLUSH);
         maybe_local_phrase();
+        life_log_line("敲击 x%u", te.count);
         if (ws_client_is_connected()) {
             char evt[128];
             snprintf(evt, sizeof(evt),
@@ -127,6 +131,7 @@ void home_interaction_on_gesture(gesture_event_t ev)
     case GESTURE_PETTING_HEAD:
         main_screen_note_interaction();
         pet_engine_trigger(PET_EVENT_TOUCH);
+        diary_mgr_note_event(DIARY_EVENT_PETTING);
         break;
 
     case GESTURE_VOICE_TRIGGER: {
@@ -136,6 +141,7 @@ void home_interaction_on_gesture(gesture_event_t ev)
         ESP_LOGI(TAG, "Voice trigger!");
         main_screen_note_interaction();
         pet_engine_trigger(PET_EVENT_VOICE);
+        diary_mgr_note_event(DIARY_EVENT_VOICE);
         session_mgr_enter();   /* 进入连续会话; 会话中 = 打断进聆听 */
         break;
     }
