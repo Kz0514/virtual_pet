@@ -4,6 +4,7 @@
  */
 #include "loading_screen.h"
 #include "font_loader.h"
+#include "esp_lvgl_port.h"
 #include "esp_log.h"
 #include "lvgl.h"
 
@@ -21,6 +22,9 @@ static lv_obj_t *s_spinner = NULL;
 esp_err_t loading_screen_init(void)
 {
     ESP_LOGI(TAG, "创建加载界面…");
+    /* main 线程调 lv_ API 必须持 LVGL 递归锁: 否则与渲染任务并发,
+     * invalidate 撞上 rendering_in_progress 触发断言死循环 (WDT 复位) */
+    lvgl_port_lock(0);
 
     s_scr = lv_obj_create(NULL);   /* 独立 screen */
     lv_obj_set_style_bg_color(s_scr, C_DARK, 0);
@@ -41,6 +45,7 @@ esp_err_t loading_screen_init(void)
     lv_obj_align(s_label, LV_ALIGN_CENTER, 0, 65);
 
     lv_scr_load(s_scr);
+    lvgl_port_unlock();
     ESP_LOGI(TAG, "加载界面已显示");
     return ESP_OK;
 }
@@ -48,6 +53,7 @@ esp_err_t loading_screen_init(void)
 void loading_screen_destroy(void)
 {
     if (s_scr) {
+        lvgl_port_lock(0);
         /* 先切到默认屏幕, 再异步删除 — 避免 LVGL 刷新周期访问已释放对象 */
         lv_obj_t *main_scr = lv_scr_act();
         if (main_scr == s_scr) {
@@ -61,6 +67,7 @@ void loading_screen_destroy(void)
         s_scr = NULL;
         s_label = NULL;
         s_spinner = NULL;
+        lvgl_port_unlock();
         ESP_LOGI(TAG, "加载界面已销毁 (async)");
     }
 }

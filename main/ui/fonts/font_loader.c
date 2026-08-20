@@ -46,6 +46,8 @@ void font_loader_init(void) {
     /* 暂停 TWDT, 在 CPU1 解析 (避免阻塞 CPU0 IDLE) */
     esp_task_wdt_deinit();
     TaskHandle_t task_h = NULL;
+    /* 1.0.224: 回退内部栈 — 任何任务栈在 flash 写冻结窗口被调度都会
+     * 因 PSRAM 栈访问双异常 (1.0.223 实测), 与任务自身是否写 flash 无关 */
     xTaskCreatePinnedToCore(load_task, "fontld", 16384, a, 1, &task_h, 1);
 
     if (task_h) {

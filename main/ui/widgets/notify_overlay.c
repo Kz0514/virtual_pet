@@ -62,7 +62,9 @@ static void poll_cb(lv_timer_t *t) {
     lv_obj_remove_flag(s_label, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_opa(s_label, LV_OPA_COVER, 0);
 
-    if (s_fade_timer) lv_timer_delete(s_fade_timer);
+    /* 删除后必须置空 — 曾漏置空导致二次删除已释放定时器
+     * (连点"检查更新"→ 悬空指针 → lv_free_core 崩溃重启) */
+    if (s_fade_timer) { lv_timer_delete(s_fade_timer); s_fade_timer = NULL; }
     if (s_auto_ms > 0) {
         s_fade_timer = lv_timer_create(fade_out, s_auto_ms, NULL);
         lv_timer_set_repeat_count(s_fade_timer, 1);
@@ -70,7 +72,9 @@ static void poll_cb(lv_timer_t *t) {
 }
 
 void notify_overlay_init(void) {
-    s_label = lv_label_create(lv_screen_active());
+    /* 挂显示器顶层 (display 级 top layer, 跨屏常驻) — 曾用 lv_screen_active()
+     * 导致提示只在主界面可见, 设置页里看不到 */
+    s_label = lv_label_create(lv_layer_top());
     lv_label_set_long_mode(s_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_label, 150);
     lv_obj_set_pos(s_label, 4, 132);   /* 上调 — 不挡底部对话框 */

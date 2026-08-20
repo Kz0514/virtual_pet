@@ -7,7 +7,9 @@
  */
 #pragma once
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
+#include "notify_overlay.h"   /* notify_type_t — 设置页提示框复用同类型 */
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,6 +36,11 @@ void settings_screen_input(settings_event_t ev);
 
 /** 注册"退出设置"回调 (根页 BACK 时调用; input_handler 负责切回主页) */
 void settings_screen_set_close_cb(void (*cb)(void));
+
+/** 设置页内嵌提示框 (1.0.227): OTA 检查等设置页操作的结果提示。
+ * 挂设置页 screen, 离开设置页即不可见 — 替代全局 notify_overlay
+ * (全局 overlay 仅保留主页/对话场景)。线程安全: 任意任务可调用 */
+void settings_screen_notify(notify_type_t type, const char *text, uint32_t auto_hide_ms);
 
 #ifdef __cplusplus
 }
