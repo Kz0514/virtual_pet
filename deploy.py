@@ -47,13 +47,17 @@ def poll_build_done(ssh):
     return False
 
 # ── Create tar in memory ──
+EXCLUDE_DIRS = {".venv", "__pycache__", ".git", "uploads", "firmware"}
 print("=== Creating archive...")
 buf = io.BytesIO()
 with tarfile.open(fileobj=buf, mode='w:gz') as tar:
     for root, dirs, files in os.walk(SERVER_DIR):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
         for f in files:
             if f in ("api.json", ".env"):
                 continue  # NEVER overwrite server's api.json / .env
+            if f.endswith(".pyc"):
+                continue
             full = os.path.join(root, f)
             arcname = os.path.relpath(full, SERVER_DIR).replace('\\', '/')
             tar.add(full, arcname=arcname)
