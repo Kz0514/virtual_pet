@@ -14,7 +14,8 @@
 static const char *TAG = "config";
 
 #define CFG_NS       "settings"
-#define CFG_MAX_KEYS 8
+/* 现有 4 键 + 时区 3 (tz_auto/tz_manual_sec/tz_last) + 日记 2 (diary_day/diary_cnt) */
+#define CFG_MAX_KEYS 12
 #define CFG_KEY_LEN  16   /* NVS 键上限 15 + '\0' */
 
 typedef struct {

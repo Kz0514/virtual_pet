@@ -113,9 +113,16 @@ CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 
 # FAT Filesystem
 CONFIG_WL_SECTOR_SIZE=4096
+# TinyUSB MSC (U盘模式): 逻辑扇区 4096 与 WL 对齐, FIFO 必须 ≥ 扇区大小
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=4096
 # 长文件名必须开 — LFN_NONE 只支持 8.3 格式 (扩展名最长 3 字符),
 # "wifi.json"/"pet.json" 的 4 字符扩展名会被 FR_INVALID_NAME 拒绝 (errno=22)
 CONFIG_FATFS_LFN_HEAP=y
+# 关 per-file 缓存 (_FS_TINY=1): FIL 不再内嵌 4KB 扇区缓冲 —
+# esp_vfs_fat_register_cfg 一次 ctx 分配从 ~39KB (8 文件 × 4.2KB) 降到 ~6KB,
+# 运行数小时后堆碎片化时格式化不再因 ESP_ERR_NO_MEM 失败 (1.0.217)
+# CONFIG_FATFS_PER_FILE_CACHE is not set
 
 # SPIFFS (page_size=1024 for 27MB partition; 256 only addresses 16MB)
 CONFIG_SPIFFS_CACHE=y
@@ -129,9 +136,16 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 # 主任务跑 esp_http_client 天气请求 + cJSON, 默认 3584 栈实测仅余 312B
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 
-# Bluetooth (for PAN)
-CONFIG_BT_ENABLED=y
-CONFIG_BT_BLUEDROID_ENABLED=y
-CONFIG_BT_CLASSIC_ENABLED=y
-CONFIG_BT_PAN_ENABLED=y
-CONFIG_BT_BLE_ENABLED=y
+# NTP 校时 (time_manager): 双服务器 + 60s 重试 (默认 1h 首轮失败等太久)
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
+CONFIG_LWIP_SNTP_UPDATE_DELAY=60000
+
+# 事件循环任务栈 2304→4096: GOT_IP 处理链 (lwip/netif + LittleFS 写盘) 曾越界砸坏相邻堆块 (1.0.204 间歇 panic)
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# U盘卷标 (f_setlabel — Windows 磁盘名显示)
+CONFIG_FATFS_USE_LABEL=y
+
+# 中断看门狗 300→1000→2000ms: 聊天回复路径存在 >1000ms 关中断窗口 (INTWDT 曾误杀重启; 定位中)
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=2000
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
