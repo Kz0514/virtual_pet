@@ -22,6 +22,13 @@ esp_err_t usb_storage_exit(void);
 /** 主循环 2s 节拍: 拔线检测 (曾枚举后断开) + 从未枚举 5min 超时自动退出 */
 void usb_storage_tick(void);
 
+/** : 充电状态驱动禁睡 (用户方案) — main 任务电池块每秒调用,
+ * charging = 判据 (main.c): soc≥100 (满电停充耗电为负, 电流不可靠) ||
+ * current_ma ≥ -5mA (非满电充电中)。charging → U盘模式下持
+ * NO_LIGHT_SLEEP 锁; 拔线 (非满电放电) → 30s 宽限后释放 → 恢复轻睡。
+ * 开关常开不再永久禁睡。幂等, 跨任务安全 (内部 spinlock)。 */
+void usb_storage_set_charging(bool charging);
+
 /** 请求格式化 /data (需 APP 态): 写 NVS 标志 → esp_restart → boot 整区擦除
  * → 组件自动格式化。不在运行时碰 FatFS (1.0.216-217 NO_MEM + 悬垂崩溃教训) */
 esp_err_t usb_storage_request_format(void);
