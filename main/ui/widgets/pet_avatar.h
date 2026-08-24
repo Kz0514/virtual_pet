@@ -16,30 +16,35 @@ extern "C" {
 
 /* ── 帧描述符 (与 manifest.h 中的 anim_frame_t 对应) ── */
 typedef struct {
-    uint8_t  frame_idx;      /* 帧池中的序号 */
-    uint16_t duration_ms;    /* 此帧持续时间 (0=使用默认FPS) */
-    uint8_t  loop_back;      /* 子循环回跳步数 (0=正常; N=回跳N帧到循环起点) */
-    uint8_t  loop_extra;     /* 额外循环次数 (总次数=1+loop_extra) */
+    uint8_t frame_idx;    /* 帧池中的序号 */
+    uint16_t duration_ms; /* 此帧持续时间 (0=使用默认FPS) */
+    uint8_t loop_back;    /* 子循环回跳步数 (0=正常; N=回跳N帧到循环起点) */
+    uint8_t loop_extra;   /* 额外循环次数 (总次数=1+loop_extra) */
 } avatar_frame_t;
 
 /* ── 动画序列 ID ── */
 typedef enum {
-    PET_ANIM_IDLE,       /* 待机 zhanli */
-    PET_ANIM_HAPPY,      /* 开心 gaoxingjiangjie */
-    PET_ANIM_SAD,        /* 难过 (复用zhanli) */
-    PET_ANIM_EXCITED,    /* 兴奋 baoxiongshuohua */
-    PET_ANIM_SLEEPY,     /* 困倦 shuijiao */
-    PET_ANIM_EATING,     /* 吃东西 e */
-    PET_ANIM_SURPRISED,  /* 惊讶 dunzhe */
-    PET_ANIM_BLUSH,      /* 害羞 miantianxiao */
-    PET_ANIM_PATHEAD,    /* 摸头 motou */
-    PET_ANIM_SCRATCH,    /* 挠头 naotou */
-    PET_ANIM_POINTSELF,  /* 指着自己 zhizheziji */
+    PET_ANIM_IDLE,      /* 待机 zhanli */
+    PET_ANIM_HAPPY,     /* 开心 gaoxingjiangjie */
+    PET_ANIM_SAD,       /* 难过 (复用zhanli) */
+    PET_ANIM_EXCITED,   /* 兴奋 baoxiongshuohua */
+    PET_ANIM_SLEEPY,    /* 困倦 shuijiao */
+    PET_ANIM_EATING,    /* 吃东西 e */
+    PET_ANIM_SURPRISED, /* 惊讶 dunzhe */
+    PET_ANIM_BLUSH,     /* 害羞 miantianxiao */
+    PET_ANIM_PATHEAD,   /* 摸头 motou */
+    PET_ANIM_SCRATCH,   /* 挠头 naotou */
+    PET_ANIM_POINTSELF, /* 指着自己 zhizheziji */
     PET_ANIM_COUNT
 } pet_anim_t;
 
 /** 初始化动画系统 */
 esp_err_t pet_avatar_init(void);
+
+/** 1.0.248: boot 预加载常用动画 (摸头) — 内部堆充足期加载进 PSRAM
+ * 池, 首次播放缓存命中零延迟 (实测首次摸头卡 = 内部堆枯竭期读缓冲
+ * 分配阻塞, 见 PROJECT_MAP 已知问题 #7) */
+void pet_avatar_preload(void);
 
 /** 切换到指定动画序列 */
 void pet_avatar_play(pet_anim_t anim);
@@ -67,6 +72,13 @@ void pet_avatar_play_fast(pet_anim_t anim);
 
 /** 当前正在播放的动画 */
 pet_anim_t pet_avatar_get_current(void);
+
+/** 暂停帧定时器 (息屏降载): 动画冻结在当前帧, LVGL 不再回调
+ * (背景帧加载/动画请求同步挂起; 帧数据在 PSRAM 不掉电, 无内容丢失) */
+void pet_avatar_pause(void);
+
+/** 恢复帧定时器 (亮屏): 从暂停位置继续, 无跳帧; 未初始化/未暂停时安全 */
+void pet_avatar_resume(void);
 
 #ifdef __cplusplus
 }
