@@ -23,13 +23,13 @@
 
 static const char *TAG = "diary_mgr";
 
-#define CFG_KEY_DAY  "diary_day"   /* 今日 YYYYMMDD */
-#define CFG_KEY_CNT  "diary_cnt"   /* 今日互动计数 */
-#define THROTTLE_MS  3000          /* 同事件最小间隔 (防 pat_detector 刷爆) */
+#define CFG_KEY_DAY "diary_day" /* 今日 YYYYMMDD */
+#define CFG_KEY_CNT "diary_cnt" /* 今日互动计数 */
+#define THROTTLE_MS 3000        /* 同事件最小间隔 (防 pat_detector 刷爆) */
 
-static uint32_t s_day = 0;      /* 当前缓存的 YYYYMMDD, 0=未知 */
-static uint32_t s_cnt = 0;      /* RAM 计数 (NVS 写受限时的可靠源) */
-static uint32_t s_last[2];      /* 每事件上次上报 tick */
+static uint32_t s_day = 0; /* 当前缓存的 YYYYMMDD, 0=未知 */
+static uint32_t s_cnt = 0; /* RAM 计数 (NVS 写受限时的可靠源) */
+static uint32_t s_last[2]; /* 每事件上次上报 tick */
 
 static const char *s_ev_name[] = {"petting", "voice"};
 
@@ -40,9 +40,7 @@ static uint32_t today_stamp(void)
     time_t t = (time_t)time_manager_get_unix_sec();
     struct tm tm;
     localtime_r(&t, &tm);
-    return (uint32_t)(tm.tm_year + 1900) * 10000
-         + (uint32_t)(tm.tm_mon + 1) * 100
-         + (uint32_t)tm.tm_mday;
+    return (uint32_t)(tm.tm_year + 1900) * 10000 + (uint32_t)(tm.tm_mon + 1) * 100 + (uint32_t)tm.tm_mday;
 }
 
 static void persist(void)

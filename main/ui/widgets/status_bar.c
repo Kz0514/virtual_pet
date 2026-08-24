@@ -3,6 +3,7 @@
  * @brief 顶部状态栏 — WiFi + 电池, FontAwesome 图标
  */
 #include "status_bar.h"
+#include "board.h"
 #include "esp_log.h"
 #include "lvgl.h"
 #include "src/font/lv_symbol_def.h"
@@ -14,27 +15,37 @@ static lv_obj_t *s_wifi_label;
 static lv_obj_t *s_bat_label;
 static lv_timer_t *s_timer;
 
-static volatile bool    s_wifi_connected;
+static volatile bool s_wifi_connected;
 static volatile uint8_t s_bat_pct;
-static volatile bool    s_dirty = true;
+static volatile bool s_dirty = true;
 
-static void update_timer_cb(lv_timer_t *t) {
+static void update_timer_cb(lv_timer_t *t)
+{
     if (!s_dirty) return;
     s_dirty = false;
 
     lv_label_set_text(s_wifi_label, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_color(s_wifi_label,
-        s_wifi_connected ? lv_color_hex(0xFFFFFF) : lv_color_hex(0xFF4444), 0);
+                                s_wifi_connected ? lv_color_hex(0xFFFFFF) : lv_color_hex(0xFF4444), 0);
 
     const char *baticon = LV_SYMBOL_BATTERY_FULL;
-    if      (s_bat_pct < 10) baticon = LV_SYMBOL_BATTERY_EMPTY;
-    else if (s_bat_pct < 35) baticon = LV_SYMBOL_BATTERY_1;
-    else if (s_bat_pct < 60) baticon = LV_SYMBOL_BATTERY_2;
-    else if (s_bat_pct < 85) baticon = LV_SYMBOL_BATTERY_3;
+    if (s_bat_pct < 10)
+        baticon = LV_SYMBOL_BATTERY_EMPTY;
+    else if (s_bat_pct < 35)
+        baticon = LV_SYMBOL_BATTERY_1;
+    else if (s_bat_pct < 60)
+        baticon = LV_SYMBOL_BATTERY_2;
+    else if (s_bat_pct < 85)
+        baticon = LV_SYMBOL_BATTERY_3;
     lv_label_set_text(s_bat_label, baticon);
+    /* 低电量红色告警 — 与写盘闸同阈值 (BATTERY_CRITICAL_THRESHOLD_PCT, 5%) */
+    bool crit = s_bat_pct < BATTERY_CRITICAL_THRESHOLD_PCT;
+    lv_obj_set_style_text_color(s_bat_label,
+                                crit ? lv_color_hex(0xFF4444) : lv_color_hex(0xFFFFFF), 0);
 }
 
-void status_bar_init(void) {
+void status_bar_init(void)
+{
     /* 无背景容器 — 图标直接放在屏幕右上角 */
 
     /* WiFi — 距右 30px, 垂直居中于 24px 状态栏高度 */
@@ -57,12 +68,14 @@ void status_bar_init(void) {
     ESP_LOGI(TAG, "状态栏就绪");
 }
 
-void status_bar_set_wifi(bool connected, int8_t rssi) {
+void status_bar_set_wifi(bool connected, int8_t rssi)
+{
     s_wifi_connected = connected;
     s_dirty = true;
 }
 
-void status_bar_set_battery(uint8_t pct, uint16_t voltage_mv) {
+void status_bar_set_battery(uint8_t pct, uint16_t voltage_mv)
+{
     s_bat_pct = pct;
     s_dirty = true;
 }

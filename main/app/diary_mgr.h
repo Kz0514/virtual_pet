@@ -16,8 +16,8 @@ extern "C" {
 #endif
 
 typedef enum {
-    DIARY_EVENT_PETTING = 0,   /* 摸头 */
-    DIARY_EVENT_VOICE,         /* 语音会话 */
+    DIARY_EVENT_PETTING = 0, /* 摸头 */
+    DIARY_EVENT_VOICE,       /* 语音会话 */
 } diary_event_t;
 
 /** 初始化 (依赖 config_mgr_init / time_manager_init 已执行) */

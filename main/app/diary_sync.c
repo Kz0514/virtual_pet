@@ -30,22 +30,24 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static const char *TAG = "diary_sync";
 
-#define SYNC_INTERVAL_S     (6 * 3600)     /* 同步节流 6h (成功后) */
-#define RETRY_INTERVAL_S    (10 * 60)      /* 失败重试 10min (服务端未就绪/断网) */
-#define LIST_CAP            (64 * 1024)    /* 列表 JSON 上限 (31 篇 × ~700B) */
-#define HTML_CAP            (192 * 1024)   /* 单篇 HTML 上限 (含涂鸦 b64) */
-#define HTTP_TIMEOUT_MS     10000
-#define DIARY_DIR           "/data/diary"
-#define MAX_FILES           30
-#define MAX_TOTAL_BYTES     (512 * 1024)
+#define SYNC_INTERVAL_S (6 * 3600) /* 同步节流 6h (成功后) */
+#define RETRY_INTERVAL_S (10 * 60) /* 失败重试 10min (服务端未就绪/断网) */
+#define LIST_CAP (64 * 1024)       /* 列表 JSON 上限 (31 篇 × ~700B) */
+#define HTML_CAP (192 * 1024)      /* 单篇 HTML 上限 (含涂鸦 b64) */
+#define HTTP_TIMEOUT_MS 10000
+#define DIARY_DIR "/data/diary"
+#define MAX_FILES 30
+#define MAX_TOTAL_BYTES (512 * 1024)
 
 static TaskHandle_t s_task = NULL;
-static bool         s_busy = false;        /* 任务执行中 (tick 不再触发) */
-static bool         s_first_done = false;
-static uint32_t     s_next_run = 0;        /* unix 秒 */
+static bool s_busy = false; /* 任务执行中 (tick 不再触发) */
+static bool s_first_done = false;
+static uint32_t s_next_run = 0; /* unix 秒 */
 
 /* ── HTTP GET → PSRAM 动态缓冲 (响应可至 ~200KB) ── */
 typedef struct {
@@ -68,8 +70,11 @@ static esp_err_t get_handler(esp_http_client_event_t *evt)
 static char *http_get(const char *url, size_t cap)
 {
     char *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
-    if (!buf) { ESP_LOGE(TAG, "缓冲分配失败 (%uB)", (unsigned)cap); return NULL; }
-    get_ctx_t ctx = { buf, cap, 0 };
+    if (!buf) {
+        ESP_LOGE(TAG, "缓冲分配失败 (%uB)", (unsigned)cap);
+        return NULL;
+    }
+    get_ctx_t ctx = {buf, cap, 0};
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -79,7 +84,10 @@ static char *http_get(const char *url, size_t cap)
         .timeout_ms = HTTP_TIMEOUT_MS,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) { free(buf); return NULL; }
+    if (!client) {
+        free(buf);
+        return NULL;
+    }
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
@@ -103,7 +111,7 @@ static void enforce_quota(void)
     char oldest[288] = {0};
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
-        if (e->d_name[0] == '.') continue;             /* README 之外的点文件 */
+        if (e->d_name[0] == '.') continue; /* README 之外的点文件 */
         size_t n = strlen(e->d_name);
         if (n < 5 || strcmp(e->d_name + n - 5, ".html") != 0) continue;
         count++;
@@ -169,10 +177,16 @@ static bool run_sync(void)
 
     cJSON *root = cJSON_Parse(list_json);
     free(list_json);
-    if (!root) { ESP_LOGW(TAG, "列表 JSON 解析失败"); return false; }
+    if (!root) {
+        ESP_LOGW(TAG, "列表 JSON 解析失败");
+        return false;
+    }
 
     cJSON *entries = cJSON_GetObjectItem(root, "entries");
-    if (!cJSON_IsArray(entries)) { cJSON_Delete(root); return false; }
+    if (!cJSON_IsArray(entries)) {
+        cJSON_Delete(root);
+        return false;
+    }
 
     int n = cJSON_GetArraySize(entries);
     ESP_LOGI(TAG, "本月 %d 篇日记", n);
@@ -184,9 +198,10 @@ static bool run_sync(void)
 
     cJSON *it;
     int synced = 0;
-    cJSON_ArrayForEach(it, entries) {
-        cJSON *id     = cJSON_GetObjectItem(it, "id");
-        cJSON *edate  = cJSON_GetObjectItem(it, "entry_date");
+    cJSON_ArrayForEach(it, entries)
+    {
+        cJSON *id = cJSON_GetObjectItem(it, "id");
+        cJSON *edate = cJSON_GetObjectItem(it, "entry_date");
         if (!cJSON_IsString(id) || !cJSON_IsString(edate)) continue;
 
         /* 文件名 = 日期; 已存在跳过 (USB 删文件可强制刷新) */
@@ -200,18 +215,21 @@ static bool run_sync(void)
                  SERVER_HOST, SERVER_PORT, id->valuestring,
                  api_client_get_token());
         char *html = http_get(html_url, HTML_CAP);
-        if (!html) continue;   /* 单篇失败不阻断整体 */
+        if (!html) continue; /* 单篇失败不阻断整体 */
 
         wait_tts_idle();
-        if (!memory_store_writes_safe()) { free(html); continue; }
+        if (!memory_store_writes_safe()) {
+            free(html);
+            continue;
+        }
 
         /* tmp+rename 原子写 — 断电不产生半个文件 */
         snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-        FILE *f = fopen(tmp, "wb");
-        if (f) {
+        int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY);
+        if (fd >= 0) {
             size_t len = strlen(html);
-            if (fwrite(html, 1, len, f) == len) {
-                fclose(f);
+            if (write(fd, html, len) == (ssize_t)len) {
+                close(fd);
                 if (rename(tmp, path) == 0) {
                     ESP_LOGI(TAG, "已同步 %s (%u B)", path, (unsigned)len);
                     synced++;
@@ -219,7 +237,7 @@ static bool run_sync(void)
                     remove(tmp);
                 }
             } else {
-                fclose(f);
+                close(fd);
                 remove(tmp);
             }
         }
@@ -229,7 +247,7 @@ static bool run_sync(void)
 
     enforce_quota();
     ESP_LOGI(TAG, "同步完成: 新 %d 篇 (共 %d)", synced, n);
-    return true;   /* 列表拉取成功 → 按 6h 节流; 失败才 10min 重试 */
+    return true; /* 列表拉取成功 → 按 6h 节流; 失败才 10min 重试 */
 }
 
 static void diary_sync_task(void *arg)
@@ -240,8 +258,7 @@ static void diary_sync_task(void *arg)
         bool ok = run_sync();
         s_busy = false;
         s_first_done = true;
-        s_next_run = (uint32_t)time_manager_get_unix_sec()
-                     + (ok ? SYNC_INTERVAL_S : RETRY_INTERVAL_S);
+        s_next_run = (uint32_t)time_manager_get_unix_sec() + (ok ? SYNC_INTERVAL_S : RETRY_INTERVAL_S);
     }
 }
 

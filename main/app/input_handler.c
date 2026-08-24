@@ -21,6 +21,7 @@
 #include "home_interaction.h"
 #include "gesture_detect.h"
 #include "settings_screen.h"
+#include "diary_screen.h"
 #include "config_mgr.h"
 #include "pat_detector.h"
 #include "tap_detector.h"
@@ -38,9 +39,9 @@ static app_page_t s_page = APP_PAGE_HOME;
 static uint32_t s_settings_open_tick = 0;
 
 /* 选择逻辑模式 (NVS "nav_mode", 设置页可调):
- *   0 = 点击: 右滑条轻点上/下半段选择; 顶条轻点左半区=返回/右半区=确认
- *             (顶条左右滑动作为超集保留)
- *   1 = 滑动: 右滑条上/下滑动选择; 顶条左滑=确认/右滑=返回
+ * 0 = 点击: 右滑条轻点上/下半段选择; 顶条轻点左半区=返回/右半区=确认
+ * (顶条左右滑动作为超集保留)
+ * 1 = 滑动: 右滑条上/下滑动选择; 顶条左滑=确认/右滑=返回
  * 左键单击=确认 恒成立。每事件读取 (config_mgr 有 RAM 缓存, 开销可忽略)。
  * 默认 1 (滑动) — 历史默认 0 点击, 但 NVS 擦除后默认值静默改变交互方式,
  * 曾导致用户滑动无反应 (2026-08-20 实报)。 */
@@ -69,15 +70,15 @@ void input_handler_set_page(app_page_t page)
     s_page = page;
 
     if (page == APP_PAGE_SETTINGS) {
-        gesture_set_menu_active(true);      /* 左键单击=确认(零延迟), 双击退出取消 */
-        gesture_reset_taps();               /* 开门的双击不得拼进设置页的按键序列 */
-        pat_detector_set_enabled(false);    /* 导航电极与摸头电极物理重叠 */
-        tap_detector_suppress(false);       /* 清亮度条 busy 可能遗留的抑制 */
+        gesture_set_menu_active(true);   /* 左键单击=确认(零延迟), 双击退出取消 */
+        gesture_reset_taps();            /* 开门的双击不得拼进设置页的按键序列 */
+        pat_detector_set_enabled(false); /* 导航电极与摸头电极物理重叠 */
+        tap_detector_suppress(false);    /* 清亮度条 busy 可能遗留的抑制 */
         shake_detector_suppress(false);
-        home_interaction_set_enabled(false);/* 摇动/敲击只排空不反应 */
+        home_interaction_set_enabled(false); /* 摇动/敲击只排空不反应 */
     } else {
         gesture_set_menu_active(false);
-        gesture_reset_taps();               /* 回主页同样防跨页拼击 */
+        gesture_reset_taps(); /* 回主页同样防跨页拼击 */
         pat_detector_set_enabled(true);
         home_interaction_set_enabled(true);
     }
@@ -93,10 +94,21 @@ app_page_t input_handler_get_page(void)
     return s_page;
 }
 
+/* ── 设置路由: 日记页打开时事件优先注入日记, 否则设置页 ──
+ * 日记是挂在设置页上的独立 screen (设置页保持存活), BACK 到列表根
+ * 再按一次即 destroy 自身并切回设置页, 此后自动回落设置路由。 */
+static void route_settings(settings_event_t sev)
+{
+    if (diary_screen_is_active())
+        diary_screen_input(sev);
+    else
+        settings_screen_input(sev);
+}
+
 /* ── 手势事件路由 (LVGL 定时器上下文) ── */
 static void on_gesture_event(gesture_event_t ev)
 {
-    app_page_t page = input_handler_get_page();   /* 先对账 */
+    app_page_t page = input_handler_get_page(); /* 先对账 */
 
     switch (ev) {
     case GESTURE_WAKE_SCREEN:
@@ -136,41 +148,41 @@ static void on_gesture_event(gesture_event_t ev)
     case GESTURE_SWIPE_RIGHT:
         if (page == APP_PAGE_SETTINGS && settings_screen_is_active()) {
             /* 打开冷却: 吞掉开门双击可能遗留的尾击 */
-            if ((uint32_t)(lv_tick_get() - s_settings_open_tick)
-                < SETTINGS_OPEN_COOLDOWN_MS) {
+            if ((uint32_t)(lv_tick_get() - s_settings_open_tick) < SETTINGS_OPEN_COOLDOWN_MS) {
                 break;
             }
-            main_screen_note_interaction();   /* 操作中保持常亮 */
+            main_screen_note_interaction(); /* 操作中保持常亮 */
             bool tap = nav_mode_is_tap();
             switch (ev) {
-            case GESTURE_SINGLE_TAP:                        /* 左键确认恒成立 */
-                settings_screen_input(SETTINGS_EV_CONFIRM);
+            case GESTURE_SINGLE_TAP: /* 左键确认恒成立 */
+                route_settings(SETTINGS_EV_CONFIRM);
                 break;
-            case GESTURE_NAV_UP:                            /* 点击模式: 选择 */
-                if (tap) settings_screen_input(SETTINGS_EV_UP);
+            case GESTURE_NAV_UP: /* 点击模式: 选择 */
+                if (tap) route_settings(SETTINGS_EV_UP);
                 break;
             case GESTURE_NAV_DOWN:
-                if (tap) settings_screen_input(SETTINGS_EV_DOWN);
+                if (tap) route_settings(SETTINGS_EV_DOWN);
                 break;
-            case GESTURE_NAV_SLIDE_UP:                      /* 滑动模式: 选择 */
-                if (!tap) settings_screen_input(SETTINGS_EV_UP);
+            case GESTURE_NAV_SLIDE_UP: /* 滑动模式: 选择 */
+                if (!tap) route_settings(SETTINGS_EV_UP);
                 break;
             case GESTURE_NAV_SLIDE_DOWN:
-                if (!tap) settings_screen_input(SETTINGS_EV_DOWN);
+                if (!tap) route_settings(SETTINGS_EV_DOWN);
                 break;
-            case GESTURE_TOP_TAP_LEFT:                      /* 点击模式: 返回 */
-                if (tap) settings_screen_input(SETTINGS_EV_BACK);
+            case GESTURE_TOP_TAP_LEFT: /* 点击模式: 返回 */
+                if (tap) route_settings(SETTINGS_EV_BACK);
                 break;
-            case GESTURE_TOP_TAP_RIGHT:                     /* 点击模式: 确认 */
-                if (tap) settings_screen_input(SETTINGS_EV_CONFIRM);
+            case GESTURE_TOP_TAP_RIGHT: /* 点击模式: 确认 */
+                if (tap) route_settings(SETTINGS_EV_CONFIRM);
                 break;
-            case GESTURE_SWIPE_RIGHT:                       /* 两模式均可: 返回 */
-                settings_screen_input(SETTINGS_EV_BACK);
+            case GESTURE_SWIPE_RIGHT: /* 两模式均可: 返回 */
+                route_settings(SETTINGS_EV_BACK);
                 break;
-            case GESTURE_SWIPE_LEFT:                        /* 两模式均可: 确认 */
-                settings_screen_input(SETTINGS_EV_CONFIRM);
+            case GESTURE_SWIPE_LEFT: /* 两模式均可: 确认 */
+                route_settings(SETTINGS_EV_CONFIRM);
                 break;
-            default: break;
+            default:
+                break;
             }
         }
         break;
