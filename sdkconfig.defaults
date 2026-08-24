@@ -68,26 +68,36 @@ CONFIG_LV_FS_STDIO_CACHE_SIZE=4096
 CONFIG_LV_USE_FS_MEMFS=y
 CONFIG_LV_FS_MEMFS_LETTER=77
 
-# WiFi
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+# WiFi — 2026-08-23 内部堆健康化 (v1.0.246 24→16, v1.0.249 16→8): 削减收发缓冲池
+# 内部堆 boot 105KB → ~57s 枯竭 (wifi 驱动 50-70KB + 缓冲池常驻/峰值),
+# 导致 WS 任务创建失败 / ASR socket OOM / lwIP 信号量 OOM / fopen abort (locks.c:77)
+# / newlib 锁分配 abort (1.0.248 实崩: 任务首次 printf 时锁 lazy 分配需内部堆)。
+# 本项目负载 (TTS ~64kbps + HTTP 小请求) 远低于 WiFi 极限, 减池无感。
+# 1.0.249: 动态 rx/tx 16→8 再回收 ~25KB — 目标是内部堆保持 >8KB 连续块,
+# esp_flash 读的 8KB 内部 DMA 缓冲可分配 (否则动画帧读 0x101 失败, 首帧卡)。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_TX_BUFFER_TYPE=DYNAMIC
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
 
-# LWIP
+# LWIP — 同上: 本项目同时 ≤8 socket (WS 1 + HTTP 2-3), 窗口 32KB 对流媒体足够
 CONFIG_ESP_HTTP_CLIENT_EVENT_HANDLER=y
-# 激进门户探测(手机并发大量连接)会耗尽 16 个 socket — ESP-AT 官方建议调大
-CONFIG_LWIP_MAX_SOCKETS=32
+CONFIG_LWIP_MAX_SOCKETS=8
 CONFIG_LWIP_TCP_MSS=1440
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
-CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
 
 # PSRAM 任务栈 (TTS/会话任务栈放外部 RAM, 防内部 RAM 碎片化)
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 
 # mbedTLS
+# 2026-08-23 (v1.0.247): 全部 TLS 上下文挪 PSRAM — WS 长连接常驻
+# ~40KB mbedTLS 缓冲 (IN/OUT 16KB×2 + ctx) 此前吃内部堆, 1.0.246 健康化
+# 省的 30-40KB 被它抵消 (67s 内部堆仍 1KB); EXTERNAL_MEM_ALLOC 后
+# 握手缓冲走 PSRAM, 内部堆省 ~40KB, 性能影响无感 (本项目负载低)
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
@@ -133,8 +143,20 @@ CONFIG_SPIFFS_USE_MTIME=y
 # FreeRTOS
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
-# 主任务跑 esp_http_client 天气请求 + cJSON, 默认 3584 栈实测仅余 312B
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+# 主任务跑 esp_http_client 天气请求 + cJSON, 默认 3584 栈实测仅余 312B;
+# 6144 曾不够: f_mkfs 建卷路径 (SPIFFS 挂载后自动建 FAT) 栈溢出重启循环
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Power management — 轻睡眠 (v1, 2026-08-22):
+# esp_pm_configure 在 power_manager_init 运行时使能 (v5.5 默认 light_sleep=false)
+CONFIG_PM_ENABLE=y
+CONFIG_PM_SLP_IRAM_OPT=y              # 轻睡代码入 IRAM, 每次入睡省 ~310µs
+CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y     # 进出轻睡日志 (调试期, 稳定后可关)
+# USB Serial/JTAG 连接时持 NO_LIGHT_SLEEP 锁禁睡 (v2, 2026-08-22):
+# S3 硬件限制: USJ 在 light sleep 下无法工作 (Kconfig 帮助明示) — 轻睡开时插 USB
+# 必断枚举 (v2.2/2.3/2.4 三次复现, 与 WiFi 无关)。连接监视器 40ms 无 SOF 判断开
+# 后释放锁 → 拔 USB 后轻睡恢复可用 = 平时电池省电, 插 USB 调试稳定。
+CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 
 # NTP 校时 (time_manager): 双服务器 + 60s 重试 (默认 1h 首轮失败等太久)
 CONFIG_LWIP_SNTP_MAX_SERVERS=2
@@ -149,3 +171,12 @@ CONFIG_FATFS_USE_LABEL=y
 # 中断看门狗 300→1000→2000ms: 聊天回复路径存在 >1000ms 关中断窗口 (INTWDT 曾误杀重启; 定位中)
 CONFIG_ESP_INT_WDT_TIMEOUT_MS=2000
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_LV_USE_LIBWEBP=y
+
+# v2.8 诊断: vTaskList 任务延迟探针 (定位轻睡被谁霸占; 稳定后移除)
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+
+# 1.0.265: WS send 独立 tx_lock — 播放期大音频帧 recv 持 client->lock 等 payload,
+# 敲击事件 send (同锁) 撞锁丢事件 (实测 "Could not lock within 100 timeout" 刷屏)
+CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y

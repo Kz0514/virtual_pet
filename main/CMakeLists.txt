@@ -62,6 +62,7 @@ idf_component_register(
         "ui/screens/boot_screen.c"
         "ui/screens/settings_screen.c"
         "ui/screens/diary_screen.c"
+        "ui/screens/screen_switch.c"
         "ui/screens/ota_screen.c"
         # UI Fonts (zh.c 已移除, 运行时从 SPIFFS 加载)
         "ui/fonts/font_loader.c"
@@ -105,6 +106,7 @@ idf_component_register(
         app_update
         json
         lvgl
+        libwebp
         esp_lvgl_port
         fatfs
         spiffs

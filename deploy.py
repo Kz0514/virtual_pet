@@ -6,9 +6,36 @@ import os
 import sys
 import time
 
-HOST = os.environ.get("VPS_HOST", "virtualpet.top")
-USER = os.environ.get("VPS_USER", "root")
+def _cred_from_project_map():
+    """凭据不入命令行 — 从仓库内 PROJECT_MAP.md 读取 (密码不入 git 日志/进程列表).
+    格式: "服务器: <IP>, 用户名 <user>, 密码 `xxx`" — 字节级正则 (ASCII-only 源码)."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    import re
+    try:
+        with open(os.path.join(base, "PROJECT_MAP.md"), "rb") as f:
+            data = f.read()
+        host = user = pwd = ""
+        m = re.search(rb"\d+\.\d+\.\d+\.\d+", data)
+        if m:
+            host = m.group(0).decode()
+        m = re.search("用户名".encode("utf-8") + rb"\s*([^,\s]+)", data)
+        if m:
+            user = m.group(1).decode("utf-8", "replace")
+        m = re.search("密码".encode("utf-8") + rb"\s*[`]([^`\r\n]+)[`]", data)
+        if m:
+            pwd = m.group(1).decode("utf-8", "replace")
+        return host or "virtualpet.top", user or "root", pwd or ""
+    except OSError:
+        return "virtualpet.top", "root", ""
+
+HOST = os.environ.get("VPS_HOST", "")
+USER = os.environ.get("VPS_USER", "")
 PASS = os.environ.get("VPS_PASSWORD", "")
+if not HOST or not PASS:
+    _h, _u, _p = _cred_from_project_map()
+    HOST = HOST or _h
+    USER = USER or _u
+    PASS = PASS or _p
 REMOTE_DIR = "/opt/virtualpet-server"
 SERVER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server")
 BUILD_LOG = "/tmp/vps_build.log"

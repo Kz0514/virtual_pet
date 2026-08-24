@@ -1,0 +1,17 @@
+# 项目代码风格(2026-08-23 定稿, 防止 IDE 格式化偏离原版):
+# 控制流 if/while/for { 同行; 函数/struct { 独立行; 4 空格/层; 不折行。
+# 等价配置验证自 HEAD 原版 (tts_client.c / ws_client.c / main.c)。
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 0
+SortIncludes: false
+AllowShortIfStatementsOnASingleLine: true
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+  AfterControlStatement: false
+  AfterStruct: false
+  AfterEnum: false
+  BeforeElse: false
+  BeforeCatch: false
+SpaceAfterCStyleCast: false

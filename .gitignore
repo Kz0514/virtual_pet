@@ -60,6 +60,38 @@ build/
 *.bin
 # SPIFFS 动画帧资源例外 — 上传仓库，克隆即可烧录
 !spiffs/*.bin
+# 模拟器独立资源 (动画包 anims.bin) — 与实机资源分离, 克隆即可运行模拟器
+!simulator/spiffs/*.bin
+# 本机便利脚本 (硬编码 IDF/COM 路径) — 不入库
+/build_new.bat
+/flash_app.bat
+/flash_assets.bat
+/flash_new.bat
+# 架构图 (drawio, 不入库)
+/docs/
+# vendored lvgl: 只入库编译必需 (src + env_support/cmake), 其余本地保留不入库
+components/lvgl/tests/
+components/lvgl/demos/
+components/lvgl/examples/
+components/lvgl/docs/
+components/lvgl/scripts/
+components/lvgl/configs/
+components/lvgl/libs/
+components/lvgl/zephyr/
+components/lvgl/env_support/cmsis-pack/
+components/lvgl/env_support/pikascript/
+components/lvgl/env_support/qnx/
+components/lvgl/env_support/rt-thread/
+components/lvgl/CHECKSUMS.json
+components/lvgl/CMakePresets.json
+components/lvgl/COPYRIGHTS.md
+components/lvgl/SConscript
+components/lvgl/component.mk
+components/lvgl/library.json
+components/lvgl/library.properties
+components/lvgl/lv_version.h.in
+components/lvgl/lvgl.mk
+components/lvgl/lvgl.pc.in
 *.elf
 *.map
 flasher_args.json # Generated in build directory

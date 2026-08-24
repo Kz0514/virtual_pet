@@ -6,7 +6,8 @@
 只能在此窗口用 esptool --before usb_reset 抢入下载模式完成烧录/擦除。
 
 用法:
-    python tools/race_flash.py            # 等端口出现 → 全量烧录 (bootloader/分区/app/资源)
+    python tools/race_flash.py            # 等端口出现 → 烧录 bootloader/分区/app (默认不含资源)
+    python tools/race_flash.py --assets   # 附带烧录资源包 (assets.bin 27.6MB, 慢, 仅动画资源变更时)
     python tools/race_flash.py --erase    # 等端口出现 → 仅擦除 flash
     python tools/race_flash.py --port COM7  # 指定已知端口 (跳过等待)
 
@@ -33,6 +34,7 @@ def find_esp_port():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--erase", action="store_true", help="只擦除 flash, 不烧录")
+    ap.add_argument("--assets", action="store_true", help="附带烧录资源包 (默认不烧, 27.6MB 太慢)")
     ap.add_argument("--port", help="已知端口则跳过等待直接执行")
     args = ap.parse_args()
 
@@ -53,13 +55,15 @@ def main():
     if args.erase:
         cmd.append("erase_flash")
     else:
-        cmd += ["write_flash",     # esptool v4: --flash_mode 等是 write_flash 子命令的选项
-                "--flash_mode", "dio", "--flash_size", "32MB", "--flash_freq", "80m",
-                "0x0",      "build/bootloader/bootloader.bin",
-                "0x8000",   "build/partition_table/partition-table.bin",
-                "0xf000",   "build/ota_data_initial.bin",
-                "0x20000",  "build/Virtualpet.bin",
-                "0x500000", "build/assets.bin"]
+        write = ["write_flash",   # esptool v4: --flash_mode 等是 write_flash 子命令的选项
+                 "--flash_mode", "dio", "--flash_size", "32MB", "--flash_freq", "80m",
+                 "0x0",      "build/bootloader/bootloader.bin",
+                 "0x8000",   "build/partition_table/partition-table.bin",
+                 "0xf000",   "build/ota_data_initial.bin",
+                 "0x20000",  "build/Virtualpet.bin"]
+        if args.assets:
+            write += ["0x5a4000", "build/assets.bin"]
+        cmd += write
     r = subprocess.run(cmd, cwd=PROJ)
     print(f"[race] 完成 rc={r.returncode} — 设备将重启进入新固件" if r.returncode == 0
           else f"[race] 失败 rc={r.returncode} — 可重试, 或检查设备是否已复位")
