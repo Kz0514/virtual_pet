@@ -3,7 +3,7 @@
  * @brief 连续会话模式 — 半双工多轮语音对话
  *
  * 状态机: IDLE →(进入)→ LISTENING(300ms 底噪校准 + VAD, 10s 窗口)
- *   → RECORDING(录至静音 800ms, 最短 300ms, 最长 15s)
+ *   → RECORDING(录至静音 600ms, 最短 300ms, 最长 15s)
  *   → ASR(只上传人声段)→ WS chat("思考中"通知)→ PLAYING(等 TTS 播完 +1s)
  *   → LISTENING → … ; 聆听窗口无语音 → IDLE("下次再聊~")
  *
@@ -24,6 +24,7 @@
 #include "noise_detector.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_pm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -31,23 +32,23 @@
 
 static const char *TAG = "sess";
 
-#define SAMPLE_RATE    48000
-#define BLOCK_MS       20
-#define BLOCK_SAMPLES  (SAMPLE_RATE * BLOCK_MS / 1000)     /* 960 */
+#define SAMPLE_RATE 48000
+#define BLOCK_MS 20
+#define BLOCK_SAMPLES (SAMPLE_RATE * BLOCK_MS / 1000) /* 960 */
 
-#define CALIBRATE_MS     300      /* 底噪校准时长 */
-#define LISTEN_WINDOW_MS 10000    /* 每次聆听窗口 */
-#define MAX_RECORD_MS    15000    /* 单段录音上限 */
-#define MIN_SPEECH_MS    300      /* 最短人声 (更短丢弃) */
-#define SILENCE_END_MS   800      /* 静音判定止点 */
-#define PRE_SPEECH_MS    300      /* 起点往前补的字头 */
+#define CALIBRATE_MS 300       /* 底噪校准时长 */
+#define LISTEN_WINDOW_MS 10000 /* 每次聆听窗口 */
+#define MAX_RECORD_MS 15000    /* 单段录音上限 */
+#define MIN_SPEECH_MS 300      /* 最短人声 (更短丢弃) */
+#define SILENCE_END_MS 600     /* 静音判定止点 (延迟优化 1.0.25x: 800→600, 每轮省 0.2s) */
+#define PRE_SPEECH_MS 300      /* 起点往前补的字头 */
 
-#define LOOKBACK_SAMPLES (SAMPLE_RATE * 2)   /* 2s 回看 */
-#define REC_MAX_SAMPLES  (SAMPLE_RATE * MAX_RECORD_MS / 1000)
+#define LOOKBACK_SAMPLES (SAMPLE_RATE * 2) /* 2s 回看 */
+#define REC_MAX_SAMPLES (SAMPLE_RATE * MAX_RECORD_MS / 1000)
 
 typedef enum {
     SESS_IDLE,
-    SESS_LISTENING,     /* 含底噪校准 */
+    SESS_LISTENING, /* 含底噪校准 */
     SESS_RECORDING,
     SESS_ASR,
     SESS_WAIT_REPLY,
@@ -58,13 +59,17 @@ static volatile sess_state_t s_state = SESS_IDLE;
 static volatile bool s_enter_req = false;
 static TaskHandle_t s_task = NULL;
 
-static int16_t *s_lookback = NULL;   /* 2s 回看环形 (PSRAM, 192KB) */
-static uint32_t  s_lb_wr = 0;
-static int16_t *s_rec = NULL;        /* 录音缓冲 (PSRAM, 1.44MB) */
-static uint32_t  s_rec_len = 0;
-static float     s_start_thr = 0.0125f;   /* VAD 起点阈值 (截断上限) */
-static float     s_stop_thr  = 0.0075f;   /* VAD 止点阈值 */
-static int16_t   s_block[BLOCK_SAMPLES];
+/* 会话期 PM 锁 — 聆听/录音期间轻睡冻结 I2S DMA 会丢语音 (2026-08-22 电源管理 v1);
+ * 粗粒度: 整个会话 (聆听+录音+等待+播放) 持锁, 播放期 tts 锁已覆盖, 双锁嵌套安全 */
+static esp_pm_lock_handle_t s_pm_lock = NULL;
+
+static int16_t *s_lookback = NULL; /* 2s 回看环形 (PSRAM, 192KB) */
+static uint32_t s_lb_wr = 0;
+static int16_t *s_rec = NULL; /* 录音缓冲 (PSRAM, 1.44MB) */
+static uint32_t s_rec_len = 0;
+static float s_start_thr = 0.0125f; /* VAD 起点阈值 (截断上限) */
+static float s_stop_thr = 0.0075f;  /* VAD 止点阈值 */
+static int16_t s_block[BLOCK_SAMPLES];
 
 static void sess_set_state(sess_state_t st)
 {
@@ -114,15 +119,16 @@ static float block_rms(const int16_t *data, uint32_t samples)
  * 不影响最小值); 聆听期间麦克风本来就在采样, 顺手自适应 —
  * 环境变安静后阈值自动下调, 环境变吵后 2s 内跟上.
  * 初始值用环境噪音检测器读数播种 (不受敲击等瞬态污染). */
-#define FLOOR_WIN_BLOCKS 100   /* 2s @20ms */
+#define FLOOR_WIN_BLOCKS 100 /* 2s @20ms */
 
 static float s_rms_win[FLOOR_WIN_BLOCKS];
-static int   s_rms_idx = 0;
-static bool  s_floor_seeded = false;   /* 窗口只在会话开始播种一次, 跨轮保持 */
+static int s_rms_idx = 0;
+static bool s_floor_seeded = false; /* 窗口只在会话开始播种一次, 跨轮保持 */
 
 static void floor_window_reset(float seed)
 {
-    for (int i = 0; i < FLOOR_WIN_BLOCKS; i++) s_rms_win[i] = seed;
+    for (int i = 0; i < FLOOR_WIN_BLOCKS; i++)
+        s_rms_win[i] = seed;
     s_rms_idx = 0;
 }
 
@@ -159,7 +165,7 @@ static void wait_playback(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     while (tts_client_is_busy())
         vTaskDelay(pdMS_TO_TICKS(100));
-    vTaskDelay(pdMS_TO_TICKS(1000));   /* 播完 +1s 再回聆听 */
+    vTaskDelay(pdMS_TO_TICKS(1000)); /* 播完 +1s 再回聆听 */
 }
 
 /* 300ms 麦克风预填 — 回看缓冲装满当前音频 (防起点补字头时夹带旧数据),
@@ -170,7 +176,10 @@ static void prefill_lookback(void)
     s_lb_wr = 0;
     for (int i = 0; i < CALIBRATE_MS / BLOCK_MS; i++) {
         int n = es8311_drv_read(s_block, BLOCK_SAMPLES);
-        if (n <= 0) { vTaskDelay(pdMS_TO_TICKS(BLOCK_MS)); continue; }
+        if (n <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(BLOCK_MS));
+            continue;
+        }
         int got = n / sizeof(int16_t);
         lb_push(s_block, got);
         floor_window_push(block_rms(s_block, got));
@@ -183,18 +192,25 @@ static void prefill_lookback(void)
 static void sess_task(void *pv)
 {
     while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   /* 等待进入 */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY); /* 等待进入 */
         if (!s_enter_req) continue;
         s_enter_req = false;
 
         ESP_LOGI(TAG, "会话开始");
         stop_tts_and_silence();
 
+        /* 会话期禁轻睡 (聆听/录音连续读 I2S) — 会话结束段释放;
+         * 只占 RX (聆听/录音不需要 TX; v1.2: open DAC 会 enable TX
+         * 播放残留数据 → 异响; 播放由 tts 自己 full hold, 嵌套计数) */
+        if (!s_pm_lock) esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "sess", &s_pm_lock);
+        if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock);
+        es8311_drv_hold_rx();
+
         /* 底噪窗口播种 (仅会话开始一次, 之后跨轮自适应保持) */
         if (!s_floor_seeded) {
             float seed = (float)noise_detector_get_level() / 100.0f;
             if (seed < 0.005f) seed = 0.005f;
-            if (seed > 0.35f)  seed = 0.35f;
+            if (seed > 0.35f) seed = 0.35f;
             floor_window_reset(seed);
             s_floor_seeded = true;
         }
@@ -216,9 +232,15 @@ static void sess_task(void *pv)
 
             for (uint32_t t = 0; t < win_blocks; t++) {
                 /* 回复晚到 (WS 回调延迟启动 TTS) — 中止聆听防抢录 */
-                if (tts_client_is_busy()) { late_reply = true; break; }
+                if (tts_client_is_busy()) {
+                    late_reply = true;
+                    break;
+                }
                 int n = es8311_drv_read(s_block, BLOCK_SAMPLES);
-                if (n <= 0) { vTaskDelay(pdMS_TO_TICKS(BLOCK_MS)); continue; }
+                if (n <= 0) {
+                    vTaskDelay(pdMS_TO_TICKS(BLOCK_MS));
+                    continue;
+                }
                 int got = n / sizeof(int16_t);
                 float rms = block_rms(s_block, got);
 
@@ -246,8 +268,10 @@ static void sess_task(void *pv)
                 } else {
                     memcpy(s_rec + s_rec_len, s_block, got * 2);
                     s_rec_len += got;
-                    if (rms < s_stop_thr) silent_run++;
-                    else silent_run = 0;
+                    if (rms < s_stop_thr)
+                        silent_run++;
+                    else
+                        silent_run = 0;
 
                     if (silent_run * BLOCK_MS >= SILENCE_END_MS ||
                         s_rec_len >= REC_MAX_SAMPLES) {
@@ -308,7 +332,7 @@ static void sess_task(void *pv)
             free(text);
 
             sess_set_state(SESS_WAIT_REPLY);
-            for (int i = 0; i < 450; i++) {   /* 45s, 100ms 步进 */
+            for (int i = 0; i < 450; i++) { /* 45s, 100ms 步进 */
                 vTaskDelay(pdMS_TO_TICKS(100));
                 if (ws_client_get_chat_seq() != seq0) break;
                 if (!ws_client_is_connected()) break;
@@ -333,6 +357,8 @@ static void sess_task(void *pv)
         sess_set_state(SESS_IDLE);
         chat_bubble_show("下次再聊~", 4000);
         es8311_drv_set_vol(0);
+        es8311_drv_release_rx();
+        if (s_pm_lock) esp_pm_lock_release(s_pm_lock);
         ESP_LOGI(TAG, "会话结束");
     }
 }
@@ -346,7 +372,7 @@ void session_mgr_init(void)
         return;
     }
     xTaskCreateWithCaps(sess_task, "sess", 16384, NULL, 5, &s_task,
-                        MALLOC_CAP_SPIRAM);   /* 12KB 曾在 esp_http_client+cJSON
+                        MALLOC_CAP_SPIRAM); /* 12KB 曾在 esp_http_client+cJSON
                                                调用链上栈溢出双异常 */
     ESP_LOGI(TAG, "会话模式就绪 (回看 %dms, 录音上限 %ds)",
              LOOKBACK_SAMPLES * 1000 / SAMPLE_RATE, MAX_RECORD_MS / 1000);

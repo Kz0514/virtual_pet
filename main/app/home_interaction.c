@@ -28,11 +28,12 @@
 
 static const char *TAG = "home_ix";
 
-static bool      s_enabled = true;   /* 页面级开关 (设置页禁用) */
-static uint32_t  s_last_voice = 0;   /* 语音触发 10s 冷却 */
+static bool s_enabled = true;     /* 页面级开关 (设置页禁用) */
+static uint32_t s_last_voice = 0; /* 语音触发 10s 冷却 */
 
-/* main.c 导出: 交互唤醒/亮度恢复 + 空闲计时重置 */
+/* main.c 导出: 交互唤醒/亮度恢复 + 空闲计时重置 + 屏幕状态查询 */
 extern void main_screen_note_interaction(void);
+extern bool main_screen_is_on(void);
 
 void home_interaction_set_enabled(bool en)
 {
@@ -43,7 +44,10 @@ void home_interaction_set_enabled(bool en)
 
 /* 物理交互的本地短句反馈 — 仅在宠物空闲时播, 不压掉对话气泡 */
 static const char *s_local_phrases[] = {
-    "嘿嘿~", "好舒服呀", "再摸一下嘛", "嘻嘻",
+    "嘿嘿~",
+    "好舒服呀",
+    "再摸一下嘛",
+    "嘻嘻",
 };
 
 static void maybe_local_phrase(void)
@@ -52,25 +56,30 @@ static void maybe_local_phrase(void)
         pet_avatar_get_current() != PET_ANIM_IDLE) return;
     chat_bubble_show(
         s_local_phrases[esp_random() %
-        (sizeof(s_local_phrases) / sizeof(s_local_phrases[0]))], 3000);
+                        (sizeof(s_local_phrases) / sizeof(s_local_phrases[0]))],
+        3000);
 }
 
 void home_interaction_poll(void)
 {
     /* 排空闸门:
-     *  - 马达震动期间 — 振动经外壳传给 DMP, 会被误判为摇动/敲击;
-     *  - 非主页(设置页) — 只排空不处理, 回主页不会积压旧事件 */
-    bool gated = !s_enabled || tm6604_is_vibrating();
+     * - 马达震动期间 — 振动经外壳传给 DMP, 会被误判为摇动/敲击;
+     * - 非主页(设置页) — 只排空不处理, 回主页不会积压旧事件;
+     * - 息屏期 — 轻睡周期电气瞬态 → 喇叭"啪" → 纸盆振动 → DMP →
+     * tap/shake 假触发 (tap 阈值仅 0.10g, 实测 2s 内必亮屏, 自动亮屏
+     * 真凶, ph/tc=0 铁证触摸探针无辜)。息屏唤醒只走触摸探针
+     * (10Hz + 去抖) + 左键/摇动等物理路径, 摇动/敲击仅亮屏期有效 */
+    bool gated = !s_enabled || tm6604_is_vibrating() || !main_screen_is_on();
 
     shake_event_t se;
     bool got_shake = shake_detector_poll(&se);
     tap_event_t te;
     bool got_tap = tap_detector_poll(&te);
     uint16_t dbg_mg;
-    uint8_t  dbg_reason;
+    uint8_t dbg_reason;
     bool got_dbg = tap_detector_poll_dbg(&dbg_mg, &dbg_reason);
 
-    if (gated) return;   /* 事件已排空 */
+    if (gated) return; /* 事件已排空 */
 
     /* 摇动 — 轻摇/重摇按幅度分流; 可唤醒屏幕 */
     if (got_shake) {
@@ -85,9 +94,9 @@ void home_interaction_poll(void)
         if (ws_client_is_connected()) {
             char evt[160];
             snprintf(evt, sizeof(evt),
-                "{\"type\":\"sensor_event\",\"event\":\"shake\","
-                "\"data\":{\"accel_mag\":%.2f,\"strength\":\"%s\"}}",
-                se.magnitude_g, hard ? "hard" : "light");
+                     "{\"type\":\"sensor_event\",\"event\":\"shake\","
+                     "\"data\":{\"accel_mag\":%.2f,\"strength\":\"%s\"}}",
+                     se.magnitude_g, hard ? "hard" : "light");
             ws_client_send_json(evt);
         }
     }
@@ -109,9 +118,9 @@ void home_interaction_poll(void)
         if (ws_client_is_connected()) {
             char evt[128];
             snprintf(evt, sizeof(evt),
-                "{\"type\":\"sensor_event\",\"event\":\"tap\","
-                "\"data\":{\"count\":%u,\"direction\":%u}}",
-                te.count, te.direction);
+                     "{\"type\":\"sensor_event\",\"event\":\"tap\","
+                     "\"data\":{\"count\":%u,\"direction\":%u}}",
+                     te.count, te.direction);
             ws_client_send_json(evt);
         }
     }
@@ -125,7 +134,7 @@ void home_interaction_poll(void)
 
 void home_interaction_on_gesture(gesture_event_t ev)
 {
-    if (!s_enabled) return;   /* input_handler 只在主页路由, 双保险 */
+    if (!s_enabled) return; /* input_handler 只在主页路由, 双保险 */
 
     switch (ev) {
     case GESTURE_PETTING_HEAD:
@@ -136,13 +145,13 @@ void home_interaction_on_gesture(gesture_event_t ev)
 
     case GESTURE_VOICE_TRIGGER: {
         uint32_t now = xTaskGetTickCount();
-        if (now - s_last_voice < pdMS_TO_TICKS(10000)) break;  /* 10s cooldown */
+        if (now - s_last_voice < pdMS_TO_TICKS(10000)) break; /* 10s cooldown */
         s_last_voice = now;
         ESP_LOGI(TAG, "Voice trigger!");
         main_screen_note_interaction();
         pet_engine_trigger(PET_EVENT_VOICE);
         diary_mgr_note_event(DIARY_EVENT_VOICE);
-        session_mgr_enter();   /* 进入连续会话; 会话中 = 打断进聆听 */
+        session_mgr_enter(); /* 进入连续会话; 会话中 = 打断进聆听 */
         break;
     }
 

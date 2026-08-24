@@ -6,10 +6,12 @@
  */
 #include "api_client.h"
 #include "server_config.h"
+#include "config_mgr.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_mac.h"
 #include "esp_http_client.h"
+#include "esp_app_desc.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
 #include <string.h>
@@ -75,10 +77,14 @@ esp_err_t api_client_init(void)
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
 
-    /* 构建 JSON body */
-    char body[256];
+    /* 构建 JSON body — 名字取配置 (pet_name/owner_name), 版本取运行固件描述
+     * (version.txt → CMake 注入, 与 OTA 判据同源); 每次开机重注册即同步改名 */
+    const esp_app_desc_t *desc = esp_app_get_description();
+    char body[320];
     snprintf(body, sizeof(body),
-             "{\"mac_address\":\"%s\",\"device_name\":\"萝莉丝\",\"firmware_version\":\"1.0.23\"}", mac);
+             "{\"mac_address\":\"%s\",\"device_name\":\"%s\",\"owner_name\":\"%s\",\"firmware_version\":\"%s\"}",
+             mac, config_get_str("pet_name", "萝莉丝"),
+             config_get_str("owner_name", "主人"), desc->version);
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, body, strlen(body));
 
