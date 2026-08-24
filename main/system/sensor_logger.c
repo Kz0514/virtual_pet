@@ -27,13 +27,14 @@
 #include <stdio.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 static const char *TAG = "sensor_log";
 static const char *CFG_MOUNT = "/cfg";
-static const char *LOG_FILE  = "/cfg/sensors.csv";   /* 内部数据 → LittleFS */
+static const char *LOG_FILE = "/cfg/sensors.csv"; /* 内部数据 → LittleFS */
 
-static bool s_ready      = false;   /* /cfg 可用 (传感器日志依赖) */
+static bool s_ready = false; /* /cfg 可用 (传感器日志依赖) */
 
 /* /data 可用性由 usb_storage 维护 (挂载/卸载随 U盘模式切换) */
 bool sensor_logger_data_mounted(void) { return usb_storage_data_mounted(); }
@@ -47,7 +48,7 @@ static esp_err_t mount_cfg(void)
     esp_vfs_littlefs_conf_t cfg = {
         .base_path = CFG_MOUNT,
         .partition_label = "config",
-        .format_if_mount_failed = true,   /* 首启对旧 FAT 内容自动格式化 */
+        .format_if_mount_failed = true, /* 首启对旧 FAT 内容自动格式化 */
         .dont_mount = false,
     };
     esp_err_t err = esp_vfs_littlefs_register(&cfg);
@@ -79,8 +80,9 @@ static esp_err_t mount_data(void)
     return ESP_OK;
 }
 
-esp_err_t sensor_logger_init(void) {
-    bool cfg_ok  = (mount_cfg()  == ESP_OK);
+esp_err_t sensor_logger_init(void)
+{
+    bool cfg_ok = (mount_cfg() == ESP_OK);
     bool data_ok = (mount_data() == ESP_OK);
     /* /data 的 FAT 挂载统一由 usb_storage 管理 (MSC 组件持有 WL 句柄,
      * U盘模式切换原子); 失败 → 降级, 恢复入口 = 设置页"格式化存储" */
@@ -88,9 +90,13 @@ esp_err_t sensor_logger_init(void) {
         data_ok = (usb_storage_init() == ESP_OK);
 
     if (cfg_ok) {
-        FILE *f = fopen(LOG_FILE, "w");
-        if (f) { fclose(f); ESP_LOGI(TAG, "日志文件已创建"); }
-        else   { ESP_LOGW(TAG, "预创建日志文件失败"); }
+        int fd = open(LOG_FILE, O_CREAT | O_TRUNC | O_WRONLY);
+        if (fd >= 0) {
+            close(fd);
+            ESP_LOGI(TAG, "日志文件已创建");
+        } else {
+            ESP_LOGW(TAG, "预创建日志文件失败");
+        }
     }
 
     s_ready = cfg_ok;
@@ -101,7 +107,8 @@ esp_err_t sensor_logger_init(void) {
     return ESP_OK;
 }
 
-esp_err_t sensor_logger_append(const sensor_snapshot_t *s) {
+esp_err_t sensor_logger_append(const sensor_snapshot_t *s)
+{
     if (!s_ready || !s) return ESP_FAIL;
     /* TTS 播放期间跳过 — flash 写会禁用 cache 冻结双核 100-400ms,
      * 流式播放的浅缓冲会把它暴露成音频卡顿; 下个 2s 节拍再写 */
@@ -120,53 +127,77 @@ esp_err_t sensor_logger_append(const sensor_snapshot_t *s) {
     }
 
     /* Rewrite file (retry once on fd contention) */
-    FILE *f = fopen(LOG_FILE, "w");
-    if (!f) { vTaskDelay(pdMS_TO_TICKS(50)); f = fopen(LOG_FILE, "w"); }
-    if (!f) { ESP_LOGW(TAG, "打开日志失败"); return ESP_FAIL; }
-    for (int i = 0; i < count; i++) {
-        fprintf(f, "%lu,%.1f,%u,%.0f,%d,%u\n",
-                entries[i].timestamp, entries[i].temperature,
-                entries[i].humidity, entries[i].ambient_lux,
-                entries[i].battery_mv, entries[i].battery_pct);
+    int fd = open(LOG_FILE, O_CREAT | O_TRUNC | O_WRONLY);
+    if (fd < 0) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        fd = open(LOG_FILE, O_CREAT | O_TRUNC | O_WRONLY);
     }
-    fclose(f);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "打开日志失败");
+        return ESP_FAIL;
+    }
+    char line[96];
+    bool wr_err = false;
+    for (int i = 0; i < count; i++) {
+        int n = snprintf(line, sizeof(line), "%lu,%.1f,%u,%.0f,%d,%u\n",
+                         (unsigned long)entries[i].timestamp, entries[i].temperature,
+                         entries[i].humidity, entries[i].ambient_lux,
+                         entries[i].battery_mv, entries[i].battery_pct);
+        if (n > 0 && write(fd, line, (size_t)n) < 0) wr_err = true;
+    }
+    if (wr_err) ESP_LOGW(TAG, "写入 %s 失败 — FAT 异常或 flash 写错误", LOG_FILE);
+    close(fd);
     return ESP_OK;
 }
 
-int sensor_logger_get_recent(sensor_snapshot_t *out, int max_count) {
+int sensor_logger_get_recent(sensor_snapshot_t *out, int max_count)
+{
     if (!s_ready || !out || max_count < 1) return 0;
 
-    FILE *f = fopen(LOG_FILE, "r");
-    if (!f) return 0;
+    int fd = open(LOG_FILE, O_RDONLY);
+    if (fd < 0) return 0;
 
-    char line[128];
+    /* 整文件读入再按行拆 — 文件滚动上限 4 行, 512B 栈缓冲足够 */
+    char buf[512];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+
     int count = 0;
-    while (fgets(line, sizeof(line), f) && count < max_count) {
-        sensor_snapshot_t s;
-        if (sscanf(line, "%lu,%f,%hhu,%f,%d,%hhu",
-                   &s.timestamp, &s.temperature, &s.humidity,
-                   &s.ambient_lux, &s.battery_mv, &s.battery_pct) == 6) {
-            out[count++] = s;
+    char *line = buf;
+    while (line && count < max_count) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (*line) {
+            sensor_snapshot_t s;
+            if (sscanf(line, "%lu,%f,%hhu,%f,%d,%hhu",
+                       &s.timestamp, &s.temperature, &s.humidity,
+                       &s.ambient_lux, &s.battery_mv, &s.battery_pct) == 6) {
+                out[count++] = s;
+            }
         }
+        line = nl ? nl + 1 : NULL;
     }
-    fclose(f);
     return count;
 }
 
-void sensor_logger_format_time(uint32_t unix_sec, char *buf, int bufsize) {
+void sensor_logger_format_time(uint32_t unix_sec, char *buf, int bufsize)
+{
     time_t t = (time_t)unix_sec;
     struct tm tm;
-    localtime_r(&t, &tm);   /* 尊重 TZ (time_manager 设置), 线程安全 */
+    localtime_r(&t, &tm); /* 尊重 TZ (time_manager 设置), 线程安全 */
     strftime(buf, (size_t)bufsize, "%H:%M:%S", &tm);
 }
 
 /* Get most recent sensor data as a human-readable string for LLM context */
-int sensor_logger_get_context_str(char *buf, int bufsize) {
+int sensor_logger_get_context_str(char *buf, int bufsize)
+{
     if (!s_ready || !buf || bufsize < 32) return 0;
     sensor_snapshot_t s;
     int count = sensor_logger_get_recent(&s, 1);
     if (count < 1) return 0;
     return snprintf(buf, bufsize,
-        "温度%.0f°C 湿度%u%% 光照%.0flux 电量%u%%",
-        s.temperature, s.humidity, s.ambient_lux, s.battery_pct);
+                    "温度%.0f°C 湿度%u%% 光照%.0flux 电量%u%%",
+                    s.temperature, s.humidity, s.ambient_lux, s.battery_pct);
 }

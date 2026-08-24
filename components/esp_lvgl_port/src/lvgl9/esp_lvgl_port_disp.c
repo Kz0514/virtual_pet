@@ -16,10 +16,12 @@
 #include "esp_idf_version.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_timer.h"
+#include "esp_pm.h"
 #include "esp_lvgl_port.h"
 #include "esp_lvgl_port_priv.h"
 
-#define LVGL_PORT_PPA   (CONFIG_LVGL_PORT_ENABLE_PPA)
+#define LVGL_PORT_PPA (CONFIG_LVGL_PORT_ENABLE_PPA)
 
 #if LVGL_PORT_PPA
 #include "../common/ppa/lcd_ppa.h"
@@ -51,51 +53,56 @@
 
 static const char *TAG = "LVGL";
 
+/* flush 传输 PM 锁 — 曾实测 light sleep 在 SPI DMA 传输中途进入:
+ * 时钟冻结 → 传输中止/行残留 (屏幕撕裂)。传输期间持 APB_FREQ_MAX
+ * 锁禁止轻睡, 传完即放。见 lvgl_port_flush_callback */
+static esp_pm_lock_handle_t s_flush_pm_lock;
+
 /*******************************************************************************
-* Types definitions
-*******************************************************************************/
+ * Types definitions
+ *******************************************************************************/
 
 typedef struct {
-    lvgl_port_disp_type_t     disp_type;    /* Display type */
-    esp_lcd_panel_io_handle_t io_handle;      /* LCD panel IO handle */
-    esp_lcd_panel_handle_t    panel_handle;   /* LCD panel handle */
-    esp_lcd_panel_handle_t    control_handle; /* LCD panel control handle */
-    lvgl_port_rotation_cfg_t  rotation;       /* Default values of the screen rotation */
-    lv_color_t                *draw_buffs[3]; /* Display draw buffers */
-    uint8_t                   *oled_buffer;
-    lv_display_t              *disp_drv;      /* LVGL display driver */
-    lv_display_rotation_t     current_rotation;
-    SemaphoreHandle_t         trans_sem;      /* Idle transfer mutex */
-    lvgl_port_rounder_cb_t    rounder_cb;     /* Rounder callback for display area */
+    lvgl_port_disp_type_t disp_type;       /* Display type */
+    esp_lcd_panel_io_handle_t io_handle;   /* LCD panel IO handle */
+    esp_lcd_panel_handle_t panel_handle;   /* LCD panel handle */
+    esp_lcd_panel_handle_t control_handle; /* LCD panel control handle */
+    lvgl_port_rotation_cfg_t rotation;     /* Default values of the screen rotation */
+    lv_color_t *draw_buffs[3];             /* Display draw buffers */
+    uint8_t *oled_buffer;
+    lv_display_t *disp_drv; /* LVGL display driver */
+    lv_display_rotation_t current_rotation;
+    SemaphoreHandle_t trans_sem;       /* Idle transfer mutex */
+    lvgl_port_rounder_cb_t rounder_cb; /* Rounder callback for display area */
 #if LVGL_PORT_PPA
-    lvgl_port_ppa_handle_t    ppa_handle;
-#endif //LVGL_PORT_PPA
+    lvgl_port_ppa_handle_t ppa_handle;
+#endif // LVGL_PORT_PPA
     struct {
-        unsigned int monochrome: 1;  /* True, if display is monochrome and using 1bit for 1px */
-        unsigned int swap_bytes: 1;  /* Swap bytes in RGB656 (16-bit) before send to LCD driver */
-        unsigned int full_refresh: 1;   /* Always make the whole screen redrawn */
-        unsigned int direct_mode: 1;    /* Use screen-sized buffers and draw to absolute coordinates */
-        unsigned int sw_rotate: 1;    /* Use software rotation (slower) or PPA if available */
+        unsigned int monochrome : 1;   /* True, if display is monochrome and using 1bit for 1px */
+        unsigned int swap_bytes : 1;   /* Swap bytes in RGB656 (16-bit) before send to LCD driver */
+        unsigned int full_refresh : 1; /* Always make the whole screen redrawn */
+        unsigned int direct_mode : 1;  /* Use screen-sized buffers and draw to absolute coordinates */
+        unsigned int sw_rotate : 1;    /* Use software rotation (slower) or PPA if available */
     } flags;
 } lvgl_port_display_ctx_t;
 
 /*******************************************************************************
-* Function definitions
-*******************************************************************************/
+ * Function definitions
+ *******************************************************************************/
 static lv_display_t *lvgl_port_add_disp_priv(const lvgl_port_display_cfg_t *disp_cfg,
-        const lvgl_port_disp_priv_cfg_t *priv_cfg);
+                                             const lvgl_port_disp_priv_cfg_t *priv_cfg);
 #if LVGL_PORT_HANDLE_FLUSH_READY
 static bool lvgl_port_flush_io_ready_callback(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata,
-        void *user_ctx);
+                                              void *user_ctx);
 #if (SOC_LCDCAM_RGB_LCD_SUPPORTED && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
 static bool lvgl_port_flush_rgb_vsync_ready_callback(esp_lcd_panel_handle_t panel_io,
-        const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx);
+                                                     const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx);
 #endif
 #if (SOC_MIPI_DSI_SUPPORTED && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0))
 static bool lvgl_port_flush_dpi_panel_ready_callback(esp_lcd_panel_handle_t panel_io,
-        esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx);
+                                                     esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx);
 static bool lvgl_port_flush_dpi_vsync_ready_callback(esp_lcd_panel_handle_t panel_io,
-        esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx);
+                                                     esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx);
 #endif
 #endif
 static void lvgl_port_flush_callback(lv_display_t *drv, const lv_area_t *area, uint8_t *color_map);
@@ -104,8 +111,8 @@ static void lvgl_port_disp_rotation_update(lvgl_port_display_ctx_t *disp_ctx);
 static void lvgl_port_display_invalidate_callback(lv_event_t *e);
 
 /*******************************************************************************
-* Public API functions
-*******************************************************************************/
+ * Public API functions
+ *******************************************************************************/
 
 lv_display_t *lvgl_port_add_disp(const lvgl_port_display_cfg_t *disp_cfg)
 {
@@ -258,7 +265,7 @@ esp_err_t lvgl_port_remove_disp(lv_display_t *disp)
     if (disp_ctx->ppa_handle) {
         lvgl_port_ppa_delete(disp_ctx->ppa_handle);
     }
-#endif //LVGL_PORT_PPA
+#endif // LVGL_PORT_PPA
 
     free(disp_ctx);
 
@@ -272,11 +279,11 @@ void lvgl_port_flush_ready(lv_display_t *disp)
 }
 
 /*******************************************************************************
-* Private functions
-*******************************************************************************/
+ * Private functions
+ *******************************************************************************/
 
 static lv_display_t *lvgl_port_add_disp_priv(const lvgl_port_display_cfg_t *disp_cfg,
-        const lvgl_port_disp_priv_cfg_t *priv_cfg)
+                                             const lvgl_port_disp_priv_cfg_t *priv_cfg)
 {
     esp_err_t ret = ESP_OK;
     lv_display_t *disp = NULL;
@@ -293,36 +300,29 @@ static lv_display_t *lvgl_port_add_disp_priv(const lvgl_port_display_cfg_t *disp
     buffer_size = disp_cfg->buffer_size;
 
     /* Check supported display color formats */
-    ESP_RETURN_ON_FALSE(disp_cfg->color_format == 0 || disp_cfg->color_format == LV_COLOR_FORMAT_RGB565
-                        || disp_cfg->color_format == LV_COLOR_FORMAT_RGB565_SWAPPED
-                        || disp_cfg->color_format == LV_COLOR_FORMAT_RGB888 || disp_cfg->color_format == LV_COLOR_FORMAT_XRGB8888
-                        || disp_cfg->color_format == LV_COLOR_FORMAT_ARGB8888
-                        || disp_cfg->color_format == LV_COLOR_FORMAT_I1, NULL, TAG, "Not supported display color format!");
+    ESP_RETURN_ON_FALSE(disp_cfg->color_format == 0 || disp_cfg->color_format == LV_COLOR_FORMAT_RGB565 || disp_cfg->color_format == LV_COLOR_FORMAT_RGB565_SWAPPED || disp_cfg->color_format == LV_COLOR_FORMAT_RGB888 || disp_cfg->color_format == LV_COLOR_FORMAT_XRGB8888 || disp_cfg->color_format == LV_COLOR_FORMAT_ARGB8888 || disp_cfg->color_format == LV_COLOR_FORMAT_I1, NULL, TAG, "Not supported display color format!");
 
-    lv_color_format_t display_color_format = (disp_cfg->color_format != 0 ? disp_cfg->color_format :
-            LV_COLOR_FORMAT_RGB565);
+    lv_color_format_t display_color_format = (disp_cfg->color_format != 0 ? disp_cfg->color_format : LV_COLOR_FORMAT_RGB565);
     uint8_t color_bytes = lv_color_format_get_size(display_color_format);
     if (disp_cfg->flags.swap_bytes) {
         /* Swap bytes can be used only in RGB565 color format */
-        ESP_RETURN_ON_FALSE(display_color_format == LV_COLOR_FORMAT_RGB565
-                            || display_color_format == LV_COLOR_FORMAT_RGB565_SWAPPED,
+        ESP_RETURN_ON_FALSE(display_color_format == LV_COLOR_FORMAT_RGB565 || display_color_format == LV_COLOR_FORMAT_RGB565_SWAPPED,
                             NULL, TAG, "Swap bytes can be used only in display color format RGB565!");
     }
 
     if (disp_cfg->flags.buff_dma) {
         /* DMA buffer can be used only in RGB565 color format */
-        ESP_RETURN_ON_FALSE(display_color_format == LV_COLOR_FORMAT_RGB565
-                            || display_color_format == LV_COLOR_FORMAT_RGB565_SWAPPED,
+        ESP_RETURN_ON_FALSE(display_color_format == LV_COLOR_FORMAT_RGB565 || display_color_format == LV_COLOR_FORMAT_RGB565_SWAPPED,
                             NULL, TAG, "DMA buffer can be used only in display color format RGB565 (not aligned copy)!");
     }
 
     /* Display context */
 #if CONFIG_LCD_RGB_ISR_IRAM_SAFE
     /* When ISR IRAM safety is enabled, the display context is passed directly
-    * to the ISR callback as user_ctx. It must reside in internal RAM so it
-    * remains accessible when the cache is disabled during SPI flash operations. */
+     * to the ISR callback as user_ctx. It must reside in internal RAM so it
+     * remains accessible when the cache is disabled during SPI flash operations. */
     lvgl_port_display_ctx_t *disp_ctx = heap_caps_malloc(sizeof(lvgl_port_display_ctx_t),
-                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #else
     lvgl_port_display_ctx_t *disp_ctx = malloc(sizeof(lvgl_port_display_ctx_t));
 #endif
@@ -338,6 +338,13 @@ static lv_display_t *lvgl_port_add_disp_priv(const lvgl_port_display_cfg_t *disp
     disp_ctx->flags.sw_rotate = disp_cfg->flags.sw_rotate;
     disp_ctx->current_rotation = LV_DISPLAY_ROTATION_0;
     disp_ctx->rounder_cb = disp_cfg->rounder_cb;
+
+    /* flush PM 锁 — 防 light sleep 中断 SPI 传输 (撕裂); 懒创建,
+     * esp_pm 未使能 (CONFIG_PM_ENABLE=n) 时创建失败, 仅告警 */
+    if (!s_flush_pm_lock) {
+        if (esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "lcd_flush", &s_flush_pm_lock) != ESP_OK)
+            ESP_LOGW(TAG, "lcd_flush PM 锁创建失败 — flush 期间允许轻睡 (可能撕裂)");
+    }
 
     uint32_t buff_caps = 0;
 #if SOC_PSRAM_DMA_CAPABLE == 0
@@ -368,14 +375,14 @@ static lv_display_t *lvgl_port_add_disp_priv(const lvgl_port_display_cfg_t *disp
     /* Use RGB internal buffers for avoid tearing effect */
     if (priv_cfg && priv_cfg->avoid_tearing) {
 #if (SOC_LCDCAM_RGB_LCD_SUPPORTED && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
-        if (priv_cfg->disp_type ==  LVGL_PORT_DISP_TYPE_RGB) {
+        if (priv_cfg->disp_type == LVGL_PORT_DISP_TYPE_RGB) {
             buffer_size = disp_cfg->hres * disp_cfg->vres;
             ESP_GOTO_ON_ERROR(esp_lcd_rgb_panel_get_frame_buffer(disp_cfg->panel_handle, 2, (void *)&buf1, (void *)&buf2), err, TAG,
                               "Get RGB buffers failed");
         }
 #endif
 #if (SOC_MIPI_DSI_SUPPORTED && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0))
-        if (priv_cfg->disp_type ==  LVGL_PORT_DISP_TYPE_DSI) {
+        if (priv_cfg->disp_type == LVGL_PORT_DISP_TYPE_DSI) {
             buffer_size = disp_cfg->hres * disp_cfg->vres;
             ESP_GOTO_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(disp_cfg->panel_handle, 2, (void *)&buf1, (void *)&buf2), err, TAG,
                               "Get RGB buffers failed");
@@ -411,8 +418,7 @@ static lv_display_t *lvgl_port_add_disp_priv(const lvgl_port_display_cfg_t *disp
 #endif
 
         /* Monochrome can be used only in RGB565 color format */
-        ESP_RETURN_ON_FALSE(display_color_format == LV_COLOR_FORMAT_RGB565
-                            || display_color_format == LV_COLOR_FORMAT_I1, NULL, TAG,
+        ESP_RETURN_ON_FALSE(display_color_format == LV_COLOR_FORMAT_RGB565 || display_color_format == LV_COLOR_FORMAT_I1, NULL, TAG,
                             "Monochrome can be used only in display color format RGB565 or I1!");
 
         /* When using monochromatic display, there must be used full bufer! */
@@ -472,8 +478,7 @@ static lv_display_t *lvgl_port_add_disp_priv(const lvgl_port_display_cfg_t *disp
             .flags = {
                 .buff_dma = disp_cfg->flags.buff_dma,
                 .buff_spiram = disp_cfg->flags.buff_spiram,
-            }
-        };
+            }};
         disp_ctx->ppa_handle = lvgl_port_ppa_create(&ppa_cfg);
         assert(disp_ctx->ppa_handle != NULL);
 #else
@@ -481,9 +486,8 @@ static lv_display_t *lvgl_port_add_disp_priv(const lvgl_port_display_cfg_t *disp
         ESP_GOTO_ON_FALSE(disp_ctx->draw_buffs[2], ESP_ERR_NO_MEM, err, TAG,
                           "Not enough memory for LVGL buffer (rotation buffer) allocation!");
 
-#endif //LVGL_PORT_PPA
+#endif // LVGL_PORT_PPA
     }
-
 
 err:
     if (ret != ESP_OK) {
@@ -512,7 +516,7 @@ err:
 
 #if LVGL_PORT_HANDLE_FLUSH_READY
 static bool lvgl_port_flush_io_ready_callback(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata,
-        void *user_ctx)
+                                              void *user_ctx)
 {
     lv_display_t *disp_drv = (lv_display_t *)user_ctx;
     assert(disp_drv != NULL);
@@ -522,7 +526,7 @@ static bool lvgl_port_flush_io_ready_callback(esp_lcd_panel_io_handle_t panel_io
 
 #if (SOC_MIPI_DSI_SUPPORTED && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0))
 static bool lvgl_port_flush_dpi_panel_ready_callback(esp_lcd_panel_handle_t panel_io,
-        esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx)
+                                                     esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx)
 {
     lv_display_t *disp_drv = (lv_display_t *)user_ctx;
     assert(disp_drv != NULL);
@@ -531,7 +535,7 @@ static bool lvgl_port_flush_dpi_panel_ready_callback(esp_lcd_panel_handle_t pane
 }
 
 static bool lvgl_port_flush_dpi_vsync_ready_callback(esp_lcd_panel_handle_t panel_io,
-        esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx)
+                                                     esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx)
 {
     BaseType_t need_yield = pdFALSE;
 
@@ -553,7 +557,7 @@ static bool lvgl_port_flush_dpi_vsync_ready_callback(esp_lcd_panel_handle_t pane
  * user_ctx is lvgl_port_display_ctx_t* to avoid calling lv_display_get_driver_data()
  * which resides in flash and would crash when cache is disabled (e.g. during SPI flash ops). */
 static LVGL_PORT_IRAM bool lvgl_port_flush_rgb_vsync_ready_callback(esp_lcd_panel_handle_t panel_io,
-        const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx)
+                                                                    const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx)
 {
     BaseType_t need_yield = pdFALSE;
 
@@ -581,8 +585,7 @@ static void _lvgl_port_transform_monochrome(lv_display_t *display, const lv_area
     uint16_t hor_res = lv_display_get_physical_horizontal_resolution(display);
     uint16_t ver_res = lv_display_get_physical_vertical_resolution(display);
     uint16_t res = hor_res;
-    bool swap_xy = (lv_display_get_rotation(display) == LV_DISPLAY_ROTATION_90
-                    || lv_display_get_rotation(display) == LV_DISPLAY_ROTATION_270);
+    bool swap_xy = (lv_display_get_rotation(display) == LV_DISPLAY_ROTATION_90 || lv_display_get_rotation(display) == LV_DISPLAY_ROTATION_270);
 
     int x1 = area->x1;
     int x2 = area->x2;
@@ -603,7 +606,7 @@ static void _lvgl_port_transform_monochrome(lv_display_t *display, const lv_area
         for (int x = x1; x <= x2; x++) {
             bool chroma_color = 0;
             if (color_format == LV_COLOR_FORMAT_I1) {
-                chroma_color = (src[(hor_res >> 3) * y  + (x >> 3)] & 1 << (7 - x % 8));
+                chroma_color = (src[(hor_res >> 3) * y + (x >> 3)] & 1 << (7 - x % 8));
             } else {
                 chroma_color = (color[hor_res * y + x].blue > 16);
             }
@@ -619,7 +622,7 @@ static void _lvgl_port_transform_monochrome(lv_display_t *display, const lv_area
             }
 
             /* Write to the buffer as required for the display.
-            * It writes only 1-bit for monochrome displays mapped vertically.*/
+             * It writes only 1-bit for monochrome displays mapped vertically.*/
             uint8_t *outbuf = NULL;
             outbuf = *color_map + res * (out_y >> 3) + (out_x);
             if (chroma_color) {
@@ -629,7 +632,6 @@ static void _lvgl_port_transform_monochrome(lv_display_t *display, const lv_area
             }
         }
     }
-
 }
 
 void lvgl_port_rotate_area(lv_display_t *disp, lv_area_t *area)
@@ -705,8 +707,7 @@ static void lvgl_port_flush_callback(lv_display_t *drv, const lv_area_t *area, u
                 .rotation = disp_ctx->current_rotation,
                 .ppa_mode = PPA_TRANS_MODE_BLOCKING,
                 .swap_bytes = (disp_ctx->flags.swap_bytes ? true : false),
-                .user_data = disp_ctx
-            };
+                .user_data = disp_ctx};
             /* Do operation */
             esp_err_t err = lvgl_port_ppa_rotate(disp_ctx->ppa_handle, &rotate_cfg);
             if (err == ESP_OK) {
@@ -739,7 +740,7 @@ static void lvgl_port_flush_callback(lv_display_t *drv, const lv_area_t *area, u
             offsety1 = area->y1;
             offsety2 = area->y2;
         }
-#endif //LVGL_PORT_PPA
+#endif // LVGL_PORT_PPA
     }
 
     if (disp_ctx->flags.swap_bytes) {
@@ -751,8 +752,12 @@ static void lvgl_port_flush_callback(lv_display_t *drv, const lv_area_t *area, u
         _lvgl_port_transform_monochrome(drv, area, &color_map);
     }
 
-    if ((disp_ctx->disp_type == LVGL_PORT_DISP_TYPE_RGB || disp_ctx->disp_type == LVGL_PORT_DISP_TYPE_DSI)
-            && (disp_ctx->flags.direct_mode || disp_ctx->flags.full_refresh)) {
+    /* 传输期间持 PM 锁 — 防 light sleep 在 SPI DMA 传输中途进入
+     * (时钟冻结 → 传输中止/行残留, 屏幕撕裂)。SPI draw_bitmap 同步
+     * 传输, 返回即传完; RGB/DSI 分支含 trans_sem 等待, 一并包住 */
+    bool have_pm = (s_flush_pm_lock != NULL);
+    if (have_pm) esp_pm_lock_acquire(s_flush_pm_lock);
+    if ((disp_ctx->disp_type == LVGL_PORT_DISP_TYPE_RGB || disp_ctx->disp_type == LVGL_PORT_DISP_TYPE_DSI) && (disp_ctx->flags.direct_mode || disp_ctx->flags.full_refresh)) {
         if (lv_disp_flush_is_last(drv)) {
             /* If the interface is I80 or SPI, this step cannot be used for drawing. */
             esp_lcd_panel_draw_bitmap(disp_ctx->panel_handle, 0, 0, lv_disp_get_hor_res(drv), lv_disp_get_ver_res(drv), color_map);
@@ -761,11 +766,22 @@ static void lvgl_port_flush_callback(lv_display_t *drv, const lv_area_t *area, u
             xSemaphoreTake(disp_ctx->trans_sem, portMAX_DELAY);
         }
     } else {
-        esp_lcd_panel_draw_bitmap(disp_ctx->panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+        /* 1.0.248: flush_dbg 周期行覆盖日志已删 — 动画每帧全屏刷新都打
+         * (每秒 10+ 条), USB-Serial-JTAG TX 压力大户 (残影排查 2026-08-22
+         * 已完成, 撕裂问题见 PROJECT_MAP #6 已接受) */
+        esp_err_t flush_err = esp_lcd_panel_draw_bitmap(disp_ctx->panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+        /* 1.0.253: 传输失败 (内存耗尽/总线错误) 必须显式完成本帧 — SPI
+         * 路径的 flush_ready 由传输完成 ISR 回调, 失败时 ISR 永不触发 →
+         * LVGL wait_for_flushing 自旋 → IDLE 饿死 → 任务看门狗重启 (实测)。
+         * 失败即未启动传输, 手动 flush_ready 安全; 成功路径仍由 ISR 回调 */
+        if (flush_err != ESP_OK) {
+            ESP_LOGE(TAG, "flush draw_bitmap 失败: %s — 跳过本帧", esp_err_to_name(flush_err));
+            lv_disp_flush_ready(drv);
+        }
     }
+    if (have_pm) esp_pm_lock_release(s_flush_pm_lock);
 
-    if (disp_ctx->disp_type == LVGL_PORT_DISP_TYPE_RGB || (disp_ctx->disp_type == LVGL_PORT_DISP_TYPE_DSI
-            && (disp_ctx->flags.direct_mode || disp_ctx->flags.full_refresh))) {
+    if (disp_ctx->disp_type == LVGL_PORT_DISP_TYPE_RGB || (disp_ctx->disp_type == LVGL_PORT_DISP_TYPE_DSI && (disp_ctx->flags.direct_mode || disp_ctx->flags.full_refresh))) {
         lv_disp_flush_ready(drv);
     }
 }

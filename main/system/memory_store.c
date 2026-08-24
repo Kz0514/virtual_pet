@@ -16,6 +16,7 @@
 #include "memory_store.h"
 #include "time_manager.h"
 #include "tts_client.h"
+#include "config_mgr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -25,23 +26,72 @@
 #include <stdio.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static const char *TAG = "memory";
-static const char *MEM_FILE  = "/cfg/memory.txt";
+static const char *MEM_FILE = "/cfg/memory.txt";
 
-#define MEM_MAX_BYTES  (100 * 1024)
-#define SUMMARY_MAX    (4 * 1024)   /* ≤4KB 视为"压缩态", 随 chat 消息携带 */
+#define MEM_MAX_BYTES (100 * 1024)
+#define SUMMARY_MAX (4 * 1024) /* ≤4KB 视为"压缩态", 随 chat 消息携带 */
+#define MEM_MAX_FILE (256 * 1024) /* 设计上限 100KB, >256KB = LittleFS 元数据损坏 */
+#define MEM_REPAIR_MAX (128 * 1024) /* 自愈读全文件上限 */
 
-static bool  s_ready   = false;
-static bool  s_writes_safe = true;  /* 低电量闸: 电池 <3.7V 暂停写盘 */
+/* : UTF-8 清洗 — 坏字节就地替换为 '?' (长度不变, 返回坏字节数,
+ * 输出仍合法 UTF-8)。坏点源于 ws_event 的 512B snprintf 行尾截断。
+ * 演进: 截断式 (早期版) 坏点后内容全丢 — 连后续完整记录一起删;
+ * 剔除式 坏字节跳过 — 相邻字节重新对齐可能错配成假字符;
+ * '?' 替换 坏点独立占位, 其余字节解析不受影响, LLM/日志可感知缺失。
+ * 背景: 半个字符 append 进 memory.txt → mem_summary 随 chat 帧上送 →
+ * 服务端 uvicorn decode 失败直接关连接 (每次语音对话必被踢, 实测 2/2)。 */
+static size_t utf8_sanitize_inplace(char *s, size_t len)
+{
+    size_t i = 0, bad = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)s[i];
+        size_t need;
+        if (c < 0x80) {
+            i++;
+            continue;
+        }
+        if (c >= 0xC2 && c <= 0xDF)
+            need = 2; /* 2 字节 */
+        else if (c >= 0xE0 && c <= 0xEF)
+            need = 3; /* 3 字节 */
+        else if (c >= 0xF0 && c <= 0xF4)
+            need = 4; /* 4 字节 */
+        else {
+            s[i] = '?';
+            bad++;
+            i++;
+            continue;
+        }                               /* 孤立 continuation/非法起始 */
+        bool is_bad = (i + need > len); /* 字符被截断 */
+        for (size_t k = 1; !is_bad && k < need; k++) {
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) is_bad = true; /* continuation 非法 */
+        }
+        if (is_bad) {
+            s[i] = '?';
+            bad++;
+            i++;
+            continue;
+        } /* 坏起始字节 — 占位, 后续重新解析 */
+        i += need;
+    }
+    return bad;
+}
+
+static bool s_ready = false;
+static bool s_writes_safe = true; /* 低电量闸: 电池 <3.7V 暂停写盘 */
+static bool s_repair_pending = false; /* 自愈去重: 一个周期只入队一次 */
 
 void memory_store_set_writes_safe(bool safe) { s_writes_safe = safe; }
 bool memory_store_writes_safe(void) { return s_writes_safe; }
 
 /* 元数据缓存 — 主循环 tick 刷新, 发送路径零 FatFS 访问 */
-static char  *s_summary = NULL;     /* PSRAM, ≤4KB 压缩态摘要 */
+static char *s_summary = NULL; /* PSRAM, ≤4KB 压缩态摘要 */
 static size_t s_size_cache = 0;
-static bool   s_size_valid = false;
+static bool s_size_valid = false;
 
 static void memory_store_refresh_cache(void);
 
@@ -51,25 +101,28 @@ static void memory_store_refresh_cache(void);
  * (1.0.213 修了写, 1.0.214 补上读 — 读也走 cache 禁用路径)。
  * 所有读写一律入队, 由本任务执行 (xTaskCreate 默认内部 RAM 栈,
  * init 在启动初期创建, 内部堆未碎片化可稳定分配)。 */
-typedef enum { MEM_WRITE_APPEND, MEM_WRITE_OVERWRITE, MEM_READ } mem_write_op_t;
+typedef enum { MEM_WRITE_APPEND,
+               MEM_WRITE_OVERWRITE,
+               MEM_READ,
+               MEM_WRITE_REPAIR } mem_write_op_t;
 
 typedef struct {
     mem_write_op_t op;
-    char *user;       /* APPEND: 可为 NULL */
-    char *assistant;  /* APPEND: 可为 NULL */
-    char *content;    /* OVERWRITE */
-    memory_read_cb_t cb;  /* READ: 结果回调 (写盘任务上下文执行) */
-    void *arg;            /* READ: 回调透传参数 (回调返回后由调用方释放) */
+    char *user;          /* APPEND: 可为 NULL */
+    char *assistant;     /* APPEND: 可为 NULL */
+    char *content;       /* OVERWRITE */
+    memory_read_cb_t cb; /* READ: 结果回调 (写盘任务上下文执行) */
+    void *arg;           /* READ: 回调透传参数 (回调返回后由调用方释放) */
 } mem_write_item_t;
 
-#define MEM_WRITE_Q_LEN  4
-#define MEM_WRITE_STACK  (6 * 1024)
+#define MEM_WRITE_Q_LEN 4
+#define MEM_WRITE_STACK (6 * 1024)
 
 static QueueHandle_t s_write_q = NULL;
 
 static void memory_store_writer_task(void *arg)
 {
-    (void) arg;
+    (void)arg;
     mem_write_item_t it;
     while (xQueueReceive(s_write_q, &it, portMAX_DELAY) == pdTRUE) {
         /* TTS 播放期间写盘冻结双核 100-400ms → 音频卡顿, 等空闲再写 (上限 30s) */
@@ -79,20 +132,24 @@ static void memory_store_writer_task(void *arg)
             waited += 200;
         }
         if (it.op == MEM_WRITE_OVERWRITE) {
-            FILE *f = fopen(MEM_FILE, "w");
-            if (f) {
-                fwrite(it.content, 1, strlen(it.content), f);
-                fclose(f);
-                ESP_LOGI(TAG, "记忆已覆盖 (%d B)", (int)strlen(it.content));
+            /* : fopen → open (newlib FILE+锁 内部 RAM 分配失败会 abort) */
+            int fd = open(MEM_FILE, O_CREAT | O_TRUNC | O_WRONLY);
+            if (fd >= 0) {
+                /* : 写入前清洗 — 坏字节替换 '?' (strdup 副本可改), 全坏不写 */
+                size_t cl = strlen(it.content);
+                size_t bad = utf8_sanitize_inplace(it.content, cl);
+                if (bad < cl) write(fd, it.content, cl);
+                close(fd);
+                ESP_LOGI(TAG, "记忆已覆盖 (%u B)", (unsigned)cl);
             } else {
                 ESP_LOGW(TAG, "打开记忆文件失败");
             }
         } else if (it.op == MEM_WRITE_APPEND) {
-            FILE *f = fopen(MEM_FILE, "a");
-            if (f) {
+            int fd = open(MEM_FILE, O_CREAT | O_APPEND | O_WRONLY);
+            if (fd >= 0) {
                 /* 时间戳在写入时刻生成: NTP 同步后行首 [MM-DD HH:MM], 未同步
                  * 不带前缀 (兼容旧格式, 服务端压缩/LLM 可理解混合) */
-                char ts[24] = "";   /* 留足空间防 format-truncation */
+                char ts[24] = ""; /* 留足空间防 format-truncation */
                 if (time_manager_is_synced()) {
                     time_t t = (time_t)time_manager_get_unix_sec();
                     struct tm tm;
@@ -100,11 +157,35 @@ static void memory_store_writer_task(void *arg)
                     snprintf(ts, sizeof(ts), "[%02d-%02d %02d:%02d] ",
                              tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
                 }
-                if (it.user && it.user[0])
-                    fprintf(f, "%s主人: %s\n", ts, it.user);
-                if (it.assistant && it.assistant[0])
-                    fprintf(f, "%s萝莉丝: %s\n", ts, it.assistant);
-                fclose(f);
+                /* 分段 write (O_APPEND 每次自动到末尾, 单写盘任务无竞争)。
+                 * v2.19.1: 每段清洗 — 坏字节替换 '?', 全坏行不写 */
+                if (it.user) {
+                    size_t ul = strlen(it.user);
+                    size_t ubad = utf8_sanitize_inplace(it.user, ul);
+                    if (ubad < ul) {
+                        write(fd, ts, strlen(ts));
+                        char prefix[CFG_STR_MAX + 2];
+                        int pl = snprintf(prefix, sizeof(prefix), "%s: ",
+                                          config_get_str("owner_name", "主人"));
+                        write(fd, prefix, pl);
+                        write(fd, it.user, ul);
+                        write(fd, "\n", 1);
+                    }
+                }
+                if (it.assistant) {
+                    size_t al = strlen(it.assistant);
+                    size_t abad = utf8_sanitize_inplace(it.assistant, al);
+                    if (abad < al) {
+                        write(fd, ts, strlen(ts));
+                        char prefix[CFG_STR_MAX + 2];
+                        int pl = snprintf(prefix, sizeof(prefix), "%s: ",
+                                          config_get_str("pet_name", "萝莉丝"));
+                        write(fd, prefix, pl);
+                        write(fd, it.assistant, al);
+                        write(fd, "\n", 1);
+                    }
+                }
+                close(fd);
             } else {
                 ESP_LOGW(TAG, "打开记忆文件失败");
             }
@@ -118,10 +199,11 @@ static void memory_store_writer_task(void *arg)
                 if (len > 0) {
                     buf = heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
                     if (buf) {
-                        FILE *f = fopen(MEM_FILE, "r");
-                        if (f) {
-                            size_t n = fread(buf, 1, len, f);
-                            fclose(f);
+                        int fd = open(MEM_FILE, O_RDONLY);
+                        if (fd >= 0) {
+                            ssize_t n = read(fd, buf, len);
+                            close(fd);
+                            if (n < 0) n = 0;
                             buf[n] = '\0';
                         } else {
                             free(buf);
@@ -129,12 +211,53 @@ static void memory_store_writer_task(void *arg)
                             len = 0;
                         }
                     } else {
-                        len = 0;   /* PSRAM 不足 → 回传空, 服务端按无记忆处理 */
+                        len = 0; /* PSRAM 不足 → 回传空, 服务端按无记忆处理 */
                     }
                 }
             }
-            if (it.cb) it.cb(buf, len, it.arg);   /* 回调返回后缓冲即失效 */
+            if (it.cb) it.cb(buf, len, it.arg); /* 回调返回后缓冲即失效 */
             free(buf);
+        } else if (it.op == MEM_WRITE_REPAIR) {
+            /* 自愈 (1.0.252): 读全文件 → 清洗坏字节 → O_TRUNC 原子重写。
+             * 全在本任务内执行 → 与 APPEND/OVERWRITE 严格串行。此前修复在
+             * 主循环直接 O_TRUNC 写盘, 与写盘任务并发 append 相互覆盖/交错 →
+             * 坏字节每次对话复现; 且修复写回用 strlen 越读 (读缓冲未终止) →
+             * 附尾 PSRAM 垃圾 → 文件增长。stat 尺寸异常 (崩溃期脏 LittleFS
+             * 元数据垃圾尺寸, memory_store_size 已带 256KB 上限 → 0) 时按
+             * MEM_REPAIR_MAX 尝试读实际数据, 读 0 字节则不动 (空文件) */
+            size_t flen = memory_store_size();
+            if (flen == 0 || flen > MEM_REPAIR_MAX) flen = MEM_REPAIR_MAX;
+            char *fbuf = heap_caps_malloc(flen + 1, MALLOC_CAP_SPIRAM);
+            if (fbuf) {
+                int fd = open(MEM_FILE, O_RDONLY);
+                if (fd >= 0) {
+                    size_t got = 0;
+                    while (got < flen) {
+                        ssize_t r = read(fd, fbuf + got, flen - got);
+                        if (r <= 0) break;
+                        got += (size_t)r;
+                    }
+                    close(fd);
+                    if (got > 0) {
+                        fbuf[got] = '\0';
+                        size_t bad = utf8_sanitize_inplace(fbuf, got);
+                        if (bad > 0) {
+                            int wfd = open(MEM_FILE, O_CREAT | O_TRUNC | O_WRONLY);
+                            if (wfd >= 0) {
+                                size_t total = strlen(fbuf);
+                                if (total > 0 &&
+                                    write(wfd, fbuf, total) != (ssize_t)total)
+                                    ESP_LOGW(TAG, "记忆文件修复写入失败");
+                                close(wfd);
+                                ESP_LOGI(TAG, "记忆文件修复完成 (%u 坏字节 → '?', %u B)",
+                                         (unsigned)bad, (unsigned)total);
+                            }
+                        }
+                    }
+                }
+                free(fbuf);
+            }
+            s_repair_pending = false; /* 允许下周期重新入队 */
         }
         free(it.user);
         free(it.assistant);
@@ -147,19 +270,31 @@ static esp_err_t memory_store_enqueue(mem_write_op_t op, const char *user,
                                       const char *assistant, const char *content)
 {
     if (!s_write_q) return ESP_FAIL;
-    mem_write_item_t it = { .op = op, .user = NULL, .assistant = NULL, .content = NULL };
-    if (user) { it.user = strdup(user); if (!it.user) return ESP_ERR_NO_MEM; }
+    mem_write_item_t it = {.op = op, .user = NULL, .assistant = NULL, .content = NULL};
+    if (user) {
+        it.user = strdup(user);
+        if (!it.user) return ESP_ERR_NO_MEM;
+    }
     if (assistant) {
         it.assistant = strdup(assistant);
-        if (!it.assistant) { free(it.user); return ESP_ERR_NO_MEM; }
+        if (!it.assistant) {
+            free(it.user);
+            return ESP_ERR_NO_MEM;
+        }
     }
     if (content) {
         it.content = strdup(content);
-        if (!it.content) { free(it.user); free(it.assistant); return ESP_ERR_NO_MEM; }
+        if (!it.content) {
+            free(it.user);
+            free(it.assistant);
+            return ESP_ERR_NO_MEM;
+        }
     }
     if (xQueueSend(s_write_q, &it, pdMS_TO_TICKS(2000)) != pdTRUE) {
         ESP_LOGW(TAG, "记忆写队列满 — 本次写入丢弃");
-        free(it.user); free(it.assistant); free(it.content);
+        free(it.user);
+        free(it.assistant);
+        free(it.content);
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
@@ -168,12 +303,12 @@ static esp_err_t memory_store_enqueue(mem_write_op_t op, const char *user,
 esp_err_t memory_store_init(void)
 {
     /* /data 由 sensor_logger_init 挂载 (main.c 中先于本模块 init) */
-    FILE *f = fopen(MEM_FILE, "a");   /* 存在则保持内容, 不存在则创建 */
-    if (!f) {
+    int fd = open(MEM_FILE, O_CREAT | O_APPEND | O_WRONLY); /* 存在则保持内容, 不存在则创建 */
+    if (fd < 0) {
         ESP_LOGW(TAG, "data 分区不可用 — 请确认 sensor_logger_init 已先执行");
         return ESP_FAIL;
     }
-    fclose(f);
+    close(fd);
     s_ready = true;
     s_write_q = xQueueCreate(MEM_WRITE_Q_LEN, sizeof(mem_write_item_t));
     if (!s_write_q) {
@@ -200,15 +335,20 @@ size_t memory_store_size(void)
     if (!s_ready) return 0;
     struct stat st;
     if (stat(MEM_FILE, &st) != 0) return 0;
+    /* : 崩溃期脏 LittleFS 元数据可给垃圾尺寸 (实测 483 B 文件 stat 出 >100KB
+     * → 假"记忆已超 100KB"告警, 1.0.252 根因); 设计上限 100KB, >256KB 即损坏,
+     * 返回 0 防垃圾尺寸传播 (s_size_cache/读缓冲分配/超限判断) */
+    if (st.st_size > (off_t)MEM_MAX_FILE) return 0;
     return (size_t)st.st_size;
 }
 
 esp_err_t memory_store_append(const char *user, const char *assistant)
 {
     if (!s_ready || !s_writes_safe || (!user && !assistant)) return ESP_FAIL;
-    /* 用 tick 刷新的缓存值判超限 — stat() 也是 flash 读, PSRAM 栈任务上会崩
+    /* 用 tick 刷新的缓存值判超限 — stat 也是 flash 读, PSRAM 栈任务上会崩
      * (1.0.213 只修了写, 此处残留的 stat 就是 1.0.214 崩点) */
-    if (memory_store_cached_size() > MEM_MAX_BYTES)
+    if (memory_store_cached_size() > MEM_MAX_BYTES) /* : 漏了 () — 函数指针
+            与整数比较恒真 → 每次对话都误报"记忆已超 100KB" (1.0.252 根因) */
         ESP_LOGW(TAG, "记忆已超 100KB, 等待服务端压缩");
     return memory_store_enqueue(MEM_WRITE_APPEND, user, assistant, NULL);
 }
@@ -216,7 +356,7 @@ esp_err_t memory_store_append(const char *user, const char *assistant)
 esp_err_t memory_store_read_async(memory_read_cb_t cb, void *arg)
 {
     if (!cb || !s_write_q) return ESP_FAIL;
-    mem_write_item_t it = { .op = MEM_READ, .cb = cb, .arg = arg };
+    mem_write_item_t it = {.op = MEM_READ, .cb = cb, .arg = arg};
     if (xQueueSend(s_write_q, &it, pdMS_TO_TICKS(2000)) != pdTRUE) {
         ESP_LOGW(TAG, "记忆读队列满 — 读取请求丢弃");
         return ESP_ERR_TIMEOUT;
@@ -234,15 +374,41 @@ static void memory_store_refresh_cache(void)
 {
     s_size_cache = memory_store_size();
     s_size_valid = true;
-    if (s_summary) { free(s_summary); s_summary = NULL; }
-    if (s_size_cache == 0 || s_size_cache > SUMMARY_MAX) return;  /* 非压缩态 */
+    if (s_summary) {
+        free(s_summary);
+        s_summary = NULL;
+    }
+    if (s_size_cache == 0 || s_size_cache > SUMMARY_MAX) return; /* 非压缩态 */
     s_summary = heap_caps_malloc(s_size_cache + 1, MALLOC_CAP_SPIRAM);
     if (!s_summary) return;
-    FILE *f = fopen(MEM_FILE, "r");
-    if (!f) { free(s_summary); s_summary = NULL; return; }
-    size_t n = fread(s_summary, 1, s_size_cache, f);
-    fclose(f);
-    s_summary[n] = '\0';
+    int fd = open(MEM_FILE, O_RDONLY);
+    if (fd < 0) {
+        free(s_summary);
+        s_summary = NULL;
+        return;
+    }
+    ssize_t n = read(fd, s_summary, s_size_cache);
+    close(fd);
+    if (n < 0) n = 0;
+    s_summary[n] = '\0'; /* : 此前缺此终止 — 修复写回 strlen 越读到 PSRAM
+                          * 垃圾 (非零垃圾 → 写回附尾垃圾 → 文件长大/坏字节
+                          * 每次对话复现, 1.0.252 根因) */
+    /* : UTF-8 校验 — 历史文件可能残留截半字符 (旧版 512B snprintf
+     * 截断 + 崩溃期脏写), 坏字节随 mem_summary 上送会被服务端拒连。
+     * 发现即入队自愈修复 (MEM_WRITE_REPAIR 由写盘任务执行 — O_TRUNC 重写
+     * 与 append 严格串行, 此前主循环直接写盘与写盘任务并发 → 相互覆盖)。
+     * 占位保留记录结构, 服务端 LLM 压缩可整合。 */
+    size_t bad = utf8_sanitize_inplace(s_summary, (size_t)n);
+    if (bad > 0) {
+        ESP_LOGW(TAG, "记忆文件含无效 UTF-8 (%u 坏字节) — 已入队修复",
+                 (unsigned)bad);
+        if (!s_repair_pending) {
+            if (memory_store_enqueue(MEM_WRITE_REPAIR, NULL, NULL, NULL) == ESP_OK)
+                s_repair_pending = true;
+            else
+                ESP_LOGW(TAG, "记忆修复入队失败 — 下个周期重试");
+        }
+    }
 }
 
 void memory_store_tick(void)

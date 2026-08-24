@@ -10,6 +10,7 @@
 #include "pet_avatar.h"
 #include "pet_engine.h"
 #include "tm6604.h"
+#include "gesture_detect.h"
 #include "esp_log.h"
 #include "lvgl.h"
 #include "freertos/FreeRTOS.h"
@@ -17,17 +18,17 @@
 
 static const char *TAG = "pat";
 
-#define PAT_POLL_MS     20      /* 轮询周期 (触摸扫描 50Hz, 20ms 足够跟手) */
-#define PAT_RELEASE_MS  200     /* 手指离开 200ms 后结束动画 */
-#define PAT_ENGINE_COOLDOWN_MS 2000  /* 按住期间养成事件的重复触发冷却 */
-#define PAT_VIBE_DUTY   52      /* 持续轻震占空比 (>50% 芯片才起振, 低于摇晃强度) */
-#define PAT_VIBE_HOLD_MS 200    /* 每次刷新续震 200ms — 按住期间持续, 松手 ≤200ms 停止 */
+#define PAT_POLL_MS 20              /* 轮询周期 (触摸扫描 50Hz, 20ms 足够跟手) */
+#define PAT_RELEASE_MS 200          /* 手指离开 200ms 后结束动画 */
+#define PAT_ENGINE_COOLDOWN_MS 2000 /* 按住期间养成事件的重复触发冷却 */
+#define PAT_VIBE_DUTY 52            /* 持续轻震占空比 (>50% 芯片才起振, 低于摇晃强度) */
+#define PAT_VIBE_HOLD_MS 200        /* 每次刷新续震 200ms — 按住期间持续, 松手 ≤200ms 停止 */
 
 static lv_timer_t *s_timer;
-static bool        s_active;           /* motou 循环播放中 */
-static bool        s_enabled = true;   /* 页面级开关 (设置页禁用摸头) */
-static uint32_t    s_last_touch_tick;  /* 最近一次中间电极触摸时刻 */
-static uint32_t    s_last_engine_tick; /* 最近一次 pet_engine 触发时刻 */
+static bool s_active;               /* motou 循环播放中 */
+static bool s_enabled = true;       /* 页面级开关 (设置页禁用摸头) */
+static uint32_t s_last_touch_tick;  /* 最近一次中间电极触摸时刻 */
+static uint32_t s_last_engine_tick; /* 最近一次 pet_engine 触发时刻 */
 
 static void poll_cb(lv_timer_t *t)
 {
@@ -35,6 +36,14 @@ static void poll_cb(lv_timer_t *t)
     uint32_t now = xTaskGetTickCount();
 
     if (touch_is_top_middle_pressed()) {
+        /* 息屏按住 → 先唤醒: 顶部电极的触摸不进 gesture 左键唤醒路径
+         * (单击/双击/长按只覆盖导航电极), 主循环轮询 >250 才有接触判定 —
+         * 轻按 (<250) 会无反应 (实测: 按两次才醒)。唤醒幂等
+         * (main_screen_note_interaction 内部有 s_screen_on 守卫)。 */
+        if (!gesture_is_screen_on()) {
+            extern void main_screen_note_interaction(void);
+            main_screen_note_interaction();
+        }
         s_last_touch_tick = now;
         if (!s_active) {
             s_active = true;
@@ -43,7 +52,7 @@ static void poll_cb(lv_timer_t *t)
             pet_avatar_play_fast(PET_ANIM_PATHEAD);
             /* 养成联动: 摸头即时反馈, 按住期间每 2s 再触发一次 */
             pet_engine_trigger(PET_EVENT_TOUCH);
-            diary_mgr_note_event(DIARY_EVENT_PETTING);  /* 日记互动上报 (3s 节流在内部) */
+            diary_mgr_note_event(DIARY_EVENT_PETTING); /* 日记互动上报 (3s 节流在内部) */
             s_last_engine_tick = now;
         } else if (pet_avatar_get_current() != PET_ANIM_PATHEAD) {
             /* 被 LLM 等其他来源换掉的动画 — 按住期间夺回控制权 */

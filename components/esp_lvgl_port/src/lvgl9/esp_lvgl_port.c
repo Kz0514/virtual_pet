@@ -23,36 +23,36 @@
 static const char *TAG = "LVGL";
 
 /*******************************************************************************
-* Types definitions
-*******************************************************************************/
+ * Types definitions
+ *******************************************************************************/
 
 typedef struct lvgl_port_ctx_s {
-    TaskHandle_t        lvgl_task;
-    SemaphoreHandle_t   lvgl_mux;
-    SemaphoreHandle_t   timer_mux;
-    EventGroupHandle_t  lvgl_events;
-    esp_timer_handle_t  tick_timer;
-    bool                running;
-    int                 task_max_sleep_ms;
-    int                 timer_period_ms;
+    TaskHandle_t lvgl_task;
+    SemaphoreHandle_t lvgl_mux;
+    SemaphoreHandle_t timer_mux;
+    EventGroupHandle_t lvgl_events;
+    esp_timer_handle_t tick_timer;
+    bool running;
+    int task_max_sleep_ms;
+    int timer_period_ms;
 } lvgl_port_ctx_t;
 
 /*******************************************************************************
-* Local variables
-*******************************************************************************/
+ * Local variables
+ *******************************************************************************/
 static lvgl_port_ctx_t lvgl_port_ctx;
 
 /*******************************************************************************
-* Function definitions
-*******************************************************************************/
+ * Function definitions
+ *******************************************************************************/
 static void lvgl_port_task(void *arg);
 static esp_err_t lvgl_port_tick_init(void);
 static void lvgl_port_task_deinit(void);
 static inline bool indev_matches_event(const lv_indev_t *indev, const EventBits_t event);
 
 /*******************************************************************************
-* Public API functions
-*******************************************************************************/
+ * Public API functions
+ *******************************************************************************/
 
 esp_err_t lvgl_port_init(const lvgl_port_cfg_t *cfg)
 {
@@ -81,8 +81,7 @@ esp_err_t lvgl_port_init(const lvgl_port_cfg_t *cfg)
     ESP_GOTO_ON_FALSE(lvgl_port_ctx.lvgl_events, ESP_ERR_NO_MEM, err, TAG, "Create LVGL Event Group fail!");
 
     BaseType_t res;
-    const uint32_t caps = cfg->task_stack_caps ? cfg->task_stack_caps : MALLOC_CAP_INTERNAL |
-                          MALLOC_CAP_DEFAULT; // caps cannot be zero
+    const uint32_t caps = cfg->task_stack_caps ? cfg->task_stack_caps : MALLOC_CAP_INTERNAL | MALLOC_CAP_DEFAULT; // caps cannot be zero
     if (cfg->task_affinity < 0) {
         res = xTaskCreateWithCaps(lvgl_port_task, "taskLVGL", cfg->task_stack, xTaskGetCurrentTaskHandle(), cfg->task_priority,
                                   &lvgl_port_ctx.lvgl_task, caps);
@@ -113,6 +112,10 @@ esp_err_t lvgl_port_resume(void)
         lv_timer_enable(true);
         ret = esp_timer_start_periodic(lvgl_port_ctx.tick_timer, lvgl_port_ctx.timer_period_ms * 1000);
     }
+    /* v2.8: 恢复渲染任务 — 与 lvgl_port_stop 的 vTaskSuspend 配对 */
+    if (lvgl_port_ctx.lvgl_task != NULL) {
+        vTaskResume(lvgl_port_ctx.lvgl_task);
+    }
 
     return ret;
 }
@@ -124,6 +127,17 @@ esp_err_t lvgl_port_stop(void)
     if (lvgl_port_ctx.tick_timer != NULL) {
         lv_timer_enable(false);
         ret = esp_timer_stop(lvgl_port_ctx.tick_timer);
+    }
+    /* v2.8 轻睡修复: 挂起渲染任务本身 — 只停 lv_timer/tick 不够:
+     * taskLVGL 循环 (esp_lvgl_port.c:221-253) 每轮 xEventGroupWaitBits +
+     * lv_timer_handler + vTaskDelay(1), 只要有 1ms 级工作待处理,
+     * 每 1-2 tick 就绪一次 → SMP 全局 uxTopReadyPriority 恒 >0 →
+     * 双核 prvGetExpectedIdleTime 恒 0 (tasks.c:2540) →
+     * vApplicationSleep 永不调用 → 轻睡 100% 不进入 (实测: 息屏后
+     * sleeps=0 且 taskLVGL 状态 R)。挂起后无 ready 源, idle 正常评估睡眠。
+     * 恢复顺序: resume 先启 tick 再 resume 任务 (任务醒来即处理事件)。 */
+    if (lvgl_port_ctx.lvgl_task != NULL) {
+        vTaskSuspend(lvgl_port_ctx.lvgl_task);
     }
 
     return ret;
@@ -175,7 +189,7 @@ esp_err_t lvgl_port_task_wake(lvgl_port_event_type_t event, void *param)
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         xEventGroupSetBitsFromISR(lvgl_port_ctx.lvgl_events, bits, &xHigherPriorityTaskWoken);
         if (xHigherPriorityTaskWoken) {
-            portYIELD_FROM_ISR( );
+            portYIELD_FROM_ISR();
         }
     } else {
         xEventGroupSetBits(lvgl_port_ctx.lvgl_events, bits);
@@ -199,8 +213,8 @@ IRAM_ATTR bool lvgl_port_task_notify(uint32_t value)
 }
 
 /*******************************************************************************
-* Private functions
-*******************************************************************************/
+ * Private functions
+ *******************************************************************************/
 
 static void lvgl_port_task(void *arg)
 {
@@ -259,7 +273,7 @@ static void lvgl_port_task(void *arg)
     lvgl_port_task_deinit();
 
     /* Close task */
-    vTaskDeleteWithCaps( NULL );
+    vTaskDeleteWithCaps(NULL);
 }
 
 static void lvgl_port_task_deinit(void)

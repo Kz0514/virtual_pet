@@ -17,23 +17,27 @@
 #include "tts_client.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static const char *TAG = "life_log";
 
-#define LIFE_DIR        "/data/life"
-#define LIFE_FILE       "/data/life/log.txt"
-#define LIFE_OLD_FILE   "/data/life/log.old"
-#define LIFE_MAX_BYTES  (512 * 1024)
-#define LIFE_QUEUE_LEN  16
-#define LIFE_LINE_MAX   256
+#define LIFE_DIR "/data/life"
+#define LIFE_FILE "/data/life/log.txt"
+#define LIFE_OLD_FILE "/data/life/log.old"
+#define LIFE_MAX_BYTES (512 * 1024)
+#define LIFE_QUEUE_LEN 16
+#define LIFE_LINE_MAX 256
 
 static QueueHandle_t s_q = NULL;
 
@@ -52,10 +56,32 @@ static void append_line(const char *ts, const char *line)
         rename(LIFE_FILE, LIFE_OLD_FILE);
     }
 
-    FILE *f = fopen(LIFE_FILE, "a");
-    if (!f) return;
-    fprintf(f, "[%s] %s\n", ts, line);
-    fclose(f);
+    /* 写失败告警 (限频 5s) — 卷损坏/低电写失败曾静默吞掉, 用户只见
+     * 日志缺失与可用空间膨胀; 这里把 open/write 失败暴露出来 */
+    static int64_t s_last_warn_us = 0;
+    int64_t now_us = esp_timer_get_time();
+
+    int fd = open(LIFE_FILE, O_CREAT | O_APPEND | O_WRONLY);
+    if (fd < 0) {
+        if (now_us - s_last_warn_us > 5000000) {
+            ESP_LOGW(TAG, "打开 %s 失败 (errno=%d) — /data 卷异常或写失败",
+                     LIFE_FILE, errno);
+            s_last_warn_us = now_us;
+        }
+        return;
+    }
+    bool wr_err = false;
+    wr_err |= (write(fd, "[", 1) < 0);
+    wr_err |= (write(fd, ts, strlen(ts)) < 0);
+    wr_err |= (write(fd, "] ", 2) < 0);
+    wr_err |= (write(fd, line, strlen(line)) < 0);
+    wr_err |= (write(fd, "\n", 1) < 0);
+    if (wr_err && now_us - s_last_warn_us > 5000000) {
+        ESP_LOGW(TAG, "写入 %s 失败 — FAT 异常或 flash 写错误 (errno=%d)",
+                 LIFE_FILE, errno);
+        s_last_warn_us = now_us;
+    }
+    close(fd);
 }
 
 static void life_log_task(void *arg)
@@ -81,7 +107,7 @@ static void life_log_task(void *arg)
             snprintf(ts, sizeof(ts), "%02d-%02d %02d:%02d",
                      tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
         } else {
-            snprintf(ts, sizeof(ts), "--:-- --:--");   /* 未校时 */
+            snprintf(ts, sizeof(ts), "--:-- --:--"); /* 未校时 */
         }
         append_line(ts, line);
     }
@@ -98,7 +124,7 @@ void life_log_line(const char *fmt, ...)
     vsnprintf(buf, LIFE_LINE_MAX, fmt, ap);
     va_end(ap);
     if (xQueueSend(s_q, &buf, 0) != pdTRUE)
-        free(buf);   /* 队列满 → 丢最新, 日志可丢 */
+        free(buf); /* 队列满 → 丢最新, 日志可丢 */
 }
 
 esp_err_t life_log_init(void)
