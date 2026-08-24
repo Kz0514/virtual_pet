@@ -15,11 +15,13 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_check.h"
+#include "freertos/FreeRTOS.h" /* : vTaskDelay — SLPOUT 后 120ms 稳定期 */
+#include "freertos/task.h"
 
 static const char *TAG = "st7789";
 
 static esp_lcd_panel_io_handle_t s_panel_io = NULL;
-static esp_lcd_panel_handle_t    s_panel    = NULL;
+static esp_lcd_panel_handle_t s_panel = NULL;
 
 /* ── 背光 PWM (LEDC, 10bit) ── */
 static bool s_backlight_inited = false;
@@ -27,22 +29,22 @@ static bool s_backlight_inited = false;
 static esp_err_t backlight_init(void)
 {
     ledc_timer_config_t ledc_timer = {
-        .speed_mode       = LEDC_LOW_SPEED_MODE,
-        .duty_resolution  = LEDC_TIMER_10_BIT,
-        .timer_num        = LEDC_TIMER_0,
-        .freq_hz          = 23814,
-        .clk_cfg          = LEDC_AUTO_CLK,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 23814,
+        .clk_cfg = LEDC_AUTO_CLK,
     };
     ESP_RETURN_ON_ERROR(ledc_timer_config(&ledc_timer), TAG, "LEDC定时器");
 
     ledc_channel_config_t ledc_ch = {
-        .gpio_num       = DISPLAY_BL_IO,
-        .speed_mode     = LEDC_LOW_SPEED_MODE,
-        .channel        = LEDC_CHANNEL_0,
-        .timer_sel      = LEDC_TIMER_0,
-        .duty           = 0,     /* 初始占空比 0 — 由调用方设置亮度 */
-        .hpoint         = 0,
-        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num = DISPLAY_BL_IO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0, /* 初始占空比 0 — 由调用方设置亮度 */
+        .hpoint = 0,
+        .intr_type = LEDC_INTR_DISABLE,
     };
     ESP_RETURN_ON_ERROR(ledc_channel_config(&ledc_ch), TAG, "LEDC通道");
     s_backlight_inited = true;
@@ -70,34 +72,35 @@ esp_err_t st7789_init(void)
 
     /* SPI2: MOSI+SCLK, 无 MISO */
     spi_bus_config_t bus_cfg = {
-        .mosi_io_num     = DISPLAY_MOSI_IO,
-        .miso_io_num     = GPIO_NUM_NC,
-        .sclk_io_num     = DISPLAY_SCLK_IO,
-        .quadwp_io_num   = GPIO_NUM_NC,
-        .quadhd_io_num   = GPIO_NUM_NC,
+        .mosi_io_num = DISPLAY_MOSI_IO,
+        .miso_io_num = GPIO_NUM_NC,
+        .sclk_io_num = DISPLAY_SCLK_IO,
+        .quadwp_io_num = GPIO_NUM_NC,
+        .quadhd_io_num = GPIO_NUM_NC,
         .max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * 2 + 10,
-        .flags           = SPICOMMON_BUSFLAG_MASTER,
+        .flags = SPICOMMON_BUSFLAG_MASTER,
     };
     ESP_RETURN_ON_ERROR(spi_bus_initialize(DISPLAY_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO), TAG, "SPI");
 
     /* SPI Panel IO: 4线制, 模式0 */
     esp_lcd_panel_io_spi_config_t io_cfg = {
-        .cs_gpio_num       = DISPLAY_CS_IO,
-        .dc_gpio_num       = DISPLAY_DC_IO,
-        .spi_mode          = 0,
-        .pclk_hz           = DISPLAY_SPI_FREQ_HZ,
+        .cs_gpio_num = DISPLAY_CS_IO,
+        .dc_gpio_num = DISPLAY_DC_IO,
+        .spi_mode = 0,
+        .pclk_hz = DISPLAY_SPI_FREQ_HZ,
         .trans_queue_depth = 10,
-        .lcd_cmd_bits      = 8,
-        .lcd_param_bits    = 8,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)DISPLAY_SPI_HOST,
-                        &io_cfg, &s_panel_io), TAG, "Panel IO");
+                                                 &io_cfg, &s_panel_io),
+                        TAG, "Panel IO");
 
     /* ST7789 Panel: RGB565, RGB顺序 */
     esp_lcd_panel_dev_config_t panel_cfg = {
-        .reset_gpio_num    = DISPLAY_RST_IO,
-        .rgb_ele_order     = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel    = 16,
+        .reset_gpio_num = DISPLAY_RST_IO,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(s_panel_io, &panel_cfg, &s_panel), TAG, "Panel");
     esp_lcd_panel_reset(s_panel);
@@ -123,5 +126,25 @@ esp_err_t st7789_init(void)
     return ESP_OK;
 }
 
-esp_lcd_panel_handle_t    st7789_get_panel(void)     { return s_panel; }
+esp_lcd_panel_handle_t st7789_get_panel(void) { return s_panel; }
 esp_lcd_panel_io_handle_t st7789_get_panel_io(void) { return s_panel_io; }
+
+/* : 面板睡眠 — 见 st7789.h 注释。SLPIN 后 SPI 不再通信, 唤醒时
+ * 先 SLPOUT → 120ms 稳定 (datasheet: sleep out 到显示稳定需 ~120ms,
+ * 短了会白屏/花屏) → DISPON。期间面板 RAM 保持 (睡眠不掉显存), 恢复
+ * 显示的是息屏前最后帧, LVGL 全屏重绘覆盖 — 无闪烁。 */
+esp_err_t st7789_panel_sleep(bool sleep)
+{
+    if (!s_panel) return ESP_ERR_INVALID_STATE;
+    if (sleep) {
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, false), TAG, "DISPOFF");
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_sleep(s_panel, true), TAG, "SLPIN");
+        ESP_LOGI(TAG, "面板进入睡眠 (DISPOFF+SLPIN, 振荡器停)");
+    } else {
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_sleep(s_panel, false), TAG, "SLPOUT");
+        vTaskDelay(pdMS_TO_TICKS(120));
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG, "DISPON");
+        ESP_LOGI(TAG, "面板唤醒 (SLPOUT+120ms+DISPON)");
+    }
+    return ESP_OK;
+}

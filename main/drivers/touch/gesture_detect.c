@@ -16,64 +16,72 @@
 
 /* ── 手势检测状态机 ── */
 typedef enum {
-    GS_IDLE,            /* 无交互 */
-    GS_PRESS_PENDING,   /* 检测到首次触摸，等待分类 */
-    GS_SINGLE_TAP,      /* 单击已确认（等待可能的双击） */
-    GS_DOUBLE_TAP,      /* 双击已确认（等待可能的三击） */
-    GS_LONG_PRESS,      /* 长按进行中 */
-    GS_SWIPING,         /* 滑动进行中 */
+    GS_IDLE,          /* 无交互 */
+    GS_PRESS_PENDING, /* 检测到首次触摸，等待分类 */
+    GS_SINGLE_TAP,    /* 单击已确认（等待可能的双击） */
+    GS_DOUBLE_TAP,    /* 双击已确认（等待可能的三击） */
+    GS_LONG_PRESS,    /* 长按进行中 */
+    GS_SWIPING,       /* 滑动进行中 */
 } gesture_state_t;
 
 typedef struct {
     gesture_state_t state;
-    uint32_t        press_start_us;     /* 当前按下开始的时间 */
-    uint32_t        last_release_us;    /* 上次释放的时间 */
-    uint32_t        last_tap_us;        /* 最近一次点击释放的时间 */
-    int             tap_count;          /* 当前序列中的连续点击次数 */
-    float           swipe_start_pos;    /* 滑动起始位置 */
-    float           swipe_current_pos;  /* 滑动当前位置 */
-    bool            screen_on;          /* 当前屏幕状态 */
-    bool            menu_active;        /* UI 菜单是否打开 */
-    gesture_event_t pending_event;      /* 待报告的事件 */
-    bool            event_pending;
+    uint32_t press_start_us;       /* 当前按下开始的时间 */
+    uint32_t last_release_us;      /* 上次释放的时间 */
+    uint32_t last_tap_us;          /* 最近一次点击释放的时间 */
+    int tap_count;                 /* 当前序列中的连续点击次数 */
+    float swipe_start_pos;         /* 滑动起始位置 */
+    float swipe_current_pos;       /* 滑动当前位置 */
+    bool screen_on;                /* 当前屏幕状态 */
+    bool menu_active;              /* UI 菜单是否打开 */
+    gesture_event_t pending_event; /* 待报告的事件 */
+    bool event_pending;
 } gesture_ctx_t;
 
 static gesture_ctx_t s_gctx = {
-    .state        = GS_IDLE,
-    .screen_on    = true,  /* 启动后屏幕默认开启 */
-    .menu_active  = false,
+    .state = GS_IDLE,
+    .screen_on = true, /* 启动后屏幕默认开启 */
+    .menu_active = false,
     .event_pending = false,
 };
 
-#define TAP_TIMEOUT_US       300000   /* 点击间隔超时 300ms */
-#define LONG_PRESS_US        3000000  /* 长按阈值 3s */
-#define SWIPE_THRESHOLD      0.3f     /* 触发滑动的位移阈值 (raw 质心位移) */
-#define DOUBLE_TAP_WINDOW_US 500000   /* 双击窗口 500ms */
-#define TRIPLE_TAP_WINDOW_US 600000   /* 三击窗口 600ms */
+#define TAP_TIMEOUT_US 300000       /* 点击间隔超时 300ms */
+#define LONG_PRESS_US 3000000       /* 长按阈值 3s */
+#define SWIPE_THRESHOLD 0.3f        /* 触发滑动的位移阈值 (raw 质心位移) */
+#define DOUBLE_TAP_WINDOW_US 500000 /* 双击窗口 500ms */
+#define TRIPLE_TAP_WINDOW_US 600000 /* 三击窗口 600ms */
 
 /* 右侧滑条轻点 (NAV_UP/NAV_DOWN) */
-#define NAV_TAP_MAX_MS       500      /* 按住超过此时长视为亮度调节等操作, 不发 NAV */
-#define NAV_DEADZONE         0.08f    /* 中央死区: |pos| 小于此值忽略, 防误触 */
-#define NAV_SETTLE_MS        100      /* 按下后 IIR 收敛等待, 之后采样作为滑动基准 */
-#define NAV_SLIDE_THRESHOLD  0.25f    /* 右侧滑条滑动判定位移阈值 */
+#define NAV_TAP_MAX_MS 500        /* 按住超过此时长视为亮度调节等操作, 不发 NAV */
+#define NAV_DEADZONE 0.08f        /* 中央死区: |pos| 小于此值忽略, 防误触 */
+#define NAV_SETTLE_MS 100         /* 按下后 IIR 收敛等待, 之后采样作为滑动基准 */
+#define NAV_SLIDE_THRESHOLD 0.25f /* 右侧滑条滑动判定位移阈值 */
+
+/* 长按连续导航 (2026-08-22): 点击模式逐格选择需点很多下 (用户实报) —
+ * 按住超过 NAV_HOLD_REPEAT_MS 后按位置分区持续发射 NAV_UP/DOWN,
+ * 直到松开 (释放时 hold 已超 TAP_MAX, 不再补发轻点, 无双事件)。 */
+#define NAV_HOLD_REPEAT_MS NAV_TAP_MAX_MS /* 与轻点阈值一致: <500ms=轻点, >=500ms=连续 */
+#define NAV_HOLD_INTERVAL_US 120000       /* 连续发射间隔 120ms */
 
 /* 右侧滑条跟踪 (轻点 NAV_UP/DOWN + 滑动 NAV_SLIDE_UP/DOWN) */
 static struct {
-    bool     tracking;       /* 按住中 */
-    bool     settled;        /* IIR 已收敛, slide_ref 有效 */
-    bool     slide_active;   /* 本次触摸已发过滑动事件 (释放时不再判轻点) */
-    uint32_t press_us;       /* 按下时刻 */
-    float    last_pos;       /* 按住期间最新位置 */
-    float    slide_ref;      /* 滑动档位基准: 每越过一个阈值发一个事件 */
+    bool tracking;         /* 按住中 */
+    bool settled;          /* IIR 已收敛, slide_ref 有效 */
+    bool slide_active;     /* 本次触摸已发过滑动事件 (释放时不再判轻点) */
+    uint32_t press_us;     /* 按下时刻 */
+    float last_pos;        /* 按住期间最新位置 */
+    float slide_ref;       /* 滑动档位基准: 每越过一个阈值发一个事件 */
+    int hold_dir;          /* 长按导航方向: 0=无, -1=上, +1=下 */
+    uint32_t hold_last_us; /* 上次长按发射时刻 */
 } s_nav = {0};
 
 /* 顶部滑条跟踪 (滑动 SWIPE_LEFT/RIGHT + 轻点分区 TOP_TAP_LEFT/RIGHT) */
 static struct {
-    bool     tracking;       /* 触摸中 */
-    bool     emitted;        /* 本次触摸已发射过滑动方向事件 */
-    uint32_t press_us;       /* 按下时刻 */
-    float    start_pos;      /* 按下时 raw 质心 */
-    float    last_pos;       /* 最新 raw 质心 */
+    bool tracking;     /* 触摸中 */
+    bool emitted;      /* 本次触摸已发射过滑动方向事件 */
+    uint32_t press_us; /* 按下时刻 */
+    float start_pos;   /* 按下时 raw 质心 */
+    float last_pos;    /* 最新 raw 质心 */
 } s_swipe = {0};
 
 static gesture_event_cb_t s_event_cb = NULL;
@@ -116,9 +124,9 @@ void gesture_process(void)
                     /* 菜单模式: 单击零延迟发射 — 双击已改为顶条右滑返回,
                      * 无竞争语义, 不必等 500ms 双击窗口 */
                     if (s_gctx.screen_on) {
-                        emit_event(GESTURE_SINGLE_TAP);   /* 确认 */
+                        emit_event(GESTURE_SINGLE_TAP); /* 确认 */
                     } else {
-                        emit_event(GESTURE_WAKE_SCREEN);  /* 息屏: 只唤醒不盲操作 */
+                        emit_event(GESTURE_WAKE_SCREEN); /* 息屏: 只唤醒不盲操作 */
                     }
                     s_gctx.state = GS_IDLE;
                     s_gctx.tap_count = 0;
@@ -231,16 +239,16 @@ void gesture_process(void)
      * 方向标定 (2026-08-18 用户实测): 物理上半段 = pos 负侧。 */
     bool right_pressed = touch_is_right_pressed();
     if (right_pressed && !s_nav.tracking) {
-        s_nav.tracking     = true;
-        s_nav.settled      = false;
+        s_nav.tracking = true;
+        s_nav.settled = false;
         s_nav.slide_active = false;
-        s_nav.press_us     = (uint32_t)now_us;
-        s_nav.last_pos     = touch_right_position();
+        s_nav.press_us = (uint32_t)now_us;
+        s_nav.last_pos = touch_right_position();
     } else if (right_pressed) {
         s_nav.last_pos = touch_right_position();
         if (!s_nav.settled &&
             ((uint32_t)(now_us - s_nav.press_us) / 1000) >= NAV_SETTLE_MS) {
-            s_nav.settled   = true;
+            s_nav.settled = true;
             s_nav.slide_ref = s_nav.last_pos;
         }
         if (s_nav.settled && s_gctx.screen_on) {
@@ -248,23 +256,42 @@ void gesture_process(void)
             while (s_nav.last_pos - s_nav.slide_ref < -NAV_SLIDE_THRESHOLD) {
                 s_nav.slide_ref -= NAV_SLIDE_THRESHOLD;
                 s_nav.slide_active = true;
-                emit_event(GESTURE_NAV_SLIDE_UP);    /* 上滑 = pos 负方向 */
+                emit_event(GESTURE_NAV_SLIDE_UP); /* 上滑 = pos 负方向 */
             }
             while (s_nav.last_pos - s_nav.slide_ref > NAV_SLIDE_THRESHOLD) {
                 s_nav.slide_ref += NAV_SLIDE_THRESHOLD;
                 s_nav.slide_active = true;
                 emit_event(GESTURE_NAV_SLIDE_DOWN);
             }
+            /* 长按连续导航: 按住 ≥500ms 且未滑动 → 按位置分区定时发射
+             * (点击模式逐格选择太累; 滑动模式已有档位连走, 不重复) */
+            uint32_t hold_ms = (uint32_t)(now_us - s_nav.press_us) / 1000;
+            if (hold_ms >= NAV_HOLD_REPEAT_MS && !s_nav.slide_active) {
+                int dir = 0;
+                if (s_nav.last_pos < -NAV_DEADZONE)
+                    dir = -1;
+                else if (s_nav.last_pos > NAV_DEADZONE)
+                    dir = +1;
+                if (dir != s_nav.hold_dir) {
+                    s_nav.hold_dir = dir;
+                    s_nav.hold_last_us = now_us; /* 换区立即重置间隔 */
+                }
+                if (dir != 0 && (uint32_t)(now_us - s_nav.hold_last_us) >= NAV_HOLD_INTERVAL_US) {
+                    s_nav.hold_last_us = now_us;
+                    emit_event(dir < 0 ? GESTURE_NAV_UP : GESTURE_NAV_DOWN);
+                }
+            }
         }
     } else if (s_nav.tracking) {
         s_nav.tracking = false;
+        s_nav.hold_dir = 0;
         uint32_t hold_ms = (uint32_t)(now_us - s_nav.press_us) / 1000;
         if (hold_ms < NAV_TAP_MAX_MS && !s_nav.slide_active &&
             s_gctx.screen_on) {
             if (s_nav.last_pos < -NAV_DEADZONE) {
-                emit_event(GESTURE_NAV_UP);      /* 物理上半段 = pos 负侧 */
+                emit_event(GESTURE_NAV_UP); /* 物理上半段 = pos 负侧 */
             } else if (s_nav.last_pos > NAV_DEADZONE) {
-                emit_event(GESTURE_NAV_DOWN);    /* 物理下半段 = pos 正侧 */
+                emit_event(GESTURE_NAV_DOWN); /* 物理下半段 = pos 正侧 */
             }
         }
     }
@@ -277,11 +304,11 @@ void gesture_process(void)
      * 息屏时不发射 — 设置页右滑=返回, 盲操作会意外退出设置页。 */
     bool top_pressed = touch_is_top_pressed();
     if (top_pressed && !s_swipe.tracking) {
-        s_swipe.tracking  = true;
-        s_swipe.emitted   = false;
-        s_swipe.press_us  = (uint32_t)now_us;
+        s_swipe.tracking = true;
+        s_swipe.emitted = false;
+        s_swipe.press_us = (uint32_t)now_us;
         s_swipe.start_pos = touch_top_position_raw();
-        s_swipe.last_pos  = s_swipe.start_pos;
+        s_swipe.last_pos = s_swipe.start_pos;
     } else if (top_pressed) {
         s_swipe.last_pos = touch_top_position_raw();
         if (!s_swipe.emitted) {
@@ -301,9 +328,9 @@ void gesture_process(void)
         if (hold_ms < NAV_TAP_MAX_MS && !s_swipe.emitted &&
             s_gctx.screen_on) {
             if (s_swipe.last_pos < -NAV_DEADZONE) {
-                emit_event(GESTURE_TOP_TAP_LEFT);    /* 左半区 */
+                emit_event(GESTURE_TOP_TAP_LEFT); /* 左半区 */
             } else if (s_swipe.last_pos > NAV_DEADZONE) {
-                emit_event(GESTURE_TOP_TAP_RIGHT);   /* 右半区 */
+                emit_event(GESTURE_TOP_TAP_RIGHT); /* 右半区 */
             }
         }
     }
@@ -312,7 +339,7 @@ void gesture_process(void)
 /* ── 轮询手势事件 ── */
 bool gesture_poll_event(gesture_event_t *out_event)
 {
-    if (s_event_cb) return false;  /* 回调模式: 事件不再进队列 */
+    if (s_event_cb) return false; /* 回调模式: 事件不再进队列 */
     if (s_gctx.event_pending) {
         *out_event = s_gctx.pending_event;
         s_gctx.event_pending = false;
@@ -333,25 +360,26 @@ void gesture_set_event_handler(gesture_event_cb_t cb)
 }
 
 /* ── 状态设置器（由屏幕/菜单管理器调用） ── */
-void gesture_set_screen_on(bool on)  { s_gctx.screen_on = on; }
+void gesture_set_screen_on(bool on) { s_gctx.screen_on = on; }
 void gesture_set_menu_active(bool a) { s_gctx.menu_active = a; }
-bool gesture_is_menu_active(void)    { return s_gctx.menu_active; }
-bool gesture_is_screen_on(void)      { return s_gctx.screen_on; }
+bool gesture_is_menu_active(void) { return s_gctx.menu_active; }
+bool gesture_is_screen_on(void) { return s_gctx.screen_on; }
 
 void gesture_reset_taps(void)
 {
-    s_gctx.state         = GS_IDLE;
-    s_gctx.tap_count     = 0;
+    s_gctx.state = GS_IDLE;
+    s_gctx.tap_count = 0;
     s_gctx.press_start_us = 0;
-    s_gctx.last_tap_us   = 0;
+    s_gctx.last_tap_us = 0;
     s_gctx.last_release_us = 0;
     s_gctx.event_pending = false;
     s_gctx.pending_event = GESTURE_NONE;
-    s_nav.tracking     = false;
-    s_nav.settled      = false;
+    s_nav.tracking = false;
+    s_nav.settled = false;
     s_nav.slide_active = false;
+    s_nav.hold_dir = 0;
     s_swipe.tracking = false;
-    s_swipe.emitted  = false;
+    s_swipe.emitted = false;
 }
 
 /* ── 基于滑块的数值调节 ── */
@@ -359,12 +387,12 @@ int gesture_read_volume_pct(void)
 {
     /* 右侧滑块上半部分 = 音量 */
     float pos = touch_right_position();
-    if (fabsf(pos) < 0.15f) return -1;  /* 未被触摸 */
+    if (fabsf(pos) < 0.15f) return -1; /* 未被触摸 */
     /* 映射 0..1 到 0-100，步长 5% */
     int pct = (int)((pos + 1.0f) / 2.0f * 100.0f);
-    pct = (pct / 5) * 5;  /* 量化为 5% 步长 */
+    pct = (pct / 5) * 5; /* 量化为 5% 步长 */
     if (pct > 100) pct = 100;
-    if (pct < 0)   pct = 0;
+    if (pct < 0) pct = 0;
     return pct;
 }
 
@@ -376,7 +404,7 @@ int gesture_read_brightness_pct(void)
     int pct = (int)((pos + 1.0f) / 2.0f * 100.0f);
     pct = (pct / 5) * 5;
     if (pct > 100) pct = 100;
-    if (pct < 0)   pct = 0;
+    if (pct < 0) pct = 0;
     return pct;
 }
 

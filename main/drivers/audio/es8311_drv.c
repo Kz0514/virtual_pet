@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "driver/gpio.h"
+#include "driver/i2s_common.h"
 #include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
@@ -22,28 +23,31 @@ static const char *TAG = "es8311";
 /* PA (TPA2011D1) 开关 — 上电有爆音 (硬件遗留), 故开机开启后常开不再关闭 */
 
 static struct {
-    bool                   inited;
-    es8311_drv_cfg_t       cfg;
-    i2s_chan_handle_t      tx_chan;
-    i2s_chan_handle_t      rx_chan;
+    bool inited;
+    es8311_drv_cfg_t cfg;
+    i2s_chan_handle_t tx_chan;
+    i2s_chan_handle_t rx_chan;
     esp_codec_dev_handle_t adc_dev;
     esp_codec_dev_handle_t dac_dev;
-    int                    frame_bytes;
+    int frame_bytes;
+    esp_codec_dev_sample_info_t fs; /* hold(open) 时复用 */
 } _es = {0};
 
 /* ════════════════════════════════════════════════════════════════ */
 esp_err_t es8311_drv_init(const es8311_drv_cfg_t *cfg)
 {
-    if (_es.inited) { ESP_LOGW(TAG, "Already init"); return ESP_OK; }
+    if (_es.inited) {
+        ESP_LOGW(TAG, "Already init");
+        return ESP_OK;
+    }
 
     _es.cfg = cfg ? *cfg : ES8311_DRV_DEFAULT_CFG();
-    if (_es.cfg.sample_rate <= 0)     _es.cfg.sample_rate     = 16000;
+    if (_es.cfg.sample_rate <= 0) _es.cfg.sample_rate = 16000;
     if (_es.cfg.bits_per_sample <= 0) _es.cfg.bits_per_sample = 16;
-    if (_es.cfg.channels <= 0)        _es.cfg.channels        = 1;
-    if (_es.cfg.frame_ms <= 0)        _es.cfg.frame_ms        = 20;
+    if (_es.cfg.channels <= 0) _es.cfg.channels = 1;
+    if (_es.cfg.frame_ms <= 0) _es.cfg.frame_ms = 20;
 
-    _es.frame_bytes = _es.cfg.sample_rate * _es.cfg.channels
-                    * (_es.cfg.bits_per_sample / 8) * _es.cfg.frame_ms / 1000;
+    _es.frame_bytes = _es.cfg.sample_rate * _es.cfg.channels * (_es.cfg.bits_per_sample / 8) * _es.cfg.frame_ms / 1000;
 
     ESP_LOGI(TAG, "Init: %dHz %dbit %dch frame=%dms(%dB)",
              _es.cfg.sample_rate, _es.cfg.bits_per_sample, _es.cfg.channels,
@@ -51,46 +55,50 @@ esp_err_t es8311_drv_init(const es8311_drv_cfg_t *cfg)
 
     /* ── PA EN ── */
     if (!_es.cfg.mic_only) {
-        gpio_config_t pc = {.pin_bit_mask = BIT64(AUDIO_AMP_EN_IO), .mode = GPIO_MODE_OUTPUT,
-                            .pull_down_en = GPIO_PULLDOWN_ENABLE};
+        gpio_config_t pc = {.pin_bit_mask = BIT64(AUDIO_AMP_EN_IO), .mode = GPIO_MODE_OUTPUT, .pull_down_en = GPIO_PULLDOWN_ENABLE};
         gpio_config(&pc);
         gpio_set_level(AUDIO_AMP_EN_IO, 0);
     }
 
     /* ── I2S 全双工 (大 DMA buffer 容忍 flash 总线阻塞) ── */
     i2s_chan_config_t ch = I2S_CHANNEL_DEFAULT_CONFIG(AUDIO_I2S_PORT, I2S_ROLE_MASTER);
-    ch.dma_frame_num = 9600;  /* 200ms @48kHz, default ~2400 too small */
+    ch.dma_frame_num = 9600; /* 200ms @48kHz, default ~2400 too small */
     esp_err_t ret = i2s_new_channel(&ch,
-        _es.cfg.mic_only ? NULL : &_es.tx_chan, &_es.rx_chan);
-    if (ret != ESP_OK) { ESP_LOGE(TAG, "I2S chan fail: %d", ret); return ret; }
+                                    _es.cfg.mic_only ? NULL : &_es.tx_chan, &_es.rx_chan);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2S chan fail: %d", ret);
+        return ret;
+    }
 
     i2s_std_config_t sc = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(_es.cfg.sample_rate),
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(_es.cfg.sample_rate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                        _es.cfg.bits_per_sample,
-                        _es.cfg.channels == 1 ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = { .mclk = AUDIO_MCLK_IO,   .bclk = AUDIO_DMIC_SCL_IO,
-                      .ws   = AUDIO_LRCK_IO,    .dout = AUDIO_DSDIN_IO,
-                      .din  = AUDIO_ASDOUT_IO },
+            _es.cfg.bits_per_sample,
+            _es.cfg.channels == 1 ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {.mclk = AUDIO_MCLK_IO, .bclk = AUDIO_DMIC_SCL_IO, .ws = AUDIO_LRCK_IO, .dout = AUDIO_DSDIN_IO, .din = AUDIO_ASDOUT_IO},
     };
 
+    /* 通道只 init 不 enable — enable 由 es8311_drv_hold/release 按需管理
+     * (2026-08-22 电源管理 v1: enable 期持 APB 锁禁轻睡, 常开会锁死轻睡) */
     if (!_es.cfg.mic_only) {
         ret = i2s_channel_init_std_mode(_es.tx_chan, &sc);
-        if (ret != ESP_OK) { ESP_LOGE(TAG, "TX fail: %d", ret); return ret; }
-        ret = i2s_channel_enable(_es.tx_chan);
-        if (ret != ESP_OK) { ESP_LOGE(TAG, "TX en fail: %d", ret); return ret; }
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "TX fail: %d", ret);
+            return ret;
+        }
     }
     ret = i2s_channel_init_std_mode(_es.rx_chan, &sc);
-    if (ret != ESP_OK) { ESP_LOGE(TAG, "RX fail: %d", ret); return ret; }
-    ret = i2s_channel_enable(_es.rx_chan);
-    if (ret != ESP_OK) { ESP_LOGE(TAG, "RX en fail: %d", ret); return ret; }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "RX fail: %d", ret);
+        return ret;
+    }
 
     /* ── Codec 接口 ── */
     const audio_codec_data_if_t *rx_data, *tx_data = NULL;
-    audio_codec_i2s_cfg_t rx_i2s = { .rx_handle = _es.rx_chan };
+    audio_codec_i2s_cfg_t rx_i2s = {.rx_handle = _es.rx_chan};
     rx_data = audio_codec_new_i2s_data(&rx_i2s);
     if (!_es.cfg.mic_only) {
-        audio_codec_i2s_cfg_t tx_i2s = { .tx_handle = _es.tx_chan };
+        audio_codec_i2s_cfg_t tx_i2s = {.tx_handle = _es.tx_chan};
         tx_data = audio_codec_new_i2s_data(&tx_i2s);
     }
 
@@ -99,25 +107,41 @@ esp_err_t es8311_drv_init(const es8311_drv_cfg_t *cfg)
         .bus_handle = board_get_i2c_bus(),
     };
     const audio_codec_ctrl_if_t *ctrl = audio_codec_new_i2c_ctrl(&i2cc);
-    if (!ctrl) { ESP_LOGE(TAG, "ctrl_if fail"); return ESP_FAIL; }
+    if (!ctrl) {
+        ESP_LOGE(TAG, "ctrl_if fail");
+        return ESP_FAIL;
+    }
 
     const audio_codec_gpio_if_t *gpio = audio_codec_new_gpio();
-    if (!gpio) { ESP_LOGE(TAG, "gpio_if fail"); return ESP_FAIL; }
+    if (!gpio) {
+        ESP_LOGE(TAG, "gpio_if fail");
+        return ESP_FAIL;
+    }
 
     /* ── ADC (录音) ── */
     es8311_codec_cfg_t adc_cfg = {
-        .ctrl_if = ctrl, .gpio_if = gpio,
+        .ctrl_if = ctrl,
+        .gpio_if = gpio,
         .codec_mode = ESP_CODEC_DEV_WORK_MODE_ADC,
-        .pa_pin = -1,  .use_mclk = true,
-        .no_dac_ref = true,  /* ★ 断开内部 DAC→ADC 参考回路 */
+        .pa_pin = -1,
+        .use_mclk = true,
+        .no_dac_ref = true, /* ★ 断开内部 DAC→ADC 参考回路 */
     };
     const audio_codec_if_t *adc_codec = es8311_codec_new(&adc_cfg);
-    if (!adc_codec) { ESP_LOGE(TAG, "ADC codec fail"); return ESP_FAIL; }
+    if (!adc_codec) {
+        ESP_LOGE(TAG, "ADC codec fail");
+        return ESP_FAIL;
+    }
 
     _es.adc_dev = esp_codec_dev_new(&(esp_codec_dev_cfg_t){
-        .codec_if = adc_codec, .data_if = rx_data, .dev_type = ESP_CODEC_DEV_TYPE_IN,
+        .codec_if = adc_codec,
+        .data_if = rx_data,
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
     });
-    if (!_es.adc_dev) { ESP_LOGE(TAG, "ADC dev fail"); return ESP_FAIL; }
+    if (!_es.adc_dev) {
+        ESP_LOGE(TAG, "ADC dev fail");
+        return ESP_FAIL;
+    }
 
     /* ── DAC (播放) ── */
     if (!_es.cfg.mic_only) {
@@ -125,37 +149,58 @@ esp_err_t es8311_drv_init(const es8311_drv_cfg_t *cfg)
          * PA 引脚重配为 GPIO 并打开 (初始化 POP 声的来源), 且使我们的
          * LEDC PWM 软上电彻底失效 (引脚被切回 GPIO, 占空比写不进去) */
         es8311_codec_cfg_t dac_cfg = {
-            .ctrl_if = ctrl, .gpio_if = gpio,
+            .ctrl_if = ctrl,
+            .gpio_if = gpio,
             .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
-            .pa_pin = -1, .use_mclk = true,
+            .pa_pin = -1,
+            .use_mclk = true,
             .no_dac_ref = true,
         };
         const audio_codec_if_t *dac_codec = es8311_codec_new(&dac_cfg);
-        if (!dac_codec) { ESP_LOGE(TAG, "DAC codec fail"); return ESP_FAIL; }
+        if (!dac_codec) {
+            ESP_LOGE(TAG, "DAC codec fail");
+            return ESP_FAIL;
+        }
 
         _es.dac_dev = esp_codec_dev_new(&(esp_codec_dev_cfg_t){
-            .codec_if = dac_codec, .data_if = tx_data, .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+            .codec_if = dac_codec,
+            .data_if = tx_data,
+            .dev_type = ESP_CODEC_DEV_TYPE_OUT,
         });
-        if (!_es.dac_dev) { ESP_LOGE(TAG, "DAC dev fail"); return ESP_FAIL; }
+        if (!_es.dac_dev) {
+            ESP_LOGE(TAG, "DAC dev fail");
+            return ESP_FAIL;
+        }
     }
 
-    /* ── 打开设备 ── */
-    esp_codec_dev_sample_info_t fs = {
+    /* ── 架构: 启动时 open 一次, 芯片常驻 ──
+     * open = I2S 通道 enable + ES8311 start (上电配置一次后保持);
+     * ★ v1.2 实测: 每周期 open/close → ES8311 start/reset → 模拟瞬态
+     * (VMID/偏置建立/跌落) 被常开 PA 放大 → 周期性咔哒声。
+     * v1.3: 芯片只 start 一次, 采样/播放由 hold/release 只开关 I2S
+     * 时钟 (微秒级, 无模拟瞬态)。
+     * open 后立即停时钟: dev 层状态保持 (read/write 可用), 物理通道
+     * disable → 不持 APB 锁 → 轻睡可用 */
+    _es.fs = (esp_codec_dev_sample_info_t){
         .sample_rate = _es.cfg.sample_rate,
-        .channel     = _es.cfg.channels,
+        .channel = _es.cfg.channels,
         .bits_per_sample = _es.cfg.bits_per_sample,
     };
 
+    esp_codec_dev_open(_es.adc_dev, &_es.fs);
+    if (!_es.cfg.mic_only && _es.dac_dev)
+        esp_codec_dev_open(_es.dac_dev, &_es.fs);
+    /* DMA buffer 预填静音 — 全双工共享 DMA: enable 任一侧时 TX 同时输出;
+     * 残留非零数据下次 enable 会播放 → 咔哒 */
+    int16_t sil[960] = {0};
+    for (int i = 0; i < 16; i++)
+        esp_codec_dev_write(_es.dac_dev, sil, sizeof(sil));
+    if (!_es.cfg.mic_only && _es.tx_chan) i2s_channel_disable(_es.tx_chan);
+    i2s_channel_disable(_es.rx_chan);
+
     esp_codec_dev_set_in_gain(_es.adc_dev, _es.cfg.mic_gain_db);
-
-    ret = esp_codec_dev_open(_es.adc_dev, &fs);
-    if (ret != ESP_CODEC_DEV_OK) { ESP_LOGE(TAG, "ADC open fail: %d", ret); return ESP_FAIL; }
-
-    if (!_es.cfg.mic_only) {
+    if (!_es.cfg.mic_only)
         esp_codec_dev_set_out_vol(_es.dac_dev, 70);
-        ret = esp_codec_dev_open(_es.dac_dev, &fs);
-        if (ret != ESP_CODEC_DEV_OK) { ESP_LOGE(TAG, "DAC open fail: %d", ret); return ESP_FAIL; }
-    }
 
     /* ★ 修正 esp_codec_dev 默认值: 0D=0x01→0x06 (VREF=1, VMID=normal) */
     esp_codec_dev_write_reg(_es.adc_dev, 0x0D, 0x06);
@@ -190,40 +235,152 @@ esp_err_t es8311_drv_init(const es8311_drv_cfg_t *cfg)
 
 /* ════════════════════════════════════════════════════════════════ */
 
-int es8311_drv_read(int16_t *buf, int count) {
+/* hold/release = 只开关 I2S 时钟 —
+ * 芯片在 init 已 start 一次并常驻, 这里不再 open/close (每次
+ * start/reset 的模拟瞬态经 PA 放大成周期性咔哒, v1.2 实测)。
+ * enable 期间驱动持 APB 锁 (esp_driver_i2s), 空闲 disable → 锁释放
+ * → 轻睡解禁 (v1 根因: 常开永久持 2 把锁, 轻睡 0 次)。
+ *
+ * 双通道计数:
+ * - full (es8311_drv_hold): TTS 播放 (enable TX)
+ * - rx (es8311_drv_hold_rx): 录音/噪音采样/会话聆听 (enable RX)
+ * ★ 全双工共享 DMA: enable 任一侧时 TX 同时输出 buffer —
+ * buffer 常驻静音 (init 预填 + 归零时冲刷) → 喇叭无声
+ * mutex 串行化多任务并发; 双计数独立, 最后归零者停时钟并冲刷静音 */
+static uint8_t s_full_cnt = 0;
+static uint8_t s_rx_cnt = 0;
+static SemaphoreHandle_t s_hold_mux = NULL;
+
+/* 停时钟前冲刷静音 — 防 TTS 残留下次 enable 被播放 (咔哒);
+ * TX 未 enable 时跳过 — i2s_channel_write 要求通道已 enable
+ * (二进制信号量, v1.3 实测: 未 enable 写 → "The channel is not enabled") */
+static void es8311_flush_silence(void)
+{
+    if (!_es.dac_dev) return;
+    if (_es.tx_chan) {
+        i2s_chan_info_t info = {0};
+        if (i2s_channel_get_info(_es.tx_chan, &info) == ESP_OK && !info.is_enabled)
+            return;
+    }
+    int16_t sil[960] = {0};
+    for (int i = 0; i < 16; i++)
+        esp_codec_dev_write(_es.dac_dev, sil, sizeof(sil));
+}
+
+static void es8311_stop_i2s(void)
+{
+    es8311_flush_silence();
+    if (!_es.cfg.mic_only && _es.tx_chan) {
+        i2s_chan_info_t info = {0};
+        if (i2s_channel_get_info(_es.tx_chan, &info) == ESP_OK && info.is_enabled)
+            i2s_channel_disable(_es.tx_chan);
+    }
+    if (_es.rx_chan) {
+        i2s_chan_info_t info = {0};
+        if (i2s_channel_get_info(_es.rx_chan, &info) == ESP_OK && info.is_enabled)
+            i2s_channel_disable(_es.rx_chan);
+    }
+}
+
+void es8311_drv_hold_rx(void)
+{
+    if (!_es.inited) return;
+    if (!s_hold_mux) s_hold_mux = xSemaphoreCreateMutex();
+    if (!s_hold_mux) return;
+    xSemaphoreTake(s_hold_mux, portMAX_DELAY);
+    if (s_rx_cnt++ == 0 && s_full_cnt == 0) {
+        /* ★ S3 全双工: BCK/WS 时钟由 TX 通道产生 (share_bck_ws) —
+         * 只 enable RX 无时钟 → i2s_channel_read 超时 → 采样失败
+         * (v1.3 实测: noise total=0)。TX 必须同时 enable 提供时钟;
+         * TX buffer 常驻静音 (init 预填 + 归零冲刷) → 喇叭无声 */
+        if (!_es.cfg.mic_only && _es.tx_chan)
+            i2s_channel_enable(_es.tx_chan);
+        i2s_channel_enable(_es.rx_chan);
+    }
+    xSemaphoreGive(s_hold_mux);
+}
+
+void es8311_drv_release_rx(void)
+{
+    if (!_es.inited || !s_hold_mux) return;
+    xSemaphoreTake(s_hold_mux, portMAX_DELAY);
+    if (s_rx_cnt == 0) {
+        xSemaphoreGive(s_hold_mux);
+        return;
+    }
+    if (--s_rx_cnt == 0 && s_full_cnt == 0)
+        es8311_stop_i2s();
+    xSemaphoreGive(s_hold_mux);
+}
+
+void es8311_drv_hold(void)
+{
+    if (!_es.inited) return;
+    if (!s_hold_mux) s_hold_mux = xSemaphoreCreateMutex();
+    if (!s_hold_mux) return;
+    xSemaphoreTake(s_hold_mux, portMAX_DELAY);
+    if (s_full_cnt++ == 0 && s_rx_cnt == 0) {
+        if (!_es.cfg.mic_only && _es.tx_chan)
+            i2s_channel_enable(_es.tx_chan);
+        else
+            i2s_channel_enable(_es.rx_chan);
+    }
+    xSemaphoreGive(s_hold_mux);
+}
+
+void es8311_drv_release(void)
+{
+    if (!_es.inited || !s_hold_mux) return;
+    xSemaphoreTake(s_hold_mux, portMAX_DELAY);
+    if (s_full_cnt == 0) {
+        xSemaphoreGive(s_hold_mux);
+        return;
+    }
+    if (--s_full_cnt == 0 && s_rx_cnt == 0)
+        es8311_stop_i2s();
+    xSemaphoreGive(s_hold_mux);
+}
+
+int es8311_drv_read(int16_t *buf, int count)
+{
     if (!_es.inited || !_es.adc_dev) return -1;
     int bytes = count * sizeof(int16_t);
     int ret = esp_codec_dev_read(_es.adc_dev, (uint8_t *)buf, bytes);
     return (ret == ESP_CODEC_DEV_OK) ? bytes : ret;
 }
 
-int es8311_drv_write(const int16_t *buf, int count) {
+int es8311_drv_write(const int16_t *buf, int count)
+{
     if (!_es.inited || !_es.dac_dev) return -1;
     int bytes = count * sizeof(int16_t);
     int ret = esp_codec_dev_write(_es.dac_dev, (uint8_t *)buf, bytes);
     return (ret == ESP_CODEC_DEV_OK) ? bytes : ret;
 }
 
-void es8311_drv_set_vol(int vol) {
+void es8311_drv_set_vol(int vol)
+{
     if (!_es.inited || !_es.dac_dev) return;
     if (vol < 0) vol = 0;
     if (vol > 100) vol = 100;
     esp_codec_dev_set_out_vol(_es.dac_dev, vol);
 }
 
-void es8311_drv_set_mic_gain(float db) {
+void es8311_drv_set_mic_gain(float db)
+{
     if (!_es.inited || !_es.adc_dev) return;
     esp_codec_dev_set_in_gain(_es.adc_dev, db);
 }
 
-void es8311_drv_pa_set(bool on) {
+void es8311_drv_pa_set(bool on)
+{
     if (AUDIO_AMP_EN_IO < 0) return;
     gpio_set_direction(AUDIO_AMP_EN_IO, GPIO_MODE_OUTPUT);
     gpio_set_level(AUDIO_AMP_EN_IO, on ? 1 : 0);
     ESP_LOGI(TAG, "PA: %d", on ? 1 : 0);
 }
 
-void es8311_drv_dac_power(bool on) {
+void es8311_drv_dac_power(bool on)
+{
     if (!_es.inited || !_es.dac_dev) return;
     if (on) {
         esp_codec_dev_write_reg(_es.dac_dev, 0x12, 0x01);
@@ -233,7 +390,8 @@ void es8311_drv_dac_power(bool on) {
     ESP_LOGI(TAG, "DAC power: %d", on ? 1 : 0);
 }
 
-void es8311_drv_mute(bool mute) {
+void es8311_drv_mute(bool mute)
+{
     if (!_es.inited || !_es.dac_dev) return;
     esp_codec_dev_set_out_mute(_es.dac_dev, mute);
     ESP_LOGI(TAG, "mute: %d", mute);
@@ -241,12 +399,25 @@ void es8311_drv_mute(bool mute) {
 
 esp_codec_dev_handle_t es8311_get_dac_handle(void) { return _es.dac_dev; }
 
-void es8311_drv_deinit(void) {
+void es8311_drv_deinit(void)
+{
     if (!_es.inited) return;
-    if (_es.dac_dev) { esp_codec_dev_close(_es.dac_dev); esp_codec_dev_delete(_es.dac_dev); }
-    if (_es.adc_dev) { esp_codec_dev_close(_es.adc_dev); esp_codec_dev_delete(_es.adc_dev); }
-    if (!_es.cfg.mic_only && _es.tx_chan) { i2s_channel_disable(_es.tx_chan); i2s_del_channel(_es.tx_chan); }
-    if (_es.rx_chan) { i2s_channel_disable(_es.rx_chan); i2s_del_channel(_es.rx_chan); }
+    if (_es.dac_dev) {
+        esp_codec_dev_close(_es.dac_dev);
+        esp_codec_dev_delete(_es.dac_dev);
+    }
+    if (_es.adc_dev) {
+        esp_codec_dev_close(_es.adc_dev);
+        esp_codec_dev_delete(_es.adc_dev);
+    }
+    if (!_es.cfg.mic_only && _es.tx_chan) {
+        i2s_channel_disable(_es.tx_chan);
+        i2s_del_channel(_es.tx_chan);
+    }
+    if (_es.rx_chan) {
+        i2s_channel_disable(_es.rx_chan);
+        i2s_del_channel(_es.rx_chan);
+    }
     memset(&_es, 0, sizeof(_es));
     ESP_LOGI(TAG, "Deinit done");
 }

@@ -18,32 +18,49 @@ extern "C" {
 #endif
 
 typedef struct {
-    int sample_rate;        /* Hz, 默认 16000 */
-    int bits_per_sample;    /* 16 或 32, 默认 16 */
-    int channels;           /* 1=mono, 2=stereo, 默认 1 */
-    int frame_ms;           /* 帧长 ms, 默认 20 */
-    bool mic_only;          /* 仅录音, 默认 false */
-    float mic_gain_db;      /* 初始麦克风增益 dB, 默认 30.0 */
+    int sample_rate;     /* Hz, 默认 16000 */
+    int bits_per_sample; /* 16 或 32, 默认 16 */
+    int channels;        /* 1=mono, 2=stereo, 默认 1 */
+    int frame_ms;        /* 帧长 ms, 默认 20 */
+    bool mic_only;       /* 仅录音, 默认 false */
+    float mic_gain_db;   /* 初始麦克风增益 dB, 默认 30.0 */
 } es8311_drv_cfg_t;
 
-#define ES8311_DRV_DEFAULT_CFG()  \
-    ((es8311_drv_cfg_t){           \
-        .sample_rate     = 16000,  \
-        .bits_per_sample = 16,     \
-        .channels        = 1,      \
-        .frame_ms        = 20,     \
-        .mic_only        = false,  \
-        .mic_gain_db     = 30.0f,  \
+#define ES8311_DRV_DEFAULT_CFG() \
+    ((es8311_drv_cfg_t){         \
+        .sample_rate = 16000,    \
+        .bits_per_sample = 16,   \
+        .channels = 1,           \
+        .frame_ms = 20,          \
+        .mic_only = false,       \
+        .mic_gain_db = 30.0f,    \
     })
 
 /** 初始化 (cfg=NULL 使用默认值). 共享I2C总线须已在 board 层初始化. */
 esp_err_t es8311_drv_init(const es8311_drv_cfg_t *cfg);
 
+/** 占用 I2S 全双工 (TTS 播放): 使能 I2S 时钟, 引用计数 —
+ * ★ v1.3: 芯片 init 时已 start 一次并常驻 (DAC 保持上电 — 开关 DAC
+ * 电源有 POP 声), hold/release 只开关 I2S 时钟 (无模拟瞬态);
+ * 空闲 disable → 不持 APB 锁 → 轻睡可用 */
+void es8311_drv_hold(void);
+
+/** 释放 I2S (对应每次 hold): 计数归零时冲刷静音 + disable 通道 */
+void es8311_drv_release(void);
+
+/** 仅占用 RX (录音/噪音采样/会话聆听): 使能 RX 时钟 —
+ * 全双工共享 DMA, TX 同时输出但 buffer 常驻静音 → 喇叭无声;
+ * 计数与 hold/release 独立, 并发嵌套安全 */
+void es8311_drv_hold_rx(void);
+
+/** 释放 RX (对应每次 hold_rx) */
+void es8311_drv_release_rx(void);
+
 /** 读取录音数据, 返回字节数 (<0=错误). count = sr*ch*frame_ms/1000 */
-int  es8311_drv_read(int16_t *buf, int count);
+int es8311_drv_read(int16_t *buf, int count);
 
 /** 写入播放数据, 返回字节数 */
-int  es8311_drv_write(const int16_t *buf, int count);
+int es8311_drv_write(const int16_t *buf, int count);
 
 /** 播放音量 0~100 */
 void es8311_drv_set_vol(int vol);
