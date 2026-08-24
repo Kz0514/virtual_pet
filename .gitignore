@@ -92,6 +92,12 @@ components/lvgl/library.properties
 components/lvgl/lv_version.h.in
 components/lvgl/lvgl.mk
 components/lvgl/lvgl.pc.in
+components/lvgl/.component_hash
+components/lvgl/.devcontainer/
+components/lvgl/.gitignore
+components/lvgl/.pre-commit-config.yaml
+components/lvgl/.typos.toml
+components/lvgl/env_support/esp/
 *.elf
 *.map
 flasher_args.json # Generated in build directory
