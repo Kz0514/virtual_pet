@@ -1,0 +1,18 @@
+/**
+ * @file screen_switch.h
+ * @brief 屏幕切换: 强制全屏重绘 (残影防护)
+ *
+ * 2026-08-22 实报: 设置页顶栏残留日记日期/正文、高亮行透出旧屏幕内容 —
+ * 部分刷新模式下, 屏幕切换后的第一帧若未完整覆盖全部行, 未刷新的行
+ * 保持旧屏幕像素。screen_load_full 在加载期间禁用 invalidate (新屏幕
+ * 创建期的 invalidate 本就无效), 加载后强制整屏重绘, 保证首帧完整。
+ */
+#pragma once
+
+#include "lvgl.h"
+
+/**
+ * @brief 加载屏幕并强制全屏重绘
+ * @param scr 新屏幕对象 (不检查 NULL, 调用方保证)
+ */
+void screen_load_full(lv_obj_t *scr);
