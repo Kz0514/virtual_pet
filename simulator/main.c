@@ -14,6 +14,9 @@
 
 /* ── 项目的 LVGL UI 代码 (直接引用, 不动原文件) ── */
 #include "ui/screens/home_screen.h"
+#include "ui/screens/settings_screen.h"
+#include "ui/screens/diary_screen.h"
+#include "ui/screens/screen_switch.h"
 #include "ui/widgets/pet_avatar.h"
 #include "ui/widgets/status_bar.h"
 #include "ui/widgets/chat_bubble.h"
@@ -28,16 +31,16 @@
 static float sim_temp = 25.3f;
 static float sim_hum = 58.7f;
 static float sim_lux = 320.0f;
-static int sim_counter = 0;
 
 static void sim_data_timer_cb(lv_timer_t *t) {
     (void)t;
-    sim_counter++;
+    static int s_tick = 0;
+    s_tick++;
 
     /* 模拟温度有微小波动 */
-    sim_temp = 25.3f + (sim_counter % 10) * 0.1f;
-    sim_hum  = 58.7f - (sim_counter % 5) * 0.2f;
-    sim_lux  = 320.0f + (sim_counter % 20) * 15.0f;
+    sim_temp = 25.3f + (s_tick % 10) * 0.1f;
+    sim_hum  = 58.7f - (s_tick % 5) * 0.2f;
+    sim_lux  = 320.0f + (s_tick % 20) * 15.0f;
 
     home_screen_set_data(
         sim_temp, sim_hum, sim_lux,
@@ -51,38 +54,22 @@ static void sim_data_timer_cb(lv_timer_t *t) {
     status_bar_set_wifi(true, -45);
     status_bar_set_battery(85, 3800);
 
-    /* 每10秒显示一条聊天消息做演示 */
-    if (sim_counter == 20) {
-        chat_bubble_show("你好! 我是你的虚拟宠物~", 5000);
-    }
-    if (sim_counter == 40) {
-        notify_show(NOTIFY_INFO, "固件已是最新版本 v2.0", 3000);
-    }
-    if (sim_counter == 60) {
-        chat_bubble_show("今天天气不错, 出去走走吧! |p1000 记得带伞哦~", 5000);
-    }
-    if (sim_counter == 80) {
-        pet_avatar_play(PET_ANIM_HAPPY);
-    }
-    if (sim_counter == 90) {
-        pet_avatar_play(PET_ANIM_EXCITED);
-    }
-    if (sim_counter == 100) {
-        pet_avatar_play(PET_ANIM_SLEEPY);
-    }
-    if (sim_counter == 110) {
-        notify_show(NOTIFY_WARN, "电量低于 20%, 请充电", 4000);
-        pet_avatar_play(PET_ANIM_SAD);
-    }
-    if (sim_counter >= 115 && sim_counter < 120) {
-        /* 回到 idle */
-        pet_avatar_play(PET_ANIM_IDLE);
-        sim_counter = 0;
-    }
+    /* 纯手动模式: 不再定时弹气泡/通知/动画, 全部由按键触发
+     * (C=气泡, N=通知, 1~7=动画) */
 }
 
-/* ── 键盘快捷键: 数字键切换动画 (边沿触发) ── */
-static bool s_key_prev[12];
+/* ── 主页 screen 对象 (SDL 默认屏; 设置页关闭后切回) ── */
+static lv_obj_t *s_home_scr = NULL;
+
+/* ── 设置页退出回调: 先切回主页再销毁 (照 diary_screen.c 的"先切后删"范式) ── */
+static void sim_settings_close_cb(void) {
+    screen_load_full(s_home_scr);
+    settings_screen_destroy();
+}
+
+/* ── 键盘快捷键: 数字键切换动画 (边沿触发) ──
+ * 槽位: 0-6 数字键, 7=C, 8=N, 9=H, 10=S, 11=D, 12-15=Up/Down/Enter/Esc */
+static bool s_key_prev[16];
 
 static void key_shortcut_timer_cb(lv_timer_t *t) {
     (void)t;
@@ -127,11 +114,68 @@ static void key_shortcut_timer_cb(lv_timer_t *t) {
     }
     s_key_prev[9] = h;
 
-    /* Q / ESC: 退出 */
-    if (keys[SDL_SCANCODE_Q] || keys[SDL_SCANCODE_ESCAPE]) {
+    /* S: 打开/关闭设置页 (激活时注入 BACK, 根页自动触发 close_cb 回主页) */
+    bool s = keys[SDL_SCANCODE_S] != 0;
+    if (s && !s_key_prev[10]) {
+        printf("[sim] 按键 S: %s\n",
+               settings_screen_is_active() ? "关闭设置页" : "打开设置页");
+        if (settings_screen_is_active()) {
+            settings_screen_input(SETTINGS_EV_BACK);
+        } else if (!diary_screen_is_active()) {
+            settings_screen_set_close_cb(sim_settings_close_cb);
+            settings_screen_init();
+        }
+    }
+    s_key_prev[10] = s;
+
+    /* D: 打开日记页 (从主页直接打开; BACK 回主页) */
+    bool d = keys[SDL_SCANCODE_D] != 0;
+    if (d && !s_key_prev[11] && !settings_screen_is_active() && !diary_screen_is_active()) {
+        printf("[sim] 按键 D: 打开日记页\n");
+        diary_screen_init();
+    }
+    s_key_prev[11] = d;
+
+    /* 方向键 + 回车 + ESC: 注入设置/日记页导航 (按真机 input_handler 优先级路由) */
+    bool up    = keys[SDL_SCANCODE_UP] != 0;
+    bool down  = keys[SDL_SCANCODE_DOWN] != 0;
+    bool enter = keys[SDL_SCANCODE_RETURN] != 0;
+    bool esc   = keys[SDL_SCANCODE_ESCAPE] != 0;
+
+    if ((up && !s_key_prev[12]) || (down && !s_key_prev[13]) ||
+        (enter && !s_key_prev[14]) || (esc && !s_key_prev[15])) {
+        settings_event_t ev;
+        if (esc)              ev = SETTINGS_EV_BACK;
+        else if (up)          ev = SETTINGS_EV_UP;
+        else if (down)        ev = SETTINGS_EV_DOWN;
+        else                  ev = SETTINGS_EV_CONFIRM;
+
+        if (diary_screen_is_active()) {
+            printf("[sim] 按键 %s → 日记页\n", esc ? "ESC" : up ? "UP" : down ? "DOWN" : "ENTER");
+            diary_screen_input(ev);
+        } else if (settings_screen_is_active()) {
+            printf("[sim] 按键 %s → 设置页\n", esc ? "ESC" : up ? "UP" : down ? "DOWN" : "ENTER");
+            settings_screen_input(ev);
+        }
+    }
+    s_key_prev[12] = up;
+    s_key_prev[13] = down;
+    s_key_prev[14] = enter;
+    /* s_key_prev[15] (esc) 在退出块统一更新, 供边沿检测 */
+
+    /* Q: 退出 (ESC 已路由给设置/日记页, 仅"连续两帧无 active 屏"时才退出)
+     * ⚠ 坑: BACK 切换是同步的 — 从设置根页 ESC 回主页的同一帧里
+     * is_active() 已为 false, 若此时直接判"主页 ESC 退出"会误杀进程,
+     * 必须要求上一帧也无 active 屏 (s_prev_no_active). */
+    static bool s_prev_no_active = true;
+    bool now_active = settings_screen_is_active() || diary_screen_is_active();
+    if (keys[SDL_SCANCODE_Q] ||
+        (esc && !s_key_prev[15] && s_prev_no_active && !now_active)) {
         printf("[sim] 退出\n");
         exit(0);
     }
+    s_key_prev[15] = esc;
+    s_prev_no_active = !now_active;
 }
 
 /* ── 字体调试: 用 LVGL API 检查关键字符是否可解析 ── */
@@ -205,6 +249,9 @@ int main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
 
+    /* 调试输出: 重定向到管道时也即时可见 (kill 不丢日志) */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     /* 1. 初始化 LVGL */
     lv_init();
 
@@ -228,6 +275,8 @@ int main(int argc, char *argv[]) {
     /* 5. 创建所有 UI 组件 */
     printf("[sim] 创建 home_screen...\n");
     home_screen_create();
+    /* 保存主页 screen 对象 (SDL 默认屏; 设置页关闭后 screen_load_full 切回) */
+    s_home_scr = lv_screen_active();
 
     printf("[sim] 初始化 pet_avatar...\n");
     if (pet_avatar_init() != 0) {
@@ -258,14 +307,25 @@ int main(int argc, char *argv[]) {
     printf("[sim]   C                — 显示聊天气泡\n");
     printf("[sim]   N                — 显示通知\n");
     printf("[sim]   H                — 切换 WiFi 状态\n");
-    printf("[sim]   Q/ESC            — 退出\n");
+    printf("[sim]   S                — 打开/关闭设置页\n");
+    printf("[sim]   D                — 打开日记页 (需 simdata/diary/ 下有 HTML)\n");
+    printf("[sim]   ↑/↓/回车/ESC     — 设置/日记页导航 (与真机 input_handler 同语义)\n");
+    printf("[sim]   Q                — 退出 (主页时 ESC 亦可)\n");
     printf("[sim]   鼠标滚轮          — 模拟编码器\n");
 
     /* 7. 主循环 */
+    const char *sim_timeout = getenv("SIM_TIMEOUT_MS");
     while (1) {
         uint32_t delay_ms = lv_timer_handler();
         if (delay_ms > 100) delay_ms = 100;  /* cap at 100ms for SDL responsiveness */
         SDL_Delay(delay_ms > 1 ? delay_ms : 1);
+
+        /* SIM_TIMEOUT_MS: 自动退出 (CI/自动化冒烟验证, 日志需落盘:
+         * 直接 kill 会丢 stdio 缓冲, 这里走正常退出路径) */
+        if (sim_timeout && SDL_GetTicks() > (Uint32)atoi(sim_timeout)) {
+            fflush(NULL);
+            exit(0);
+        }
     }
 
     return 0;

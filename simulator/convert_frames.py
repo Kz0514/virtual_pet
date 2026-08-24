@@ -73,9 +73,9 @@ def main():
         else:
             i += 1
 
-    # 输出到 simulator/spiffs/
+    # 输出到项目根 spiffs/ (资源与实机共享; 旧版输出到 simulator/spiffs 的布局已废弃)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    out_dir = os.path.join(script_dir, "spiffs")
+    out_dir = os.path.join(script_dir, "..", "spiffs")
     os.makedirs(out_dir, exist_ok=True)
 
     count = 0

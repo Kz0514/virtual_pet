@@ -11,6 +11,8 @@ extern "C" {
  * pet_avatar 的 TTS 联动逻辑直接跳过 */
 static inline void tts_client_init(void) { /* no-op */ }
 static inline bool tts_speak(const char *text) { (void)text; return false; }
+static inline bool tts_speak_queue(const char *text) { (void)text; return false; }
+static inline bool tts_client_queue_empty(void) { return true; }
 static inline bool tts_speak_inst(const char *text, const char *instruction) {
     (void)text; (void)instruction; return false;
 }
