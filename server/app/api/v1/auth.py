@@ -21,6 +21,7 @@ settings = get_settings()
 class DeviceRegisterRequest(BaseModel):
     mac_address: str = Field(..., pattern=r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
     device_name: str = Field(default="萝莉丝", max_length=64)
+    owner_name: str = Field(default="主人", max_length=32)  # 主人称谓 (旧固件缺省兜底)
     firmware_version: str = Field(default="1.0.0", max_length=16)
     hardware_rev: str = Field(default="A", max_length=8)
 
@@ -65,8 +66,24 @@ async def register_device(
         db.add(device)
         await db.flush()
 
-        pet = Pet(device_id=device.id, name=req.device_name)
+        pet = Pet(device_id=device.id, name=req.device_name, owner_name=req.owner_name)
         db.add(pet)
+        await db.flush()
+    else:
+        # 重注册 = 改名唯一同步通道 (固件每次开机擦 token 重 POST)
+        pet_result = await db.execute(
+            select(Pet).where(Pet.device_id == device.id)
+        )
+        pet = pet_result.scalar_one_or_none()
+        if pet is None:
+            pet = Pet(device_id=device.id, name=req.device_name, owner_name=req.owner_name)
+            db.add(pet)
+        else:
+            pet.name = req.device_name
+            pet.owner_name = req.owner_name
+        device.device_name = req.device_name
+        device.firmware_version = req.firmware_version
+        device.hardware_rev = req.hardware_rev
         await db.flush()
 
     # Issue JWT token

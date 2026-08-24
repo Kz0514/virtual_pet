@@ -17,9 +17,20 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup / shutdown events."""
+    import logging
+    from sqlalchemy import text
     from app.core.database import engine, Base
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # create_all 只建新表不补旧表列 — 幂等迁移: pets.owner_name (1.0.269)
+        try:
+            await conn.execute(
+                text("ALTER TABLE pets ADD COLUMN owner_name VARCHAR(32) DEFAULT '主人'")
+            )
+            logging.getLogger("startup").warning("迁移: pets.owner_name 列已新增")
+        except Exception as e:  # 已存在 (Duplicate column) 或其它
+            if "Duplicate column" not in str(e) and "already exists" not in str(e):
+                logging.getLogger("startup").error(f"迁移检查异常: {e}")
     yield
 
 

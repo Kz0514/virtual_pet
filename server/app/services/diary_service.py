@@ -58,24 +58,31 @@ def _safe_doodle_path(doodle_url: str) -> str | None:
 
 
 def load_doodle_b64(doodle_url: str | None) -> str | None:
-    """读取涂鸦 → data URI; 缺失/越界/过大/解码失败 → None (页面降级)."""
+    """读取涂鸦 → data URI; 缺失/越界/过大/解码失败 → None (页面降级).
+
+    mime 按扩展名 (png → image/png, webp → image/webp, 其余忽略).
+    """
     if not doodle_url:
         return None
     path = _safe_doodle_path(doodle_url)
     if not path or not os.path.isfile(path):
+        return None
+    mime = {"png": "image/png", "webp": "image/webp"}.get(
+        os.path.splitext(path)[1].lstrip(".").lower())
+    if not mime:
         return None
     try:
         with open(path, "rb") as f:
             data = f.read()
         if not data or len(data) > MAX_DOODLE_BYTES:
             return None
-        return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+        return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
     except (OSError, ValueError):
         logger.warning("Doodle read failed: %s", doodle_url)
         return None
 
 
-def render_diary_html(entry, doodle_b64: str | None) -> str:
+def render_diary_html(entry, doodle_b64: str | None, pet_name: str = "萝莉丝") -> str:
     """渲染单篇日记为完整 HTML 文档 (所有内容内嵌, 打开即用).
 
     entry: 具备 entry_date/title/content/mood_summary 属性的对象
@@ -87,7 +94,9 @@ def render_diary_html(entry, doodle_b64: str | None) -> str:
     paras = [escape(line) for line in entry.content.split("\n") if line.strip()]
     content_html = "".join(f"<p>{p}</p>" for p in paras) or "<p>今天没有留下文字。</p>"
 
-    mood_html = f'<div class="mood">☀ {mood}</div>' if mood else ""
+    # 纯文字心情 — 设备中文字体子集缺 ☀☔ 等符号会渲染成 tofu "▯",
+    # 不再硬编码装饰符号 (旧数据由固件 symbol_fix 映射兜底)
+    mood_html = f'<div class="mood">{mood}</div>' if mood else ""
     doodle_html = (
         f'<div class="doodle"><img src="{doodle_b64}" alt="今天的涂鸦"></div>'
         if doodle_b64 else ""
@@ -108,7 +117,7 @@ def render_diary_html(entry, doodle_b64: str | None) -> str:
   {mood_html}
   <div class="content">{content_html}</div>
   {doodle_html}
-  <div class="footer">Virtualpet · 萝莉丝的日记</div>
+  <div class="footer">Virtualpet - {escape(pet_name)}的日记</div>
 </div>
 </body>
 </html>

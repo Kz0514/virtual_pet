@@ -101,6 +101,16 @@ async def _generate_for_device(engine, device_id: str, target_date: date) -> Non
                         f"{settings.diary_min_interactions} — skip")
             return
 
+        # ── 1.5 宠物名/主人称谓 (对话前缀 + 提示词 token 替换用) ──
+        pet_row = (
+            await conn.execute(
+                text("SELECT name, owner_name FROM pets WHERE device_id=:d"),
+                {"d": device_id},
+            )
+        ).fetchone()
+        pet_name = (pet_row[0] if pet_row and pet_row[0] else "萝莉丝")
+        owner_name = (pet_row[1] if pet_row and pet_row[1] else "主人")
+
         # ── 2. 素材: 近三天对话 (带上海时间戳拼行) ──
         rows = (
             await conn.execute(
@@ -113,7 +123,7 @@ async def _generate_for_device(engine, device_id: str, target_date: date) -> Non
         lines = []
         for role, content, created_at in rows:
             ts = created_at.astimezone(timezone.utc) + SHIFT
-            who = "主人" if role == "user" else "萝莉丝"
+            who = owner_name if role == "user" else pet_name
             lines.append(f"[{ts:%m-%d %H:%M}] {who}: {content}")
         dialogue_text = "\n".join(lines)[:MAX_DIALOGUE_CHARS]
 
@@ -141,22 +151,45 @@ async def _generate_for_device(engine, device_id: str, target_date: date) -> Non
             event_lines.append(f"[{ts:%m-%d %H:%M}] 互动: {EVENT_LABELS.get(event_type, event_type)}")
         event_text = "\n".join(event_lines) or "(无)"
 
+    # ── 4.5 素材: 当天天气 (服务器 IP 定位; 预报无 target_date → 实时近似) ──
+    weather_text = ""
+    try:
+        from app.services.weather_service import get_current_weather, get_forecast, get_ip_location
+        loc = await get_ip_location()
+        lat, lon = loc.get("lat") or None, loc.get("lng") or None
+        fc = await get_forecast(lat=lat, lon=lon, days=3)
+        for f in fc:
+            if f.get("date") == str(target_date):
+                weather_text = f.get("weather", "") or ""
+                break
+        if not weather_text:
+            cur = await get_current_weather(lat=lat, lon=lon)
+            weather_text = cur.get("weather", "") or ""
+    except Exception as e:
+        logger.warning(f"Weather fetch failed: {e}")
+    weather_text = weather_text.strip()
+
     material = (
         f"【目标日期】{target_date:%Y年%m月%d日} (当天互动次数: {interaction_count})\n"
+        f"【当日天气】{weather_text or '(未知)'}\n"
         f"【重要历史】\n{history_text}\n"
         f"【当日互动】\n{event_text}\n"
         f"【对话记录 (含前后两天, 仅作上下文)】\n{dialogue_text}"
     )
 
     # ── 5. LLM 生成 ──
-    from app.utils.prompt_templates import DIARY_GENERATION_PROMPT
+    from app.utils.prompt_templates import DIARY_GENERATION_PROMPT, apply_names
     from app.services.llm_service import chat_json
     result = await chat_json(
-        DIARY_GENERATION_PROMPT, material, max_tokens=800, temperature=0.8
+        apply_names(DIARY_GENERATION_PROMPT, pet_name, owner_name),
+        material, max_tokens=800, temperature=0.8
     )
     title, content, mood, fallback_used = _coerce_result(
-        result, dialogue_text, target_date
+        result, dialogue_text, target_date, owner_name
     )
+    # 心情前置天气文字 (纯文字 — 设备中文字体子集缺符号, 腾讯 weather 字段已是"晴/多云"等)
+    if weather_text:
+        mood = f"{weather_text} {mood}".strip()
 
     # ── 6. Upsert (device_id+entry_date 唯一) ──
     now = datetime.now(timezone.utc)
@@ -204,7 +237,8 @@ async def _generate_for_device(engine, device_id: str, target_date: date) -> Non
                 f"fallback={fallback_used})")
 
 
-def _coerce_result(result, dialogue_text: str, target_date: date):
+def _coerce_result(result, dialogue_text: str, target_date: date,
+                   owner_name: str = "主人"):
     """LLM 输出校验与兜底 — 非 dict/含 _raw/字段缺失 → 模板标题 + 对话前 100 字.
     返回 (title, content, mood_summary, fallback_used)."""
     ok = isinstance(result, dict) and "_raw" not in result
@@ -215,6 +249,6 @@ def _coerce_result(result, dialogue_text: str, target_date: date):
     if fallback_used:
         logger.warning("Diary LLM output invalid — using fallback template")
         title = f"{target_date:%m月%d日} 的一天"
-        content = dialogue_text.strip()[:100] or "今天和主人一起度过了平凡的一天。"
+        content = dialogue_text.strip()[:100] or f"今天和{owner_name}一起度过了平凡的一天。"
         mood = ""
     return title[:20], content[:600], mood[:4], fallback_used

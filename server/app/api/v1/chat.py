@@ -47,11 +47,17 @@ async def send_message(
         and isinstance(h.get("content"), str)
     ]
 
+    # 宠物名/主人称谓 — AsyncSession 禁 lazy load, 显式查
+    from app.services.pet_state_service import fetch_pet_profile
+    pet_name, owner_name = await fetch_pet_profile(db, str(device.id))
+
     try:
-        reply, tools_used = await chat_with_tools(
+        reply, tools_used, _ = await chat_with_tools(
             user_text=req.text,
             history=history,
             device_id=str(device.id),
+            pet_name=pet_name,
+            owner_name=owner_name,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM error: {e}")

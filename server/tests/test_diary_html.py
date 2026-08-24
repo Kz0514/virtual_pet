@@ -80,7 +80,7 @@ class TestRenderDiaryHtml(unittest.TestCase):
         self.assertIn("2026-08-20", html)
         self.assertIn("今天主人摸了我的头。", html)
         self.assertIn("好开心呀!", html)
-        self.assertIn("☀ 开心", html)          # mood 徽章
+        self.assertIn('<div class="mood">开心</div>', html)  # mood 徽章 (纯文字, 无 ☀ 符号)
         self.assertNotIn("<img", html)          # 无涂鸦时不出现
 
     def test_xss_escaped(self):

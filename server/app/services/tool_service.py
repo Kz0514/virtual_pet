@@ -167,7 +167,7 @@ async def tool_env(device_id: str, params: dict | None = None) -> str:
     return json.dumps({"temp": "?", "hum": "?", "light": "?", "noise": "?", "battery": "?", "_note": "暂无传感器数据"})
 
 
-@_register("state", "萝莉丝的状态(心情/精力/亲密度/等级)")
+@_register("state", "宠物状态(心情/精力/亲密度/等级)")
 async def tool_state(device_id: str, params: dict | None = None) -> str:
     from app.core.database import AsyncSessionLocal
     from sqlalchemy import text
@@ -219,32 +219,32 @@ async def tool_location(device_id: str, params: dict | None = None) -> str:
     return json.dumps({"city": "未知", "_hint": "设备尚未定位"}, ensure_ascii=False)
 
 
-@_register("actions", "萝莉丝的动画表(名称/描述/心情/触觉)")
+@_register("actions", "宠物动画表(名称/描述/心情/触觉)")
 async def tool_actions(device_id: str, params: dict | None = None) -> str:
     """Return 11 animation slots. 播完自动回idle(zhanli站立)."""
     animations = [
         {"name":"idle","text":"站立(zhanli)","mood_fit":"平静、日常","haptic":"none",
          "use_when":"默认状态、平常说话、被动回应"},
         {"name":"happy","text":"高兴讲解","mood_fit":"开心","haptic":"short",
-         "use_when":"被夸、收到好消息、主人开心时"},
+         "use_when":"被夸、收到好消息、用户开心时"},
         {"name":"sad","text":"难过(同站立)","mood_fit":"难过","haptic":"soft",
-         "use_when":"被骂、主人生气、萝莉丝做错事"},
+         "use_when":"被骂、用户生气、宠物做错事"},
         {"name":"excited","text":"抱胸说话","mood_fit":"非常开心","haptic":"heartbeat",
          "use_when":"被夸可爱、超开心、元气满满"},
         {"name":"surprised","text":"蹲着/惊讶","mood_fit":"惊讶","haptic":"double",
-         "use_when":"意外消息、主人突然出现"},
+         "use_when":"意外消息、用户突然出现"},
         {"name":"sleepy","text":"睡觉","mood_fit":"困倦","haptic":"none",
-         "use_when":"深夜、萝莉丝累了、主人说晚安"},
+         "use_when":"深夜、宠物累了、用户说晚安"},
         {"name":"eating","text":"吃东西","mood_fit":"美食相关","haptic":"short",
-         "use_when":"聊到食物、萝莉丝饿了"},
+         "use_when":"聊到食物、宠物饿了"},
         {"name":"blush","text":"腼腆笑","mood_fit":"害羞、感动","haptic":"soft",
-         "use_when":"被过度夸奖、主人说肉麻的话"},
+         "use_when":"被过度夸奖、用户说肉麻的话"},
         {"name":"pathead","text":"摸头","mood_fit":"亲昵","haptic":"short",
-         "use_when":"主人摸头、安抚、亲昵互动"},
+         "use_when":"用户摸头、安抚、亲昵互动"},
         {"name":"scratch","text":"挠头","mood_fit":"困惑","haptic":"short",
          "use_when":"被问倒、疑惑、不好意思"},
         {"name":"pointself","text":"指着自己","mood_fit":"俏皮","haptic":"short",
-         "use_when":"主人问是谁、自夸、卖萌"},
+         "use_when":"用户问是谁、自夸、卖萌"},
     ]
     return json.dumps(animations, ensure_ascii=False)
 
@@ -283,7 +283,9 @@ async def tool_history(device_id: str, params: dict | None = None) -> str:
         # 超限: LLM 按重要性+时间远近压缩 → 推回设备覆盖 → 用压缩后内容回答
         logger.info(f"Memory {size}B > {settings.memory_max_bytes}B — compacting")
         from app.services.llm_service import compact_memory
-        new_content = await compact_memory(content)
+        from app.services.pet_state_service import fetch_pet_profile
+        pet_name, owner_name = await fetch_pet_profile(None, device_id)
+        new_content = await compact_memory(content, pet_name, owner_name)
         if new_content:
             await send_to_device(device_id, {"type": "memory_update", "content": new_content})
             # 重要历史落库 — 供夜间日记生成作素材 (失败不阻断对话)

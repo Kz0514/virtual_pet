@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_device
 from app.core.database import get_db
-from app.models import Device, DiaryEntry
+from app.models import Device, DiaryEntry, Pet
 from app.services.diary_service import load_doodle_b64, render_diary_html
 
 router = APIRouter()
@@ -100,6 +100,10 @@ async def get_diary_html(
     设备端保存到 /data/diary/YYYY-MM-DD.html, USB 拷出浏览器打开即一页纸.
     """
     entry = await _load_entry(entry_id, device, db)
+    # 宠物名 — AsyncSession 禁 lazy load, 显式查 (缺省回退 "萝莉丝")
+    pet_result = await db.execute(select(Pet).where(Pet.device_id == device.id))
+    pet = pet_result.scalar_one_or_none()
+    pet_name = pet.name if pet and pet.name else "萝莉丝"
     doodle_b64 = load_doodle_b64(entry.doodle_url)   # 缺失 → 纯文字页
-    html = render_diary_html(entry, doodle_b64)
+    html = render_diary_html(entry, doodle_b64, pet_name)
     return Response(content=html, media_type="text/html; charset=utf-8")

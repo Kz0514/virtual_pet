@@ -14,6 +14,7 @@ prompt: 只画具体元素 (太阳/云朵/花朵/蛋糕等), 避开动物/人物
 import asyncio
 import glob
 import hashlib
+import io
 import logging
 import os
 import random
@@ -21,7 +22,7 @@ import time
 
 import dashscope
 import httpx
-from PIL import Image
+from PIL import Image, ImageChops
 
 from app.config import get_settings
 
@@ -58,7 +59,7 @@ def _grid_prompt() -> str:
 
 
 def _pool_size() -> int:
-    return len(glob.glob(os.path.join(BATCH_DIR, "grid_*.png")))
+    return len(glob.glob(os.path.join(BATCH_DIR, "grid_*.webp")))
 
 
 def _cooled_down() -> bool:
@@ -129,7 +130,7 @@ async def _generate_and_split() -> int:
             return 0
         img = Image.open(__import__("io").BytesIO(r.content)).convert("RGB")
 
-    # 裁剪成格子
+    # 裁剪成格子 → 白底转透明 → lossless WebP (设备端直接解码显示, 透明融入信纸底)
     os.makedirs(BATCH_DIR, exist_ok=True)
     w, h = img.size
     cw, ch = w // GRID_COLS, h // GRID_ROWS
@@ -137,10 +138,28 @@ async def _generate_and_split() -> int:
     for row in range(GRID_ROWS):
         for col in range(GRID_COLS):
             tile = img.crop((col * cw, row * ch, (col + 1) * cw, (row + 1) * ch))
-            tile.save(os.path.join(BATCH_DIR, f"grid_{n}.png"), "PNG")
+            _save_webp_transparent(tile, os.path.join(BATCH_DIR, f"grid_{n}.webp"))
             n += 1
-    logger.info(f"Grid generated: {w}x{h} → {n} tiles")
+    logger.info(f"Grid generated: {w}x{h} → {n} tiles (webp lossless)")
     return n
+
+
+def _save_webp_transparent(tile: Image.Image, path: str) -> None:
+    """白底贴纸 → 透明 WebP 落盘.
+
+    生成图背景纯白, 把接近纯白的像素置为透明 (阈值 24/765 三通道距白之和),
+    线条/色块保留不透明. lossless 保线条边缘无有损噪点.
+    """
+    rgba = tile.convert("RGBA")
+    r, g, b, _ = rgba.split()
+    white = Image.new("L", rgba.size, 255)
+    dr = ImageChops.subtract(white, r)
+    dg = ImageChops.subtract(white, g)
+    db = ImageChops.subtract(white, b)
+    dist = ImageChops.add(ImageChops.add(dr, dg), db)          # 0..765
+    alpha = Image.eval(dist, lambda d: 0 if d <= 24 else 255)
+    rgba.putalpha(alpha)
+    rgba.save(path, "WEBP", lossless=True, quality=100)
 
 
 async def ensure_pool() -> bool:
@@ -176,4 +195,4 @@ async def maybe_generate_doodle(entry_id: str, title: str, content: str) -> str 
 
     size = _pool_size()
     idx = int(hashlib.md5(entry_id.encode()).hexdigest(), 16) % size
-    return f"/doodles/batch/grid_{idx}.png"
+    return f"/doodles/batch/grid_{idx}.webp"

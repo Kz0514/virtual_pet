@@ -2,13 +2,14 @@
 WebSocket endpoint — streaming chat + tool support + mood_delta 统一更新.
 """
 import json, logging, asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from sqlalchemy import text
 from app.config import get_settings
 from app.core.database import AsyncSessionLocal
 from app.core.security import verify_access_token
 from app.services.llm_service import chat_with_tools
+from app.services.tts_service import TTSSession
 from app.services.tool_service import (
     cache_sensor, resolve_scan_future, resolve_memory_future, get_device_location,
 )
@@ -113,20 +114,24 @@ async def device_ws(websocket: WebSocket, token: str = Query("")):
                     """Process chat in background so WS loop can handle scan_result etc."""
                     nonlocal user_text, context, mem_summary, mem_size
                     pet_state = ""
+                    pet_name = "萝莉丝"
+                    owner_name = "主人"
                     try:
                         async with AsyncSessionLocal() as db:
                             r = await db.execute(
-                                text("SELECT mood, intimacy, name FROM pets WHERE device_id=:d"),
+                                text("SELECT mood, intimacy, name, owner_name FROM pets WHERE device_id=:d"),
                                 {"d": device_id}
                             )
                             row = r.fetchone()
                             if row:
+                                pet_name = row[2] or "萝莉丝"
+                                owner_name = row[3] or "主人"
                                 mood_labels = {range(0,20):"极度低落", range(20,40):"有点难过",
                                                range(40,60):"平静", range(60,80):"开心", range(80,101):"超级兴奋"}
                                 ml = "平静"
                                 for rng, label in mood_labels.items():
                                     if row[0] in rng: ml = label; break
-                                pet_state = f"[{row[2]} 心情{row[0]}/100({ml}) 亲密度{row[1]}/100]"
+                                pet_state = f"[{pet_name} 心情{row[0]}/100({ml}) 亲密度{row[1]}/100]"
                     except Exception:
                         pass
                     loc = get_device_location(device_id)
@@ -167,29 +172,87 @@ async def device_ws(websocket: WebSocket, token: str = Query("")):
                     except Exception as e:
                         logger.warning(f"History load fail: {e}")
 
-                    # 本轮 user 行先落库 (失败不阻断对话)
-                    try:
-                        async with AsyncSessionLocal() as db:
-                            await db.execute(
-                                text("INSERT INTO conversations (device_id,role,content,created_at) "
-                                     "VALUES (:d,'user',:c,:t)"),
-                                {"d": device_id, "c": user_text, "t": datetime.now(timezone.utc)},
-                            )
-                            await db.commit()
-                    except Exception as e:
-                        logger.warning(f"User save fail: {e}")
-
                     reply = ""
+
+                    # 全流式定稿 (1.0.262): LLM 流式句子逐句 feed 给 TTSSession
+                    # (流式输入) → streaming_call 增量合成 → 音频队列 → WS
+                    # 二进制帧限速直推 (流式输出) — 一次性回传, 全程并行.
+                    # LLM 停顿期合成器无输出 = 设备静音等待, 播放链保持存活
+                    # (固件 1.0.262 已禁用 WS 模式排空看门狗), 恢复后无缝续播.
+                    loop = asyncio.get_running_loop()
+                    tts = None
+                    audio_push = None
+                    audio_bytes = 0
                     try:
-                        reply, tools_used = await chat_with_tools(
+                        tts = TTSSession()
+                    except Exception as e:
+                        logger.error(f"TTS session create failed: {e}")
+
+                    if tts is not None:
+                        async def _push_audio():
+                            """队列 PCM → WS 二进制帧直推, 全速 (1.0.263).
+                            设备端帧队列满 → TCP 窗口收紧 → send_bytes 挂起,
+                            速率恒 = 设备播放消费速率 — 背压闭环, 无需限速
+                            (1.0.261 限速: 预算被句间空闲清零, burst 时失守
+                            实测环满丢块 64+)."""
+                            nonlocal audio_bytes
+                            while True:
+                                chunk = await loop.run_in_executor(None, tts.q.get)
+                                if chunk is None:
+                                    break
+                                try:
+                                    await websocket.send_bytes(chunk)
+                                    audio_bytes += len(chunk)
+                                except Exception as e:
+                                    logger.warning(f"audio push fail: {e}")
+                                    break
+                        audio_push = asyncio.create_task(_push_audio())
+
+                    audio_started = False
+
+                    async def _send_chat_text(sentence: str):
+                        nonlocal audio_started
+                        if sentence:
+                            await websocket.send_json({"type": "chat_text",
+                                                       "text": sentence})
+                            if tts is not None and not tts.error:
+                                if not audio_started:
+                                    audio_started = True
+                                    await websocket.send_json({"type": "audio_start"})
+                                try:
+                                    await loop.run_in_executor(None, tts.feed, sentence)
+                                except Exception as e:
+                                    logger.warning(f"tts feed fail: {e}")
+
+                    try:
+                        reply, _, _ = await chat_with_tools(
                             user_text=user_text,
                             history=history,
                             device_id=device_id,
                             extra_context=pet_state,
+                            on_sentence=_send_chat_text,
+                            pet_name=pet_name,
+                            owner_name=owner_name,
                         )
                     except Exception as e:
                         logger.error(f"LLM error: {e}")
-                        reply = f"萝莉丝睡着了...({str(e)[:50]})"
+                        reply = f"{pet_name}睡着了...({str(e)[:50]})"
+
+                    if tts is not None:
+                        try:
+                            await loop.run_in_executor(None, tts.finish)
+                        except Exception as e:
+                            logger.warning(f"tts finish fail: {e}")
+                    if audio_push:
+                        try:
+                            await asyncio.wait_for(audio_push, timeout=120)
+                        except Exception:
+                            audio_push.cancel()
+                    try:
+                        await websocket.send_json({"type": "audio_end",
+                                                   "ok": audio_bytes > 0})
+                    except Exception:
+                        pass
 
                     # Parse model output & send reply
                     stripped = reply.strip()
@@ -221,17 +284,29 @@ async def device_ws(websocket: WebSocket, token: str = Query("")):
                         logger.warning(f"chat_done send fail: {e}")
 
                     try:
+                        # 本轮 user + assistant + mood 更新同事务原子落库 (延迟优化 1.0.25x):
+                        # user 行原在 LLM 前单独落库 — 当前轮历史已加载完, LLM 调用链在内存
+                        # append, 该行只服务后续轮次/日记; per-device 锁已串行化顺序, 提前落库
+                        # 无必要且多一次 LLM 前的串行 DB 往返。合并后三行要么全成要么全不成。
                         async with AsyncSessionLocal() as db:
                             now = datetime.now(timezone.utc)
+                            await db.execute(
+                                text("INSERT INTO conversations (device_id,role,content,created_at) "
+                                     "VALUES (:d,'user',:c,:t)"),
+                                {"d": device_id, "c": user_text, "t": now},
+                            )
                             await db.execute(
                                 text("UPDATE pets SET mood=LEAST(100,GREATEST(0,mood+:d)) "
                                      "WHERE device_id=:did"),
                                 {"d": mood_delta, "did": device_id},
                             )
+                            # created_at 微秒错开 — ORDER BY created_at 平票时返回顺序
+                            # 不确定, 同事务先插 user 后插 assistant 保证历史顺序
                             await db.execute(
                                 text("INSERT INTO conversations (device_id,role,content,created_at) "
                                      "VALUES (:d,'assistant',:c,:t)"),
-                                {"d": device_id, "c": clean_text(chat_text), "t": now},
+                                {"d": device_id, "c": clean_text(chat_text),
+                                 "t": now + timedelta(microseconds=1)},
                             )
                             await db.commit()
                     except Exception as e:

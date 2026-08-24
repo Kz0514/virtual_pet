@@ -31,9 +31,10 @@ def _extract_text(meta) -> str | None:
     return t.strip() if isinstance(t, str) and t.strip() else None
 
 
-def parse_reply(reply: str) -> tuple[str, dict]:
+def parse_reply(reply: str, fallback_text: str | None = None) -> tuple[str, dict]:
     """
     Parse model reply into (chat_text, meta).
+    fallback_text: 全部解析失败时的兜底语 (None → 默认常量).
 
     兜底链 (逐级降级):
       1. 整段即 JSON
@@ -85,6 +86,6 @@ def parse_reply(reply: str) -> tuple[str, dict]:
             if rest and not rest.startswith("{"):
                 return rest, {}
         logger.warning(f"Reply unparseable, fallback used: {stripped[:200]}")
-        return FALLBACK_TEXT, {}
+        return (fallback_text or FALLBACK_TEXT), {}
     # 6) 纯文本回复 (无 JSON 结构), 原样使用
     return stripped, {}
