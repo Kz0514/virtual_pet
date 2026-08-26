@@ -169,14 +169,13 @@ i2c_master_bus_handle_t board_get_i2c_bus(void) { return s_i2c_bus; }
 /* ── 屏幕节能状态机: 亮 → (off_s-30s) 渐变变暗 → 保持暗态 → off_s 渐变息屏 ── */
 static bool s_screen_on = true;
 static bool s_screen_dim = false;    /* 已处于变暗态 */
-static bool s_off_fade_done = false; /* 息屏渐变(目标0)是否已完成 — 修复:
-                                      变暗后保持暗态直到 off 超时, 不再无条件息屏 */
+static bool s_off_fade_done = false; /* 息屏渐变(目标0)是否已完成 — 变暗后保持暗态直到 off 超时 */
 static uint32_t s_last_interact = 0;
 
 #define DIM_RATIO_PCT 30 /* 变暗 = 设定亮度的 30% */
 #define DIM_CAP_PCT 10   /* 变暗上限 10% */
 /* 息屏时序 (设置页可调, NVS "off_s" 持久化, 默认 90s):
- * dim = off−30s (下限 15s) — 与原 60s 变暗 / 90s 息屏一致 */
+ * dim = off−30s (下限 15s) */
 static uint32_t s_dim_after_ms = 60000; /* 无操作多久 → 开始变暗 */
 static uint32_t s_off_after_ms = 90000; /* 无操作多久 → 开始息屏 */
 #define FADE_STEP_MS 20                 /* 渐变步进 20ms (50Hz) */
@@ -204,14 +203,10 @@ static uint8_t s_fade_step_size; /* 线性步进量 (×10 精度) */
  * 息屏后直查: 1 = WiFi skip 回调在阻断轻睡 (见 wifi_manager_detach_light_sleep_skip) */
 bool esp_wifi_internal_is_tsf_active(void);
 
-/* : FreeRTOS-Kernel tasks.c 诊断探针 (本地 patch 加入, prvGetExpectedIdleTime
- * 每次评估时更新) — 息屏实测 enter 窗口恒 3000-4000us, 需定位窗口来源:
- * dexp = 评估出的 xExpectedIdleTime (ticks; 注意: 采样时 main 自己就在
- * ready 列表, 全局位图必置位 → dexp 恒 0, 是采样偏差不是真实值)
- * ddel = xNextTaskUnblockTime − xTickCount (阻塞任务最早到期差, 同样受
- * 采样偏差污染 — 采样时 main 未阻塞, 头指向 dmp_bg 等的 50ms 级到期)
- * 真实窗口来源 = winname/winrem: 窗口评估 (dexp 2..6 ticks) 瞬间延迟列表
- * 头部任务名 + 剩余 ticks (不受采样偏差影响, 只在窗口瞬间捕获) */
+/* : FreeRTOS-Kernel tasks.c 诊断探针 (本地 patch, prvGetExpectedIdleTime
+ * 每次评估时更新) — 定位轻睡窗口来源。dexp/ddel 受采样偏差污染 (采样时
+ * main 在 ready 列表/未阻塞), 真实窗口来源 = winname/winrem (窗口评估瞬间
+ * 延迟列表头部任务名 + 剩余 ticks, 不受采样偏差影响) */
 extern volatile uint32_t xDiagExpectedIdle;
 extern volatile TickType_t xDiagNextUnblock;
 extern volatile TickType_t xDiagTickCount;
@@ -225,12 +220,8 @@ extern volatile char xDiagWinName[16];
 extern volatile uint32_t xDiagSleepErr;    /* : esp_light_sleep_start 最后错误码 */
 extern volatile uint32_t xDiagSleepErrCnt; /* : 错误累计计数 */
 
-/* 临时电流日志 (2026-08-22 电源管理实测): 2s 一条追加 /data/power_log.csv,
- * 断开串口静置后用 U盘模式拷出看真实耗电 (插串口会充电测不准);
- * state: 0=亮 1=变暗 2=息屏; >64KB 重开; 与 sensor_logger 同写盘模式 */
-/* : fopen → open/write — newlib fopen 分配 FILE+锁 (内部 RAM), 锁
- * 分配失败直接 abort (SRAM 7KB 时后台帧加载实测崩 locks.c:77)。本函数
- * 每秒执行, 是最高频 fopen 点; fd 路径零分配 (静态 fd 表) */
+/* /data/power_log.csv — 2s 一条追加 (state: 0=亮 1=变暗 2=息屏), >64KB 重开。
+ * fd 路径零分配 — newlib fopen 分配 FILE+锁 (内部 RAM), 耗尽直接 abort */
 static void power_log_append(const bq27220_data_t *bat, int state)
 {
     int fd = open("/data/power_log.csv", O_CREAT | O_APPEND | O_WRONLY);
@@ -240,22 +231,12 @@ static void power_log_append(const bq27220_data_t *bat, int state)
         static const char hdr[] = "ms,mv,ma,soc,state,sleeps,rejects,winus,nxtalm,dexp,ddel,sof,tsf,prob,evalcnt,ret0,ret1,wincnt,wincore,winrem,winname,err,errcnt,wk,ph,tc,d0,d1,d2,d3,d4,d5,d6,d7,d8,d9,d10,d11\n";
         write(fd, hdr, sizeof(hdr) - 1);
     }
-    /* 离线诊断列: sleeps=轻睡评估次数 (enter_cb), rejects=评估了但未真睡,
-     * winus=最后睡眠窗口 µs, sof=USJ SOF 原始位 (拔电后恒1=PHY卡死,
-     * 恒0=hook 应能判定断开) — 拔电期间串口死, 只能靠 CSV 判轻睡
-     * 新增: tsf=WiFi TSF 激活查询 (esp_wifi_internal_is_tsf_active,
-     * 1=periph skip 阻断轻睡), prob=vApplicationSleep 调用计数探针
-     * 新增: nxtalm=esp_timer 最早可唤醒 alarm 距现在 µs (巨大=无
-     * alarm, 窗口来自 FreeRTOS tick 列表 — 实测巨大)
-     * 新增: dexp=prvGetExpectedIdleTime 评估值 (ticks, 直接成为
-     * 窗口), ddel=xNextTaskUnblockTime − xTickCount (阻塞到期差) —
-     * 内核 patch 探针 (tasks.c xDiag*), 定位 3-4ms 窗口来源
-     * 新增: evalcnt/wincnt=评估/窗口评估累计, wincore=窗口评估核
-     * (bit8=调度器挂起=二次评估), winrem/winname=窗口瞬间延迟列表头部
-     * 任务剩余 ticks/名字 = 真正的窗口限制者 (不受采样偏差影响)
-     * 新增: ret0/ret1=评估 xReturn=0/1 分类计数 (tasks.c xDiagRet*)
-     * — ret0 主导 (~300-700/s, 评估时 ready 非空 = SMP 双核 ready
-     * 列表镜像), ret1≈0 (头部 1 tick 后到期几乎没有) */
+    /* 离线诊断列: 电源/睡眠/触摸三类 — sleeps=轻睡评估次数 (enter_cb),
+     * rejects=评估未真睡, winus=最后睡眠窗口 µs, sof/tsf/prob 见下,
+     * nxtalm=esp_timer 最早可唤醒 alarm 距现在 µs (巨大=窗口来自 tick 列表),
+     * dexp/ddel/evalcnt/ret0/ret1/wincnt/wincore/winrem/winname = tasks.c
+     * 内核 patch 探针 (xDiag*), 定位窗口来源; err/errcnt=esp_light_sleep_start
+     * 错误码/计数。拔电期间串口死, 只能靠 CSV 判轻睡 */
     uint32_t slp = 0, over30 = 0, rej = 0;
     int64_t wmax = 0, wlast = 0;
     power_manager_get_sleep_stats(&slp, &over30, &wmax, &wlast);
@@ -267,9 +248,7 @@ static void power_log_append(const bq27220_data_t *bat, int state)
     uint32_t dexp = (uint32_t)xDiagExpectedIdle;
     int64_t ddel = (int64_t)(xDiagNextUnblock - xDiagTickCount);
     /* 触摸诊断列: ph=探针去抖命中数, tc=超阈值通道数, d0..d11=
-     * 每通道 delta (raw−baseline, 有符号)。息屏自动亮屏根因在"睡眠供电
-     * 偏移"的形状 (阶跃/缓升/全局/局部) — 全量逐通道偏差进 CSV,
-     * 拔电静置后按 state 列对照分析。 */
+     * 每通道 delta (raw−baseline, 有符号) — 供睡眠供电偏移形态分析 */
     uint32_t tr[12], tb[12];
     touch_get_raw(tr);
     touch_get_baseline(tb);
@@ -299,6 +278,104 @@ static void power_log_append(const bq27220_data_t *bat, int state)
     close(fd);
     if (sz > 64 * 1024)
         remove("/data/power_log.csv");
+}
+
+/* ── 分段功耗/唤醒统计: /data/power_seg.csv (256KB 环形 ≈25h 全量保留,
+ * 补 power_log.csv 64KB 只留 ~10min 的验收盲区)。两型行:
+ *   S 行: 每 60s 聚合 = 段内平均电流/电压/SOC + 亮屏时长 + 唤醒次数
+ *   W 行: 每次亮屏翻转瞬间 = 时刻 (unix+uptime) + 来源 + 当时电量
+ * 来源 src: 1=探针 2 连击 (假唤醒嫌疑), 0=其他 (左键/摇动/操作)。
+ * fd 零分配路径遍历, 禁 fopen (SRAM 紧张 abort) */
+#define SEG_MS (60 * 1000 * 1000LL) /* esp_timer 段长 60s */
+
+static int64_t s_seg_start_us = 0;   /* 当前段起点 */
+static int64_t s_seg_last_us = 0;    /* 上次 2s tick 时刻 (亮屏时长差) */
+static int64_t s_seg_on_us = 0;      /* 段内亮屏累计 µs */
+static int32_t s_seg_ma_sum = 0;     /* 段内电流累计 */
+static uint32_t s_seg_ma_cnt = 0, s_seg_mv_cnt = 0, s_seg_soc_sum = 0;
+static uint32_t s_seg_mv_sum = 0;
+static uint32_t s_seg_wake_cnt = 0;  /* 段内唤醒次数 */
+static uint8_t s_seg_wake_src = 0;   /* 本次唤醒来源 (1=探针, 0=其他) */
+static bool s_bat_last_ok = false;   /* W 行电量取最近一次 bq27220 读数 */
+static uint16_t s_bat_last_mv = 0;
+static int16_t s_bat_last_ma = 0;
+static uint8_t s_bat_last_soc = 0;
+
+static void power_seg_write_row(const char *buf, int len)
+{
+    int fd = open("/data/power_seg.csv", O_CREAT | O_APPEND | O_WRONLY);
+    if (fd < 0)
+        return;
+    if (lseek(fd, 0, SEEK_END) == 0) {
+        static const char hdr[] = "type,ts_ms,up_ms,ma,mv,soc,src,wake_cnt,on_ms,seg_ms\n";
+        write(fd, hdr, sizeof(hdr) - 1);
+    }
+    if (len > 0)
+        write(fd, buf, (size_t)len);
+    off_t sz = lseek(fd, 0, SEEK_END);
+    close(fd);
+    if (sz > 256 * 1024)
+        remove("/data/power_seg.csv");
+}
+
+/* 唤醒翻转点调用: 记录 W 行 (主要靠二次分析来源) */
+static void power_seg_note_wake(void)
+{
+    s_seg_wake_cnt++;
+    char line[160];
+    int ln = snprintf(line, sizeof(line),
+                      "W,%lld,%u,%d,%d,%u,%u,1,0,0\n",
+                      (long long)(time_manager_is_synced() ? time_manager_get_unix_sec() * 1000LL : 0),
+                      (unsigned)xTaskGetTickCount(),
+                      (int)(s_bat_last_ok ? s_bat_last_ma : 0),
+                      (int)(s_bat_last_ok ? s_bat_last_mv : 0),
+                      (unsigned)(s_bat_last_ok ? s_bat_last_soc : 0),
+                      (unsigned)s_seg_wake_src);
+    power_seg_write_row(line, ln);
+}
+
+/* 2s 块调用 (have_bat 时): 累积段统计, 每 60s 落 S 行 */
+static void power_seg_tick(const bq27220_data_t *bat)
+{
+    int64_t nowus = esp_timer_get_time();
+    s_bat_last_ok = true;
+    s_bat_last_mv = (uint16_t)bat->voltage_mv;
+    s_bat_last_ma = (int16_t)bat->current_ma;
+    s_bat_last_soc = (uint8_t)bat->soc_pct;
+    if (s_seg_last_us && s_seg_start_us) {
+        if (s_screen_on)
+            s_seg_on_us += (nowus - s_seg_last_us);
+        s_seg_ma_sum += bat->current_ma;
+        s_seg_ma_cnt++;
+        s_seg_mv_sum += bat->voltage_mv;
+        s_seg_mv_cnt++;
+        s_seg_soc_sum += bat->soc_pct;
+    } else {
+        s_seg_start_us = nowus;
+        s_seg_ma_sum = s_seg_mv_sum = 0;
+        s_seg_ma_cnt = s_seg_mv_cnt = s_seg_soc_sum = 0;
+        s_seg_on_us = 0;
+        s_seg_wake_cnt = 0;
+    }
+    s_seg_last_us = nowus;
+    if (nowus - s_seg_start_us >= SEG_MS) {
+        char line[160];
+        int ln = snprintf(line, sizeof(line),
+                          "S,%lld,%u,%d,%d,%u,0,%u,%u,%d\n",
+                          (long long)(time_manager_is_synced() ? time_manager_get_unix_sec() * 1000LL : 0),
+                          (unsigned)xTaskGetTickCount(),
+                          s_seg_ma_cnt ? (int)(s_seg_ma_sum / (int32_t)s_seg_ma_cnt) : 0,
+                          s_seg_mv_cnt ? (int)(s_seg_mv_sum / s_seg_mv_cnt) : 0,
+                          (unsigned)(s_seg_mv_cnt ? (s_seg_soc_sum + s_seg_mv_cnt / 2u) / s_seg_mv_cnt : 0),
+                          (unsigned)(s_seg_on_us / 1000), (unsigned)s_seg_wake_cnt,
+                          (int)((nowus - s_seg_start_us) / 1000));
+        power_seg_write_row(line, ln);
+        s_seg_ma_sum = s_seg_mv_sum = 0;
+        s_seg_ma_cnt = s_seg_mv_cnt = s_seg_soc_sum = 0;
+        s_seg_on_us = 0;
+        s_seg_wake_cnt = 0;
+        s_seg_start_us = nowus;
+    }
 }
 
 static void fade_tick(lv_timer_t *t)
@@ -345,6 +422,9 @@ void main_screen_note_interaction(void)
         s_screen_on = true;
         s_screen_dim = false;
         s_off_fade_done = false;
+        /* power_seg.csv W 行: 任一唤醒翻转点 (探针 src=1 已前置标记) */
+        power_seg_note_wake();
+        s_seg_wake_src = 0;
         /* WiFi 保持连接态浅睡 (息屏不再 stop) — 唤醒零重连延迟:
          * 语音回执/消息推送不再等 3-5s WiFi 重连 + WS 重挂 */
         power_manager_screen_on(); /* 恢复动画 + LVGL 刷新 + 全屏重绘 */
@@ -355,11 +435,6 @@ void main_screen_note_interaction(void)
     }
     s_last_interact = xTaskGetTickCount();
 }
-
-/* 手势事件路由与主页交互分发已移至 input_handler / home_interaction */
-
-/* 诊断探针 diag_heartbeat_core1 已删 (1.0.250): 内部堆回收 ~3KB。
- * 串口卡死定位改由 H0 (core0 主循环) + 日志存活度判断 */
 
 void app_main(void)
 {
@@ -463,12 +538,8 @@ void app_main(void)
     /* 3. Display + LVGL + Pet */
     ESP_ERROR_CHECK(st7789_init());
     lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    /* → 教训: LVGL 任务栈曾改 PSRAM , 实测进设置页
-     * 即 Double exception — flash 写期间 cache 冻结 (mem_writer 等任务写
-     * memory.txt/FatFS/LittleFS), 冻结窗口内访问 PSRAM 栈 → 双异常。
-     * 高频访问内存 (任务栈/draw buffer) 必须内部 RAM; 1.0.223 的内存地图
-     * 证明 PSRAM 化 + ALWAYSINTERNAL=4096 后内部堆充裕 (boot 150KB),
-     * 回退后仍 ~80KB, 无内存压力 */
+    /* LVGL 任务栈必须内部 RAM — flash 写期间 cache 冻结 (mem_writer 等
+     * 任务写 memory.txt/FatFS/LittleFS), 冻结窗口内访问 PSRAM 栈 → 双异常 */
     lvgl_cfg.task_priority = 4;
     lvgl_cfg.task_stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DEFAULT;
     lvgl_port_init(&lvgl_cfg);
@@ -478,34 +549,21 @@ void app_main(void)
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = st7789_get_panel_io(),
         .panel_handle = st7789_get_panel(),
-        /* 84 行 = 2×行高(42px): 设置页导航总是相邻两行变化, LVGL 会
-         * 合并成一个 84 行脏区 → 单次渲染、单个 SPI 突发刷完,
-         * 两行同帧原子更新 (分片越多, 与面板异步扫描交叉的撕裂机会越多)
-         * 1.0.226: 84 → 42 行 (20KB): U盘模式 enter 需内部堆 (1.0.225
-         * 实测运行期内部堆稳态仅 ~19KB, tinyusb install ~13KB 需栈+初始化
-         * 空间), 40KB draw buffer 占死内部堆。42 行 = 1 行高, 导航两行分
-         * 两次 flush (撕裂轻微, 单缓冲本就逐段扫描); 渲染性能损失可接受
-         * 1.0.232: 42 → 21 行 (10KB): 运行期内部堆稳态实测跌至 ~4.6KB
-         * (1.0.226 时 ~18.8KB), 已在 49s 瞬态耗尽 (fopen 新 FILE 槽的
-         * 互斥信号量分配失败 → lock_init abort → 重启循环, 1.0.232 实测);
-         * 21 行 = 半行高, 导航两行分 4 次 flush (撕裂略增), 换 10KB 连续
-         * 内部余量保稳定 — 撕裂代价远小于崩溃。残余内存吃紧仍待查
-         * v2.18 实测: 21 → 42 行 (20KB) 长跑内部堆跌至 SRAM 1KB/最大块
-         * 0KB, TTS 下载速率 96→2 KB/s 卡语音 — 立即回退 21 行。
-         * 撕裂/卡顿根治 = 内部堆健康化 (fopen 迁移后稳态待测) + 后续
-         * 双缓冲/TE 同步, 不在 buffer 尺寸上赌 */
+        /* draw buffer 21 行 (10KB) 半边高 — 内部堆稳态紧张的权衡:
+         * 更大缓冲提高渲染原子性但占死内部堆 (U盘 enter/文件槽分配失败
+         * 崩溃), 撕裂代价远小于崩溃; 根治 = 内部堆健康化, 不在 buffer
+         * 尺寸上赌 */
         .buffer_size = DISPLAY_WIDTH * 21,
         .hres = DISPLAY_WIDTH,
         .vres = DISPLAY_HEIGHT,
         .monochrome = false,
         .rotation = {.swap_xy = true, .mirror_x = false, .mirror_y = true},
-        /* : 去掉 buff_spiram — draw buffer 每帧高频写, flash 写
-         * 冻结窗口内写 PSRAM 缓冲 → 双异常 (1.0.223 实测进设置页即崩);
-         * 40KB 内部堆负担可接受 (boot 后内部堆 ~80KB 空闲) */
+        /* 不用 buff_spiram — draw buffer 每帧高频写, flash 写冻结窗口内
+         * 写 PSRAM 缓冲 → 双异常; 内部 buffer + DMA */
         .flags = {.buff_dma = true, .swap_bytes = true},
     };
     lvgl_port_add_disp(&disp_cfg);
-    /* 1.0.248 探针: LVGL draw buffer 分配后内部堆 */
+    /* 探针: LVGL draw buffer 分配后内部堆 */
     ESP_LOGI(TAG, "MEM[2] LVGL 后: SRAM %u KB (最大块 %u KB)",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
@@ -560,7 +618,7 @@ void app_main(void)
     lvgl_port_lock(0);
     loading_screen_destroy();
     pet_avatar_init();
-    /* 1.0.248: boot 预加载摸头动画 (内部堆充足期) — 首次摸头零延迟 */
+    /* boot 预加载摸头动画 (内部堆充足期) — 首次摸头零延迟 */
     {
         extern void pet_avatar_preload(void);
         pet_avatar_preload();
@@ -584,7 +642,7 @@ void app_main(void)
     ESP_ERROR_CHECK(power_manager_init());
 
     /* 6. WiFi */
-    /* NVS/PHY 校准诊断 — 排查每次开机 "Saving new calibration data" 循环 */
+    /* NVS/PHY 校准诊断 */
     {
         nvs_stats_t st;
         if (nvs_get_stats(NULL, &st) == ESP_OK) {
@@ -606,8 +664,7 @@ void app_main(void)
         }
     }
     wifi_manager_init();
-    /* 1.0.248 探针: WiFi 初始化后内部堆 — 定位启动期消耗大头
-     * (实测 1.0.247: boot 105KB → WiFi 后骤降, 60s 内枯竭) */
+    /* 探针: WiFi 初始化后内部堆 — 定位启动期消耗大头 */
     ESP_LOGI(TAG, "MEM[1] WiFi init 后: SRAM %u KB (最大块 %u KB)",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
@@ -626,14 +683,12 @@ void app_main(void)
     uint32_t last_touch_dbg = 0;
     bool registered = false;
     s_last_interact = xTaskGetTickCount();
-    static uint32_t s_last_poll = 0; /* 息屏兜底扫描 10Hz 节拍器 */
 
     while (1) {
         /* 手势处理已移入 LVGL 20ms 定时器 (gesture_timer_cb) */
 
-        /* Touch debug: print filtered values — 触摸活动时 1Hz, 空闲 5s 一次
-         * (1.0.248: 原 1Hz 恒打, 20 分钟 ~1200 行 → USB-Serial-JTAG TX 压力
-         * → 主循环卡 1s + 243958 串口通道死 (1.0.246 实测) */
+        /* Touch debug: print filtered values — 活动时 200ms 一打, 空闲 5s 一次
+         * (减频防 USB-Serial-JTAG TX 压力卡主循环) */
         {
             static uint8_t dbg_idle_cnt = 0;
             uint32_t dbg_period = pdMS_TO_TICKS(1000);
@@ -642,15 +697,20 @@ void app_main(void)
             touch_get_filtered(f);
             for (int i = 0; i < 12; i++)
                 if (f[i] > 60) { dbg_active = true; break; }
-            if (!dbg_active && ++dbg_idle_cnt < 5)
-                dbg_period = pdMS_TO_TICKS(5000);
-            else
+            if (dbg_active) {
                 dbg_idle_cnt = 0;
+                dbg_period = pdMS_TO_TICKS(200); /* 触摸活动期 200ms 一打 */
+            } else if (++dbg_idle_cnt < 5)
+                dbg_period = pdMS_TO_TICKS(5000);
             if (xTaskGetTickCount() - last_touch_dbg > dbg_period) {
+                int t2[12];
+                touch_fpc_get_thr(t2);
                 last_touch_dbg = xTaskGetTickCount();
-                esp_rom_printf("H0:%u\n", (unsigned)(xTaskGetTickCount() * portTICK_PERIOD_MS)); /* 探针: core0() 心跳 (绕过日志系统) */
-                ESP_LOGI(TAG, "Touch: %d %d %d %d %d %d %d %d %d %d %d %d",
-                         f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+                esp_rom_printf("H0:%u\n", (unsigned)(xTaskGetTickCount() * portTICK_PERIOD_MS)); /* 探针: core0 主循环心跳 (绕过日志系统) */
+                /* 附右侧 6 通道当前阈值 (T: 列) */
+                ESP_LOGI(TAG, "Touch: %d %d %d %d %d %d %d %d %d %d %d %d T:%d %d %d %d %d %d",
+                         f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11],
+                         t2[6], t2[7], t2[8], t2[9], t2[10], t2[11]);
             bool touched = false, contacted = false;
             for (int i = 0; i < 12; i++) {
                 if (f[i] > 100)
@@ -667,16 +727,16 @@ void app_main(void)
                 ESP_LOGI(TAG, "触摸硬件唤醒 (pad %u) — 亮屏", (unsigned)wake_pad);
                 main_screen_note_interaction();
             } else if (contacted && s_screen_on) {
-                /* : 息屏期不再直判 contacted — 唤醒统一走 10Hz 兜底
-                 * 扫描 (touch_fpc_sleep_probe: 动态基线 + 3 次去抖)。拔电后
-                 * raw 持续偏移时此处每 1s 必中一次, 与 10Hz 块重复且无去抖。 */
+                /* 息屏期不直判 contacted — 唤醒统一走动态频率探针
+                 * (touch_fpc_sleep_probe: 限速基线 + 抖动自适应阈值 +
+                 * 2 连击去抖; 拔电后 raw 持续偏移时此处会重复误报) */
                 main_screen_note_interaction();
             } else {
                 uint32_t idle = xTaskGetTickCount() - s_last_interact;
 
                 /* ── 渐变完成后的状态推进 ──
                  * 只认息屏渐变 (目标 0) 完成标志 — 变暗渐变完成后保持暗态,
-                 * 直到 off 超时才彻底息屏 (修复: 曾无条件 2s 后即黑屏) */
+                 * 直到 off 超时才彻底息屏 */
                 if (s_screen_on && s_screen_dim && s_off_fade_done) {
                     ESP_LOGI(TAG, "息屏完成");
                     st7789_backlight_set(0);
@@ -757,9 +817,8 @@ void app_main(void)
                     ESP_LOGI(TAG, "设备已认证");
                     ws_client_connect(api_client_get_token());
                     fetch_weather_once();
-                    /* OTA 检查 — 同步执行 (曾用 xTaskCreate 任务, 但任务在部分启动
-                     * 场景下从未发出 check 请求, 导致 OTA 永不触发; 改为与
-                     * register 同上下文, 行为已被 7 次注册验证可靠) */
+                    /* OTA 检查 — 与 register 同上下文同步执行 (独立任务曾被调度跳过导致
+                     * OTA 永不触发) */
                     ota_client_check_sync();
                     /* 栈保持内部 RAM — OTA 写 flash (cache 冻结期 PSRAM 栈会崩) */
                     xTaskCreate(asset_update_task, "asset_up", 8192, NULL, 5, NULL);
@@ -790,18 +849,12 @@ void app_main(void)
 
         uint32_t now = xTaskGetTickCount();
 
-        /* : USB 连接感知禁睡 — SOF 帧 = USB 主机在通信 (插着线且
-         * 枚举正常)。息屏轻睡冻结 USJ 时钟 → 主机侧 COM 口消失 (掉串口
-         * 被误判"卡死")。SOF 存在 → 持锁禁睡保活; 拔线 SOF 消失 → 释放
-         * 恢复轻睡 (省电场景)。U盘模式下 PHY 在 OTG, USJ 无 SOF, 恒 0 —
-         * 由 usb_storage 的 usb 锁覆盖, 不冲突。
-         * v2.18 修复抖动: 原实现每 100ms 读 SOF 中断原始位, 而 IDF 连接
-         * 监视器 (usb_serial_jtag_sof_tick_hook, 每 tick) 检查后即清除该
-         * 位 — 100ms 采样撞 <1ms 置位窗口, 读到的是随机竞争结果 →
-         * usbconn 锁 100ms 级来回获取/释放 (实测日志)。改用 IDF 官方
-         * usb_serial_jtag_is_connected: 1ms 粒度 + 3ms 容差 + 粘滞,
-         * 与系统 usb_serial_jtag 锁 (CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION,
-         * 连接恒持) 状态一致, 零抖动。 */
+        /* USB 连接感知禁睡 — 连接 = USB 主机在通信 (插着线且枚举正常);
+         * 息屏轻睡冻结 USJ 时钟 → COM 口消失被误判"卡死"。用官方
+         * usb_serial_jtag_is_connected (1ms 粒度 + 3ms 容差 + 粘滞,
+         * 与系统 usb_serial_jtag 锁 CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION
+         * 状态一致, 零抖动)。U盘模式下 PHY 在 OTG, USJ 恒 0 — 由
+         * usb_storage 的 usb 锁覆盖 */
         {
             static bool s_usb_conn = false;
             bool conn = usb_serial_jtag_is_connected();
@@ -811,20 +864,16 @@ void app_main(void)
             }
         }
 
-        /* 息屏期兜底触摸扫描 10Hz : 1Hz/4Hz 实测滑动唤醒仍难 —
-         * 滑动轻掠单通道接触 <100ms, delta 峰 250~500, 4Hz 仍可能错过峰值
-         * (用户实测 4Hz "还是难")。100ms 粒度: 滑动期间每个通道平均采 1 次,
-         * 捕捉概率接近 1, 唤醒响应 ≤100ms。亮屏期 50Hz 定时器在跑, 不需要
-         * 兜底。主循环 vTaskDelay 走 TIMG tick, 不产生 esp_timer alarm,
-         * 不影响轻睡窗口。 */
-        if (!s_screen_on && (now - s_last_poll) > pdMS_TO_TICKS(100)) {
-            s_last_poll = now;
-            /* : 唤醒判定统一走 touch_fpc_sleep_probe — 复用触摸
-             * 模块共享判定 (s_ts.touched), 3 次去抖 + 空间上限 10 通道 */
-            if (touch_fpc_sleep_probe()) {
-                ESP_LOGI(TAG, "触摸兜底唤醒 (10Hz, 去抖确认)");
-                main_screen_note_interaction();
-            }
+        /* 息屏期唤醒探针: 扫描在触摸模块独立任务, 由 esp_timer (RTC 闹钟) 按
+         * probe_interval 节拍驱动 (20Hz 快探/深闲 2Hz — 独立任务保证节拍
+         * 不被主循环拖慢)。本循环只消费唤醒结果: 判定+去抖+免疫窗全在
+         * 触摸模块内完成 */
+        if (!s_screen_on && touch_fpc_wake_pending()) {
+            ESP_LOGI(TAG, "触摸唤醒 (动态探针, 150ms 窗内 2 连击确认)");
+            s_seg_wake_src = 1; /* power_seg.csv W 行来源: 探针 */
+            main_screen_note_interaction();
+            /* DMP 轮询跟随息屏档 (唤醒=回亮屏 50ms) */
+            dmp_mpu_set_off_interval(250);
         }
 
         /* 每 2 秒推进宠物状态 + 传感器检测 */
@@ -832,9 +881,8 @@ void app_main(void)
             last_tick = now;
             ESP_LOGI(TAG, "2s块: 入口"); /* 探针: 确认主循环到达 2s 块 */
 
-            /* v2 探针: 轻睡窗口 (esp_timer 最早非SKIP alarm 距现在) +
-             * vApplicationSleep 回调内统计 (idle 临界区取样, 纯整数)
-             * 1.0.248: 30s 一次 (原 2s 一次, 日志量大) */
+            /* 探针: 轻睡窗口 (esp_timer 最早非SKIP alarm 距现在) +
+             * vApplicationSleep 回调内统计 (30s 一次, 减日志量) */
             {
                 static uint8_t pm_log_cnt = 0;
                 bool pm_log_now = (++pm_log_cnt >= 15);
@@ -863,8 +911,7 @@ void app_main(void)
             bool have_bat = (bq27220_read(&bat) == ESP_OK);
             opt3001_read_lux(&lux);
 
-            /* 1.0.248: 🌡/⚡ 从每 2s 降为每 30s — 原频率日志量大,
-             * USB-Serial-JTAG TX 压力 → 主循环卡 + 串口通道死 */
+            /* 🌡/⚡ 每 30s 打一次 (原 2s — USB-JTAG TX 压力卡主循环) */
             static uint8_t env_log_cnt = 0;
             bool env_log_now = (++env_log_cnt >= 15);
             if (env_log_now) env_log_cnt = 0;
@@ -876,19 +923,14 @@ void app_main(void)
                     ESP_LOGI(TAG, "⚡ %umV %u%% %dmA",
                              bat.voltage_mv, bat.soc_pct, bat.current_ma);
                 power_log_append(&bat, s_screen_on ? (s_screen_dim ? 1 : 0) : 2);
-                /* : 充电状态翻转 = USB 拔/插 → 供电链路瞬态 (VBUS
-                 * 消失/恢复 + 充电路径切换) 会跳变触摸 raw → 探针假唤醒
-                 * (拔线+关U盘模式实测)。通知探针进 5s 免疫窗。插着 USB
-                 * 但电流≈0 (bq27220 未稳定) 时不参与翻转判定 */
+                power_seg_tick(&bat); /* power_seg.csv 段统计 */
+                /* 充电状态翻转 = USB 拔/插 → 供电链路瞬态 (VBUS 消失/恢复 +
+                 * 充电路径切换) 会跳变触摸 raw → 探针假唤醒; 翻转时通知
+                 * 探针进 5s 免疫窗。滞回 ±15mA 死区: 插线时 bq27220
+                 * 电流在 ±0 抖动, 会导致免疫窗永续 → 息屏唤醒被吞;
+                 * 真实拔插电流 ±30mA+ 不受影响。电流≈0 (未稳定) 不参与 */
                 {
                     static int8_t s_last_charge = -1;
-                    /* : 滞回 ±15mA — 插着 USB 时 bq27220 电流在 ±0
-                     * 抖动 (实测 +10/-13mA) 会频繁翻转 → 触摸探针免疫窗
-                     * 每 2-6s 续期 5s → 免疫窗永续 → 息屏触摸唤醒被吞
-                     * (1.0.246 实测: 221s 起翻转密集, 免疫窗自 227s
-                     * 从未关闭, 触摸 232s-243s 持续按压 11s 无唤醒)。
-                     * 死区防抖动; 真实拔插电流 >±30mA (拔线实测
-                     * 放电 -30~-60mA) 不受影响 */
                     int8_t chg = (bat.current_ma >  15) ? 1
                                  : (bat.current_ma < -15) ? 0
                                                           : -1;
@@ -901,29 +943,23 @@ void app_main(void)
                     if (chg != -1)
                         s_last_charge = chg;
                 }
-                /* : U盘模式下禁睡跟随充电状态 (用户方案) — 持锁条件
-                 * = 插线。判据 SOC 优先 (2026-08-23 数据实锤): 满电后
-                 * 充电芯片停充防浮充, 停充期电池放电电流 -30~-60mA
-                 * (CSV 实测), 纯电流阈值必误判拔线 → 插着电脑满电掉盘。
-                 * 满电 SOC 恒 100% (用户: "满电绝对是 100%") → SOC≥100
-                 * 恒视为插线禁睡; 非满电看电流 (充电中 ma>0, 阈值 -5mA
-                 * 余量足)。拔线 (非满电放电) 30s 宽限后释放锁 → 平时
-                 * 恢复轻睡。读失败 (have_bat=false) 不改变状态 */
+                /* U盘模式下禁睡跟随充电状态 — 持锁条件 = 插线。判据 SOC 优先:
+                 * 满电停充期电池放电电流 -30~-60mA, 纯电流阈值会误判拔线
+                 * → 插着电脑满电掉盘; 满电 SOC 恒 100% → SOC≥100 恒视为
+                 * 插线禁睡, 非满电看电流 (阈值 -5mA)。拔线 (非满电放电)
+                 * 30s 宽限后释放锁 → 平时恢复轻睡。读失败不改变状态 */
                 usb_storage_set_charging(bat.soc_pct >= 100 ||
                                          bat.current_ma >= -5);
                 /* 息屏每 60s 诊断一次: 轻睡计数 + PM 锁列表 */
                 if (!s_screen_on) {
                     static uint8_t diag_cnt = 0;
-                    if (++diag_cnt >= 7) { /* : 60s→15s, 加密 I2C_0 锁采样 */
+                    if (++diag_cnt >= 7) { /* 息屏 15s 一次诊断 (加密锁采样) */
                         diag_cnt = 0;
                         power_manager_dump_stats();
-                        /* : 锁列表也写进 power_log.csv (# 注释行) —
-                         * 拔电期间串口死, 锁状态只能靠这里看。
-                         * : fopen 堆守卫 — newlib fopen 分配 FILE+锁 (内部
-                         * RAM), 内部堆耗尽时 locks.c:77 abort 直接重启
-                         * (1.0.244 实测崩点: 息屏诊断 143s 撞上内部堆
-                         * 枯竭); 守卫不足则跳过, 锁列表仍经
-                         * power_manager_dump_stats 上日志 */
+                        /* 锁/计时器 dump 写进 power_log.csv (# 注释行) —
+                         * 拔电期间串口死, 只能靠这里看。fopen 堆守卫:
+                         * newlib fopen 分配 FILE+锁, 内部堆耗尽 abort;
+                         * 不足 8KB 跳过 (锁列表仍走上面日志) */
                         if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 8192) {
                             ESP_LOGW(TAG, "内部堆不足, 跳过 power_log.csv 锁诊断");
                         } else {
@@ -933,19 +969,18 @@ void app_main(void)
                             fprintf(lf, "# locks @ %lld\n",
                                     (long long)(time_manager_is_synced() ? time_manager_get_unix_sec() * 1000LL : 0));
                             esp_pm_dump_locks(lf);
-                            /* : esp_timer dump — 息屏窗口恒 3000us,
-                             * 定位 3ms 周期 alarm 来源 (名字直接可见) */
+                            /* esp_timer dump — 定位周期 alarm 来源
+                             * (任务名直接可见) */
                             fprintf(lf, "# timers @ %lld\n",
                                     (long long)(time_manager_is_synced() ? time_manager_get_unix_sec() * 1000LL : 0));
                             esp_timer_dump(lf);
                             fclose(lf);
                         }
                         } /* else: 内部堆充足才写 CSV 诊断 */
-                        /* : 任务延迟探针 — vTaskList 列每任务状态 + 剩余
-                         * delay tick。谁在 FreeRTOS tick 列表高频到期 →
-                         * prvGetExpectedIdleTime < 3 → vApplicationSleep
-                         * 永不调用 (轻睡 100% 不进入)。写 /data/tasks.txt 覆盖,
-                         * U盘拷出。 */
+                        /* 任务延迟探针 — vTaskList 列每任务状态 + 剩余 delay tick:
+                         * tick 列表高频到期任务会阻轻睡 (prvGetExpectedIdle
+                         * Time < 3 → vApplicationSleep 永不调用)。写
+                         * /data/tasks.txt 覆盖, U盘拷出 */
                         static char s_tasklist[2048];
                         vTaskList(s_tasklist);
                         int tfd = open("/data/tasks.txt", O_CREAT | O_TRUNC | O_WRONLY);
@@ -957,10 +992,9 @@ void app_main(void)
                 }
             }
 
-            /* 低电量写盘闸: SOC<5% 暂停 flash 写 — 断电中断写是
-             * data 分区损坏的元凶 (8% 电量时发生过);
-             * 2026-08-22: 电压 3.7V → SOC 制 (BATTERY_CRITICAL_THRESHOLD_PCT),
-             * 读失败保持 fail-open (闸开可写) */
+            /* 低电量写盘闸: SOC < 阈值 (BATTERY_CRITICAL_THRESHOLD_PCT) 暂停
+             * flash 写 — 断电中断写是 data 分区损坏的元凶; 读失败保持
+             * fail-open (闸开可写) */
             memory_store_set_writes_safe(!have_bat ||
                                          bat.soc_pct >= BATTERY_CRITICAL_THRESHOLD_PCT);
 
@@ -1039,6 +1073,8 @@ void app_main(void)
             status_bar_set_wifi(wifi_is_connected(), 0);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100)); /* 100ms 粒度 : 息屏兜底扫描 10Hz 节拍 (4Hz 实测唤醒难, 保持) */
+        /* 亮屏 100ms 粒度 (轮询/状态机节拍); 息屏跟随触摸探针动态间隔:
+         * 快探 50ms / 深闲 500ms — 深闲时睡眠窗口 50ms→500ms (主功耗收益) */
+        vTaskDelay(pdMS_TO_TICKS(s_screen_on ? 100 : touch_fpc_probe_interval_ms()));
     }
 }
