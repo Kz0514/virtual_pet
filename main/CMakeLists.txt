@@ -47,7 +47,7 @@ idf_component_register(
         "app/event_bus.c"
         # Network
         "network/ws_client.c"
-        "network/wifi_scanner.c"
+        "system/wifi_scanner.c"
         "network/api_client.c"
         "network/ota_client.c"
         "network/asset_client.c"
