@@ -12,7 +12,7 @@
  * 涂鸦内存: 服务端已缩至 ≤240×240 透明 WebP; 解码产物 BGRA 像素
  * ≤230KB 全在 PSRAM (heap_caps SPIRAM), 退出详情释放 — 不常驻。
  * 交互: 事件经 input_handler 路由 (diary_screen_is_active 优先于设置页),
- * 输入枚举复用 settings_event_t (UP/DOWN/CONFIRM/BACK 语义一致)。
+ * 输入枚举复用 menu_event_t (UP/DOWN/CONFIRM/BACK 语义一致)。
  */
 #include "diary_screen.h"
 #include "screen_switch.h"
@@ -655,23 +655,23 @@ static void move_sel(int dir)
 
 /* ══════ 对外接口 ══════ */
 
-void diary_screen_input(settings_event_t ev)
+void diary_screen_input(menu_event_t ev)
 {
     if (!s_active) return;
 
     if (s_detail) {
         switch (ev) {
-        case SETTINGS_EV_UP:
-        case SETTINGS_EV_DOWN: {
+        case MENU_EV_UP:
+        case MENU_EV_DOWN: {
             /* scroll_to_y 会 clamp 到可滚动范围 (scroll_by 会无限滚出边界) */
-            int dy = (ev == SETTINGS_EV_UP) ? -20 : 20;
+            int dy = (ev == MENU_EV_UP) ? -20 : 20;
             /* 滑动反向开关 (设置页"操作"页) — 翻页方向反转 */
             if (config_get_u32(CFG_KEY_SCROLL_FLIP, 0)) dy = -dy;
             lv_obj_scroll_to_y(s_cont, lv_obj_get_scroll_y(s_cont) + dy,
                                LV_ANIM_OFF);
             break;
         }
-        case SETTINGS_EV_BACK: {
+        case MENU_EV_BACK: {
             /* 删屏重建: 详情/列表切换走完整屏幕切换 (与 destroy 同机制),
              * 绕开部分刷新下 clean+重建的残留 */
             detail_free();
@@ -694,16 +694,16 @@ void diary_screen_input(settings_event_t ev)
     }
 
     switch (ev) {
-    case SETTINGS_EV_UP:
+    case MENU_EV_UP:
         move_sel(-1);
         break;
-    case SETTINGS_EV_DOWN:
+    case MENU_EV_DOWN:
         move_sel(+1);
         break;
-    case SETTINGS_EV_CONFIRM:
+    case MENU_EV_CONFIRM:
         if (open_detail(s_sel)) nav_vibe();
         break;
-    case SETTINGS_EV_BACK:
+    case MENU_EV_BACK:
         diary_screen_destroy();
         break;
     default:

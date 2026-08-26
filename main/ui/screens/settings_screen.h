@@ -16,11 +16,11 @@ extern "C" {
 #endif
 
 typedef enum {
-    SETTINGS_EV_UP = 0,     /* 上一项 / 数值加 */
-    SETTINGS_EV_DOWN,       /* 下一项 / 数值减 */
-    SETTINGS_EV_CONFIRM,    /* 进入子页 / 进出调值 / 切换开关 */
-    SETTINGS_EV_BACK,       /* 退出调值 / 回上级 / 退出设置 */
-} settings_event_t;
+    MENU_EV_UP = 0,     /* 上一项 / 数值加 */
+    MENU_EV_DOWN,       /* 下一项 / 数值减 */
+    MENU_EV_CONFIRM,    /* 进入子页 / 进出调值 / 切换开关 */
+    MENU_EV_BACK,       /* 退出调值 / 回上级 / 退出设置 */
+} menu_event_t;
 
 /** 创建并显示设置界面 (根页) */
 esp_err_t settings_screen_init(void);
@@ -32,7 +32,7 @@ void settings_screen_destroy(void);
 bool settings_screen_is_active(void);
 
 /** 唯一输入口 — 由 input_handler 在 LVGL 上下文调用 */
-void settings_screen_input(settings_event_t ev);
+void settings_screen_input(menu_event_t ev);
 
 /** 注册"退出设置"回调 (根页 BACK 时调用; input_handler 负责切回主页) */
 void settings_screen_set_close_cb(void (*cb)(void));

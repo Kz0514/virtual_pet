@@ -1,7 +1,7 @@
 /** @file diary_screen.h @brief 日记列表/详情界面接口 */
 #pragma once
 #include "esp_err.h"
-#include "settings_screen.h" /* settings_event_t — 输入枚举复用设置页 */
+#include "settings_screen.h" /* menu_event_t — 输入枚举复用菜单页 */
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,7 +17,7 @@ void diary_screen_destroy(void);
 bool diary_screen_is_active(void);
 
 /** 唯一输入口 — 由 input_handler 在 LVGL 上下文调用 */
-void diary_screen_input(settings_event_t ev);
+void diary_screen_input(menu_event_t ev);
 
 #ifdef __cplusplus
 }

@@ -797,19 +797,19 @@ static void do_back(void)
 
 /* ══════ 对外接口 ══════ */
 
-void settings_screen_input(settings_event_t ev)
+void settings_screen_input(menu_event_t ev)
 {
     if (!s_active) return;
     if (s_test_idx >= 0) { /* 屏幕测试模式: 上/下切色, 返回/确认退出 */
         switch (ev) {
-        case SETTINGS_EV_UP:
+        case MENU_EV_UP:
             screen_test_step(+1);
             break;
-        case SETTINGS_EV_DOWN:
+        case MENU_EV_DOWN:
             screen_test_step(-1);
             break;
-        case SETTINGS_EV_CONFIRM:
-        case SETTINGS_EV_BACK:
+        case MENU_EV_CONFIRM:
+        case MENU_EV_BACK:
             exit_screen_test();
             break;
         default:
@@ -818,22 +818,22 @@ void settings_screen_input(settings_event_t ev)
         return;
     }
     switch (ev) {
-    case SETTINGS_EV_UP: /* 上一项 / 数值加 */
+    case MENU_EV_UP: /* 上一项 / 数值加 */
         if (s_adjusting)
             adjust_step(+1);
         else
             move_sel(-1);
         break;
-    case SETTINGS_EV_DOWN: /* 下一项 / 数值减 */
+    case MENU_EV_DOWN: /* 下一项 / 数值减 */
         if (s_adjusting)
             adjust_step(-1);
         else
             move_sel(+1);
         break;
-    case SETTINGS_EV_CONFIRM:
+    case MENU_EV_CONFIRM:
         do_confirm();
         break;
-    case SETTINGS_EV_BACK:
+    case MENU_EV_BACK:
         do_back();
         break;
     default:

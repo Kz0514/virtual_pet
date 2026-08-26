@@ -96,7 +96,7 @@ app_page_t input_handler_get_page(void)
 /* ── 设置路由: 日记页打开时事件优先注入日记, 否则设置页 ──
  * 日记是挂在设置页上的独立 screen (设置页保持存活), BACK 到列表根
  * 再按一次即 destroy 自身并切回设置页, 此后自动回落设置路由。 */
-static void route_settings(settings_event_t sev)
+static void route_settings(menu_event_t sev)
 {
     if (diary_screen_is_active())
         diary_screen_input(sev);
@@ -154,31 +154,31 @@ static void on_gesture_event(gesture_event_t ev)
             bool tap = nav_mode_is_tap();
             switch (ev) {
             case GESTURE_SINGLE_TAP: /* 左键确认恒成立 */
-                route_settings(SETTINGS_EV_CONFIRM);
+                route_settings(MENU_EV_CONFIRM);
                 break;
             case GESTURE_NAV_UP: /* 点击模式: 选择 */
-                if (tap) route_settings(SETTINGS_EV_UP);
+                if (tap) route_settings(MENU_EV_UP);
                 break;
             case GESTURE_NAV_DOWN:
-                if (tap) route_settings(SETTINGS_EV_DOWN);
+                if (tap) route_settings(MENU_EV_DOWN);
                 break;
             case GESTURE_NAV_SLIDE_UP: /* 滑动模式: 选择 */
-                if (!tap) route_settings(SETTINGS_EV_UP);
+                if (!tap) route_settings(MENU_EV_UP);
                 break;
             case GESTURE_NAV_SLIDE_DOWN:
-                if (!tap) route_settings(SETTINGS_EV_DOWN);
+                if (!tap) route_settings(MENU_EV_DOWN);
                 break;
             case GESTURE_TOP_TAP_LEFT: /* 点击模式: 返回 */
-                if (tap) route_settings(SETTINGS_EV_BACK);
+                if (tap) route_settings(MENU_EV_BACK);
                 break;
             case GESTURE_TOP_TAP_RIGHT: /* 点击模式: 确认 */
-                if (tap) route_settings(SETTINGS_EV_CONFIRM);
+                if (tap) route_settings(MENU_EV_CONFIRM);
                 break;
             case GESTURE_SWIPE_RIGHT: /* 两模式均可: 返回 */
-                route_settings(SETTINGS_EV_BACK);
+                route_settings(MENU_EV_BACK);
                 break;
             case GESTURE_SWIPE_LEFT: /* 两模式均可: 确认 */
-                route_settings(SETTINGS_EV_CONFIRM);
+                route_settings(MENU_EV_CONFIRM);
                 break;
             default:
                 break;
