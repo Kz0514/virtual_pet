@@ -2,12 +2,10 @@
  * @file lvgl_mem.c
  * @brief LVGL 自定义内存分配 — 对象/绘制缓冲走 PSRAM
  *
- * 默认 CONFIG_LV_USE_BUILTIN_MALLOC 是 64KB 静态池占内部 SRAM
- * (实测整机 SRAM 空闲仅 45KB); 改为 LV_STDLIB_CUSTOM 后由本文件
- * 提供 lv_malloc_core/lv_free_core/lv_realloc_core, 全部走 PSRAM 堆,
- * 内部 SRAM 空闲提升至 ~109KB。
+ * 由本文件提供 lv_malloc_core/lv_free_core/lv_realloc_core, 全部走
+ * PSRAM 堆, 不占内部 SRAM。
  * 显示 DMA 缓冲由 esp_lvgl_port 单独分配 (内部 DMA-capable 内存),
- * 不受此改动影响。
+ * 不走此路径。
  */
 #include "esp_heap_caps.h"
 #include "stdlib/lv_mem.h"   /* lv_result_t 经 lv_types.h 一并引入 */
