@@ -1,18 +1,15 @@
 /**
  * @file tts_client.c
- * @brief TTS 流式 — chunked HTTP → 双槽环形缓冲 → 链式边下边播
+ * @brief TTS 播放 — WS 流式 (主) + chunked HTTP 下载 (兜底)
  *
- * Architecture (1.0.25x 延迟优化):
- *   download_task (prio 6): recv → chunked_decode → rb_put(槽 k)
- *   playback_task (prio 6): rb_get(槽 k) → es8311_drv_write (DMA pacing)
+ * 架构:
+ *   WS 音频流 (主): 二进制 PCM 逐片直喂 → 帧队列 → 搬运任务 → 单槽环 →
+ *   播放任务整块写入 (I2S DMA 节拍)。download/playback 链为下载兜底路径。
+ *   服务端把 LLM 回复按句子切分经 chat_text 帧下发, 固件逐句入队 —
+ *   播放任务按链消费, 句间缝隙 ≈ 0 (下一句的 DNS/连接/TTFB 藏在语音后面)。
+ *   chat_done 携带 tts_done 标记时不再整段 TTS, 防重复朗读。
  *
- * 双槽环形缓冲 + 句子文本队列 (s_q): 服务端把 LLM 回复按句子切分经
- * chat_text 帧下发, 固件逐句入队 — 播放任务按链消费: 前一句播放中,
- * 后一句的下载已并行写入另一槽, 句间缝隙 ≈ 0 (下一句的 DNS/连接/TTFB
- * 全部藏在语音后面)。chat_done 携带 tts_done 标记时不再整段 TTS,
- * 防重复朗读。单句模式 (tts_speak) 与链式共用同一路径。
- *
- * 环形缓冲: 2×512KB SPSC, lock-free — wr only by producer, rd only by consumer.
+ * 环形缓冲: 单槽 512KB SPSC, lock-free — wr only by producer, rd only by consumer.
  * Unsigned 32-bit subtraction wr-rd always correct for byte count (max gap << 2^32).
  */
 #include "tts_client.h"
@@ -34,14 +31,13 @@
 static const char *TAG = "tts";
 
 /* ── 环形缓冲 (SPSC lock-free) ──
- * 512KB ≈ 5.5s @48kHz mono16, power of 2. 单槽 (1.0.266): 聚合协议下下载
- * 模式仅兜底整段单句, 双槽预下载 (播 A 下 B) 为死代码 — 单槽省 512KB
- * PSRAM (双槽实测挤占: anim 异步备帧分配失败刷屏). rb_put 满等 30s 背压. */
+ * 单槽 512KB ≈ 5.5s @48kHz mono16, power of 2。下载路径仅兜底整段单句,
+ * 双槽预下载 (播 A 下 B) 为死代码 — 单槽省 512KB PSRAM。
+ * rb_put 满等 120s 背压. */
 #define RB_SLOT_BYTES (512 * 1024)
 #define RB_SLOTS 2 /* 数组尺寸保留 — 逻辑恒用槽 0 */
 
-static uint8_t *rb_buf;                 /* SPIRAM 单槽 512KB (1.0.266): 下载模式
-                                          仅兜底整段单句 — 双槽预下载已死代码 */
+static uint8_t *rb_buf;                 /* SPIRAM 单槽 512KB (下载仅兜底整段单句) */
 static volatile uint32_t rb_wr[RB_SLOTS]; /* producer index (bytes), monotonic, overflow OK */
 static volatile uint32_t rb_rd[RB_SLOTS]; /* consumer index (bytes) */
 static volatile bool rb_done[RB_SLOTS];   /* 本槽下载完成 (dl 退出时置位) */
@@ -55,8 +51,8 @@ static volatile bool s_slot_busy[RB_SLOTS]; /* 槽被下载任务占用 — dl_s
                                              * 任务退出后再重置, 防双写混叠 */
 static volatile uint32_t s_playback_start_tick = 0;
 
-/* 播放期 PM 锁 — 轻睡冻结 I2S DMA 会破音 (2026-08-22 电源管理 v1);
- * 持锁期间 esp_pm 完全禁止轻睡, 播放结束释放 */
+/* 播放期 PM 锁 — 轻睡冻结 I2S DMA 会破音; 持锁期间 esp_pm 完全禁止
+ * 轻睡, 播放结束释放 */
 static esp_pm_lock_handle_t s_pm_lock = NULL;
 
 /* ── 协作式中断 (不杀任务) ── */
@@ -64,22 +60,20 @@ static volatile bool s_stop_req = false;     /* 停止请求 — 任务轮询 */
 static volatile uint32_t s_gen = 0;          /* 世代号 — 每次新会话递增 */
 static SemaphoreHandle_t s_api_mutex = NULL; /* 串行化 stop/speak/interrupt 入口 */
 
-/* ── WS 音频流模式 (1.0.258 聚合二期) ──
+/* ── WS 音频流模式 ──
  * 服务器 LLM 流式期间 streaming_call 增量合成, 音频经 WS 二进制帧直推
  * 设备入环直播: audio_start → 起播放链 (预冲等音频); 二进制帧 → 入环;
  * audio_end → rb_done (排空收尾). 无 POST 无下载任务, 播放任务复用,
  * 顶部以 s_ws_mode 区分 (不再 q_pop 文本). */
 static volatile bool s_ws_mode = false;
 
-/* ── WS 帧队列 + 搬运任务 (1.0.263 背压闭环) ──
+/* ── WS 帧队列 + 搬运任务 (背压闭环) ──
  * 组件任务不能阻塞 (卡 ping/pong → 断连) — ws_feed 只把帧零阻塞写入
- * 本队列; 独立搬运任务 ws_relay 取帧 → rb_put 满等阻塞 (历史 68a5450
- * 背压方式, git 实证) → 环满时 TCP 窗口收紧 → 服务器 send_bytes 挂起,
- * 速率恒 = 播放消费速率, 零估算零丢块 (除播放真实停滞 > 缓冲 10.6s).
- * 双缓冲吸收合成突发 (Qwen 整句 0.3s 内吐完) 与网络抖动. */
-#define WS_Q_BYTES (256 * 1024) /* 1.0.267: 512→256KB 省 256KB PSRAM — 播放期
-                                   空闲 370KB, anim 7 备帧 (112.5KB) 不再失败;
-                                   环 512KB + 队列 2.7s 存量仍覆盖句间合成间隙 */
+ * 本队列; 独立搬运任务 ws_relay 取帧 → rb_put 满等阻塞 → 环满时 TCP
+ * 窗口收紧 → 服务器 send_bytes 挂起, 速率恒 = 播放消费速率, 零估算
+ * 零丢块 (除播放真实停滞 > 缓冲 10.6s). 双缓冲吸收合成突发与网络抖动. */
+#define WS_Q_BYTES (256 * 1024) /* 帧队列 256KB + 环 512KB = 2.7s 存量,
+                                   覆盖句间合成间隙 (省下更大 PSRAM 预算) */
 #define WS_RELAY_BUF (9600 * 2) /* 播放整块 200ms, 与排空写纪律一致 */
 static uint8_t *s_ws_q = NULL;          /* SPIRAM 帧队列环 */
 static volatile uint32_t s_ws_q_wr = 0, s_ws_q_rd = 0; /* SPSC 指针 */
@@ -91,19 +85,17 @@ static volatile uint32_t s_ws_relay_gen = 0; /* rb_put 世代守卫 */
 /* ── 句子文本队列 (chat_text 帧 → 链式播放) ──
  * 单生产者 (WS 任务) 单消费者 (playback 任务), 互斥保护。
  * 满则丢新句 (极端场景; 正常每句 <100B, 8 句远超一轮回复)。
- * 动态条目 (PSRAM): 旧版 256B 硬上限 = 85 个中文字, 服务端按标点切句
- * 实测 105 字长句 (315B) → 句尾被截 → 语音缺失/与文字错位 (1.0.26x
- * 日志实锤: 截掉「主人想跟萝莉丝说说话，萝莉丝随时都在的！」) */
+ * 动态条目 (PSRAM): 256B 硬上限会截断超长句 → 语音缺失/与文字错位,
+ * 条目必须按实际句长分配 */
 #define TTS_Q_LEN 8
 
 static char *s_q[TTS_Q_LEN]; /* 条目 PSRAM, 所有权随出队转移给播放任务 */
 static int s_q_head = 0, s_q_tail = 0;
 static SemaphoreHandle_t s_q_mutex = NULL;
 
-/* 重复句诊断 (1.0.253): 最近一次取句的文本快照 — 播放任务再次取出
- * 相同文本即上游重发/重排 (WS 重连补发/LLM 重生成) → 声音重复播放
- * (用户实测"每段播完又播")。取句点比对打 WARN, 不跳过 — 本轮先钉死
- * 现象与频率, 跳过策略待日志确认后定 (误跳 = 语音缺失, 比重复更糟) */
+/* 重复句诊断: 最近一次取句的文本快照 — 播放任务再次取出相同文本即
+ * 上游重发/重排 (WS 重连补发/LLM 重生成)。取句点比对打 WARN, 不跳过 —
+ * 误跳 = 语音缺失, 比重复更糟 */
 static char s_last_queued[64];
 
 static int q_count(void) { return (s_q_tail - s_q_head + TTS_Q_LEN) % TTS_Q_LEN; }
@@ -173,7 +165,7 @@ uint32_t tts_client_get_playback_ms(void)
     return (xTaskGetTickCount() - s_playback_start_tick) * portTICK_PERIOD_MS;
 }
 
-static inline uint8_t *rb_slot(int s) { return rb_buf; } /* 单槽 (1.0.266) */
+static inline uint8_t *rb_slot(int s) { return rb_buf; } /* 单槽环形 */
 static inline uint32_t rb_avail(int s) { return rb_wr[s] - rb_rd[s]; }
 static inline uint32_t rb_free(int s) { return RB_SLOT_BYTES - (rb_wr[s] - rb_rd[s]); }
 
@@ -181,11 +173,10 @@ static inline uint32_t rb_free(int s) { return RB_SLOT_BYTES - (rb_wr[s] - rb_rd
  * 写入; false=槽满放弃 (rb_done 已置位, 播放侧排空已写入部分后换句).
  * Notifies playback task after adding data.
  * 世代守卫: 被打断的旧 download 任务不得再向新会话的缓冲写数据.
- * 满等 30s→120s (1.0.257 聚合): 整段回复一次合成, 单槽环形边下边播 —
- * 网络欠载时播放侧泵静音等数据, 恢复窗口可达数十秒; 120s 才判定
- * 播放侧真死 (es8311 阻塞/任务崩溃) — 置 done 放弃本句让链自愈.
- * 满等期间 recv 停摆, 数据堆在 TCP 缓冲 (可靠传输, 播放消费后流入),
- * 8s 无数据看门狗不触发 (recv 未在跑) — 120s 兜底. */
+ * 满等 120s 判定播放侧真死 (es8311 阻塞/任务崩溃) — 置 done 放弃本句
+ * 让链自愈; 网络欠载时播放侧泵静音等数据, 恢复窗口可达数十秒, 120s
+ * 足够宽. 满等期间 recv 停摆, 数据堆在 TCP 缓冲 (可靠传输, 播放消费后
+ * 流入), 8s 无数据看门狗不触发 (recv 未在跑) */
 static bool rb_put(int slot, uint32_t gen, const uint8_t *data, uint32_t len)
 {
     if (gen != s_gen) return true;
@@ -345,10 +336,9 @@ static void dl_exit(tts_args_t *args, int sock)
 
 /* 单次 TTS 下载尝试 — 成功返回 true (sock 已关闭)。
  * *out_slot_full: 槽满放弃 (播放侧疑死) — 非网络问题, 重试只会重写同槽
- * 造成数据混叠, 调用方据此不重试.
- * 所有失败路径打日志: 旧版多处静默退出 (头部 200ms 单次 recv 超时即退、
- * send 返回值不检查), 网络瞬断时 TTS 静默失败无任何痕迹
- * (1.0.231 实测: 请求在途丢失, 服务端无 access log, 设备无错误日志)。 */
+ * 造成数据混叠, 调用方据此不重试。
+ * 所有失败路径打日志 — 静默失败 (头部超时即退/send 未检) 会让网络瞬断
+ * 时的 TTS 丢失无任何痕迹 */
 static bool tts_dl_attempt(tts_args_t *args, bool *out_slot_full)
 {
     *out_slot_full = false;
@@ -411,9 +401,8 @@ static bool tts_dl_attempt(tts_args_t *args, bool *out_slot_full)
         return false;
     }
 
-    /* 头部 200ms/轮轮询, 总超时 10s — 网络瞬断 (实测) 与服务端
-     * 抖动通常在数秒内恢复; 旧版单次 200ms recv 超时即静默退出导致
-     * 整个 TTS 静默失败 (无日志无重试)。EOF/无头/超时均打日志。 */
+    /* 头部 200ms/轮轮询, 总超时 10s — 网络瞬断与服务端抖动通常在数秒内
+     * 恢复; EOF/无头/超时均打日志 */
     static char t[4096];
     int n = 0;
     TickType_t hdr_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(10000);
@@ -534,8 +523,7 @@ static void download_task(void *pv)
     ESP_LOGI(TAG, "TTS dl start (slot %d): '%.60s'", args->slot, args->text);
     /* 失败重试一次 (1s 后) — 网络瞬断场景第二次大概率恢复; 重试期间
      * rb_done 不置位, playback 预冲继续等待 (世代守卫保证安全).
-     * 槽满放弃不重试 — 播放侧疑死 (30s 满等), 重试只会重写同槽造成
-     * 数据混叠 (尖锐噪音实测) */
+     * 槽满放弃不重试 — 播放侧疑死, 重试会重写同槽造成数据混叠 */
     bool ok = false, slot_full = false;
     for (int attempt = 0; attempt < 2; attempt++) {
         if (attempt > 0) {
@@ -553,9 +541,9 @@ static void download_task(void *pv)
 
 /* 起一次下载: 重置槽计数器 + 生成 dl 任务. 成功返回 true.
  * 文本所有权移交 dl 任务 (退出时释放); 失败调用方自行 free
- * 槽占用保护: 旧下载任务未退出时重置槽 → 新旧任务写同一槽, 两任务各自
- * 维护 wr 指针 → 数据混叠 (播放出垃圾 PCM = 尖锐噪音实测, 1.0.26x).
- * 等旧任务退出 (最多 3s, 其 8s 看门狗保证有限等待); 仍占用则放弃本句 */
+ * 槽占用保护: 旧下载任务未退出时重置槽 → 新旧任务写同一槽, 各自维护
+ * wr 指针 → 数据混叠 (垃圾 PCM 尖锐噪音)。等旧任务退出 (最多 3s, 其
+ * 8s 看门狗保证有限等待); 仍占用则放弃本句 */
 static bool dl_spawn(char *text, int slot, uint32_t gen)
 {
     for (int i = 0; i < 60 && s_slot_busy[slot]; i++)
@@ -588,23 +576,19 @@ static bool dl_spawn(char *text, int slot, uint32_t gen)
 }
 
 /* ── Playback task: 链式播放驱动 ──
- * 单任务跑完整条回复链: 起下载 → 预冲 → 预发起下一句 → 排空 → 换槽.
+ * 单任务跑完整条回复链: 起下载 → 预冲 → 起下一句 → 排空 → 换槽.
  * 链结束 (队列空) 或被打断时退出并清理.
- * 预冲 0.4s (P2 延迟优化): flash 写已全部门控, 0.4s 足以吸收
- * DashScope 短抖动; underruns 计数监控欠冲。 */
-#define PLAY_CHUNK_SAMPLES 9600 /* 200ms @48kHz — 整 desc 写纪律 (1.0.256):
+ * 预冲 0.5s 足以吸收短抖动; underruns 计数监控欠冲。 */
+#define PLAY_CHUNK_SAMPLES 9600 /* 200ms @48kHz — 整 desc 写纪律:
                                  * esp_driver_i2s TX desc 环 dw0.len 固定全长度,
                                  * DMA 播满 200ms 才移下一 desc; 半块写 = 播到
-                                 * 未填部分 = 1.2s 前环内旧内容 (复播句首根因) */
-#define MIN_START_SAMPLES 24000 /* 0.5s @48kHz — 1.0.263 背压闭环: 首句
-                                 * burst (0.3s 内整句到) + 服务器全速推,
-                                 * 0.5s 预冲后环仍有秒级缓冲, 开播更快 */
+                                 * 未填部分 = 旧内容 (复播句首根因) */
+#define MIN_START_SAMPLES 24000 /* 0.5s @48kHz — 首句 burst 后环仍有秒级
+                                 * 缓冲, 开播更快 */
 
-/* 静音泵 — 整 desc 满块写, 源用 PSRAM chunk 清零 (1.0.261: 原
- * static const .rodata → flash 直读, 播放期任何 flash 操作 (动画帧
- * 加载/日志写) 冻结 flash cache → DMA 从 flash 读源挂起/读错,
- * 1.0.260 实测 wl_flash read(610)=0x101)。chunk 已 MALLOC_CAP_SPIRAM,
- * 泵只在等待期调用 (那时 chunk 内容无意义), 零额外分配 */
+/* 静音泵 — 整 desc 满块写, 源用 PSRAM chunk 清零 (播放期任何 flash
+ * 操作会冻结 flash cache → DMA 从 flash 直读源挂起/读错, 故源必须
+ * PSRAM; chunk 只在泵调用期间使用, 内容无意义, 零额外分配) */
 static inline void pump_silence(int16_t *chunk)
 {
     memset(chunk, 0, PLAY_CHUNK_SAMPLES * 2);
@@ -616,7 +600,7 @@ static void playback_task(void *pv)
     s_playback_task = xTaskGetCurrentTaskHandle();
     uint32_t my_gen = s_gen;
     /* 播放期禁轻睡 (I2S DMA 冻结会破音) — 各退出路径与 interrupt 强杀处释放;
-     * 同时占用 I2S 通道 (2026-08-22 电源管理 v1) */
+     * 同时占用 I2S 通道 (电源管理 v1) */
     if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock);
     es8311_drv_hold();
 
@@ -625,7 +609,7 @@ static void playback_task(void *pv)
         if (my_gen == s_gen) {
             s_playback_task = NULL;
             s_busy = false;
-            s_ws_mode = false; /* 1.0.265: WS 链结束复位 */
+            s_ws_mode = false; /* WS 链结束复位 */
             s_playback_start_tick = 0;
         }
         es8311_drv_release();
@@ -635,7 +619,7 @@ static void playback_task(void *pv)
     }
     esp_codec_dev_handle_t dac = es8311_get_dac_handle();
 
-    int slot = 0; /* 单槽 (1.0.266) */
+    int slot = 0; /* 单槽环形 */
     int total_played = 0;
     int underruns = 0;
     bool stopped = false;
@@ -643,14 +627,11 @@ static void playback_task(void *pv)
     TickType_t t_start = xTaskGetTickCount();
     s_playback_start_tick = t_start;
 
-    /* 静音泵缓冲 (1.0.255→1.0.256): 任何等待期 (预冲/欠载/链尾) 写静音保持
-     * DMA 流 — ★ 必须整 desc 写 (9600 samples = 200ms 满块): i2s_common.c 的
-     * TX 环是硬件级循环链 (desc[i]->next = desc[i+1], 末个回链 desc[0],
+    /* 静音泵缓冲: 任何等待期 (预冲/欠载/链尾) 写静音保持 DMA 流 —
+     * ★ 必须整 desc 写 (9600 samples = 200ms 满块): i2s_common.c 的 TX 环
+     * 是硬件级循环链 (desc[i]->next = desc[i+1], 末个回链 desc[0],
      * dw0.len 固定全长度), DMA 播满 200ms 才移下一 desc。小块只部分填充 →
-     * DMA 播到未填满部分 = 上轮旧内容 (1.0.254 静音泵 20ms 小块实测未消除)。
-     * 1.0.255 泵改整块写仍复播 — 根因: 排空循环 80ms 块停在 desc 中间,
-     * 欠载点/句尾的半块残留 = 1.2s 前环内旧内容照样被播 (旧内容 = 本句句首
-     * 区域 → "复播一小段句首")。1.0.256: 排空也只写整块 + 句尾静音补齐,
+     * DMA 播到未填部分 = 环内旧内容; 排空也须整块写 + 句尾静音补齐,
      * 环内任何时刻零残留, 泵仅兜底 */
 
     while (1) {
@@ -660,11 +641,11 @@ static void playback_task(void *pv)
         }
 
         /* 本槽无内容 (链起点/失败跳过/晚到句) — 取一句文本并起下载;
-         * WS 模式 (1.0.258): 无文本队列, rb_done 由 audio_end 置位 */
+         * WS 模式: 无文本队列, rb_done 由 audio_end 置位 */
         if (rb_done[slot] && rb_avail(slot) == 0) {
             if (s_ws_mode) {
                 /* audio_end 已到但帧队列还有残余 — 搬运任务未搬完,
-                 * 等它搬入 (1.0.263 背压闭环) */
+                 * 等帧队列搬完 (背压闭环) */
                 if (s_ws_q && s_ws_q_rd != s_ws_q_wr) {
                     pump_silence(chunk);
                     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
@@ -681,12 +662,11 @@ static void playback_task(void *pv)
             }
         }
 
-        /* 预冲: 0.4s 音频或本句下载完成 (前一句播放期已预发起下载, 通常即刻就绪).
-         * 30s 兜底超时 — 下载模式防死等 (dl 自身有 8s 无数据看门狗, 双保险);
-         * WS 模式 (1.0.262): 禁用看门狗 — LLM 停顿 (实测 20s+) 期间合成器
-         * 无输出是正常现象, 播放链必须静音等待到 audio_end, 不得放弃
-         * (1.0.261 教训: 看门狗误杀播放链 → 后到音频全丢).
-         * 等待期静音泵: 写静音保持 DMA 流 (1.0.254) — 旧 desc 循环播 = 重复卡顿 */
+        /* 预冲: 0.5s 音频或本句下载完成 (前一句播放期已预发起下载, 通常即刻就绪).
+         * 下载模式 30s 兜底超时 (dl 自身还有 8s 无数据看门狗, 双保险);
+         * WS 模式禁用看门狗 — LLM 停顿 (20s+) 期间合成器无输出是正常现象,
+         * 播放链必须静音等待到 audio_end, 不得放弃 (误杀 → 后到音频全丢).
+         * 等待期静音泵: 写静音保持 DMA 流 */
         TickType_t wait_start = xTaskGetTickCount();
         while (rb_avail(slot) < MIN_START_SAMPLES * 2 && !rb_done[slot]) {
             if (s_stop_req) {
@@ -700,7 +680,7 @@ static void playback_task(void *pv)
                                        * 排空死等, 队列里后续句子永不播放 */
                 break;
             }
-            pump_silence(chunk); /* 静音泵: 整 desc 满块 (1.0.255) */
+            pump_silence(chunk); /* 静音泵: 整 desc 满块 */
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
         }
         if (stopped) break;
@@ -709,9 +689,9 @@ static void playback_task(void *pv)
             continue; /* 回顶部起下一句下载 */
         }
 
-        /* 首句前: DAC 就绪. WS 模式 (1.0.267): 预冲循环已泵静音清残留,
-         * 跳过 2 块 pump — 实测起播前多 400ms 静音 = 首句开头"卡两下";
-         * 链尾冲刷 (1.0.256) 已保证环内零残留, 预冲泵即足矣 */
+        /* 首句前: DAC 就绪. WS 模式: 预冲循环已泵静音清残留, 跳过
+         * 2 块 pump (省起播前 400ms 静音 = "卡两下"); 链尾冲刷已保证
+         * 环内零残留, 预冲泵即足矣 */
         if (!dac_ready) {
             es8311_drv_set_vol(100);
             if (dac) esp_codec_dev_write_reg(dac, 0x32, 0xCC);
@@ -724,22 +704,20 @@ static void playback_task(void *pv)
         }
 
         /* 排空本槽 — es8311_drv_write 阻塞即 DMA 节拍, 自然控速.
-         * 10s 无进展 (无数据可读且下载未完成) 判定下载侧已死 — 强制
-         * 换句, 防排空死等冻结整链 (2026-08-24: 下载任务挂死实测).
-         * WS 模式 (1.0.262): 看门狗禁用 — 播放节奏 = LLM 生成节奏,
-         * 停顿期无数据是正常现象, 静音泵等待到 audio_end 才收链 */
+         * 下载模式 10s 无进展 (无数据可读且下载未完成) 判定下载侧已死 —
+         * 强制换句, 防排空死等冻结整链. WS 模式: 看门狗禁用 — 播放节奏
+         * = LLM 生成节奏, 停顿期无数据是正常现象, 静音泵等待到 audio_end */
         TickType_t drain_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(10000);
         while (1) {
             if (s_stop_req) {
                 stopped = true;
                 break;
             }
-            /* 整 desc 写纪律 (1.0.256): 只写 9600-sample 整块 — esp_driver_i2s
-             * TX desc 环 dw0.len 固定全长度 200ms, DMA 无论写入多少都播满;
-             * 半块写 = 播到未填部分 = 1.2s 前环内旧内容 → "复播一小段句首"
-             * (1.0.255 泵只保证泵自身整块, 欠载点/句尾的半块残留照样被播).
-             * 整块写 = 环内永不残留旧内容; 句尾不足一块用静音补齐 (≤200ms,
-             * 顺带恢复句间停顿) */
+            /* 整 desc 写纪律: 只写 9600-sample 整块 — esp_driver_i2s TX desc 环
+             * dw0.len 固定全长度 200ms, DMA 无论写入多少都播满; 半块写 =
+             * 播到未填部分 = 环内旧内容 → "复播一段句首"。整块写 = 环内
+             * 永不残留旧内容; 句尾不足一块用静音补齐 (≤200ms, 顺带恢复
+             * 句间停顿) */
             uint32_t avail = rb_avail(slot);
             if (avail >= 2) {
                 uint32_t to_read = avail;
@@ -764,18 +742,18 @@ static void playback_task(void *pv)
                 } else {
                     /* 半块攒齐等待 (下载慢于播放) — 泵保持 DMA 流 */
                     if (!s_ws_mode && !rb_done[slot]) underruns++;
-                    /* WS 模式 (1.0.262): 禁用看门狗 — LLM 停顿期静音等待,
-                     * 见预冲循环注释; underruns 同理不计 (停顿 = 设计行为) */
+                    /* WS 模式: 禁用看门狗 — LLM 停顿期静音等待, 见预冲循环注释;
+                     * underruns 同理不计 (停顿 = 设计行为) */
                     if (!s_ws_mode && xTaskGetTickCount() > drain_deadline) {
                         ESP_LOGW(TAG, "排空 10s 无进展 — 强制换句 (slot %d)", slot);
                         rb_done[slot] = true;
                         break;
                     }
-                    pump_silence(chunk); /* 静音泵: 整 desc 满块 (1.0.255) */
+                    pump_silence(chunk); /* 静音泵: 整 desc 满块 */
                     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
                 }
             } else if (rb_done[slot] && avail == 0) {
-                /* WS 模式: 帧队列残余未搬完 — 静音泵等搬运任务 (1.0.263) */
+                /* WS 模式: 帧队列残余未搬完 — 静音泵等搬运任务 */
                 if (s_ws_mode && s_ws_q && s_ws_q_rd != s_ws_q_wr) {
                     pump_silence(chunk);
                     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
@@ -785,25 +763,24 @@ static void playback_task(void *pv)
             } else {
                 /* Buffer low — wait for download to deliver more data */
                 if (!s_ws_mode && !rb_done[slot]) underruns++;
-                /* WS 模式 (1.0.262): 禁用看门狗 — 静音等待到 audio_end */
+                /* WS 模式: 禁用看门狗 — 静音等待到 audio_end */
                 if (!s_ws_mode && xTaskGetTickCount() > drain_deadline) {
                     ESP_LOGW(TAG, "排空 10s 无进展 — 强制换句 (slot %d)", slot);
                     rb_done[slot] = true;
                     break;
                 }
-                pump_silence(chunk); /* 静音泵: 整 desc 满块 (1.0.255) */
+                pump_silence(chunk); /* 静音泵: 整 desc 满块 */
                 ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
             }
         }
         if (stopped) break;
 
-        /* 单槽 (1.0.266): 无句中切换 — 多句队列时回顶部起下一句下载
-         * (下载模式恒整段单句, 见 tts_start_chain 注释) */
+        /* 单槽: 无句中切换 — 多句队列时回顶部起下一句下载
+         * (下载模式恒整段单句) */
     }
 
-    /* 链结束 — 冲刷 I2S DMA 环为全静音 (1.0.255): 6 × 200ms 整 desc = 全环
-     * 覆盖。旧版 20ms 小块部分填充 → 环内残留旧内容, 下链开头被循环复播;
-     * 整 desc 写 = 每块一次填满, 播完残留后干净静音。一句没播过无需冲刷 */
+    /* 链结束 — 冲刷 I2S DMA 环为全静音: 6 × 200ms 整 desc = 全环覆盖,
+     * 下链开头不会循环复播残留。一句没播过无需冲刷 */
     if (total_played > 0) {
         for (int i = 0; i < 6; i++)
             pump_silence(chunk);
@@ -824,7 +801,7 @@ static void playback_task(void *pv)
     if (my_gen == s_gen) {
         s_playback_task = NULL;
         s_busy = false;
-        s_ws_mode = false; /* 1.0.265: WS 链收尾复位 — 兜底 POST 走下载模式 */
+        s_ws_mode = false; /* WS 链收尾复位 — 后续 POST 走下载模式 */
         s_playback_start_tick = 0;
     }
     es8311_drv_release();
@@ -842,8 +819,8 @@ void tts_client_init(void)
         if (esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "tts_play", &s_pm_lock) != ESP_OK)
             ESP_LOGW(TAG, "PM 锁创建失败 — 播放期不禁轻睡 (有破音风险)");
     }
-    /* 环 + WS 帧队列全部预分配到开机 (1.0.264): ws_start 时动画帧等
-     * 已占 PSRAM, 实测 512KB 分配失败降级直接写环 (开环丢块) */
+    /* 环 + WS 帧队列开机预分配 — 启动期 PSRAM 最空; ws_start 时动画帧等
+     * 已占 PSRAM, 分配失败只能降级直接写环 (丢块) */
     if (!rb_buf) {
         rb_buf = heap_caps_malloc(RB_SLOT_BYTES, MALLOC_CAP_SPIRAM);
         if (rb_buf) {
@@ -880,8 +857,8 @@ static bool tts_start_chain(void)
             return false;
         }
     }
-    /* 下载模式起点 (1.0.265): WS 链已收尾 — 强制复位防遗留 WS 态
-     * (兜底 POST 竞态: chat_done 先于播放收链到达) */
+    /* 下载模式起点: 强制复位 s_ws_mode 防遗留 WS 态 (兜底 POST 竞态:
+     * chat_done 先于播放收链到达) */
     s_ws_mode = false;
 
     s_busy = true;
@@ -959,10 +936,10 @@ static bool _interrupt_chain(void)
         vTaskDelete(s_playback_task);
         s_playback_task = NULL;
         s_busy = false; /* 被杀任务不会自行清理 */
-        s_ws_mode = false; /* 1.0.265 */
+        s_ws_mode = false;
     }
-    /* 搬运任务同理 (1.0.263) — 可能阻塞在 rb_put 满等, 杀后 SPSC 指针
-     * 未更新的半帧由下次会话重读, 无残留 */
+    /* 搬运任务同理 — 可能阻塞在 rb_put 满等, 杀后 SPSC 指针未更新的
+     * 半帧由下次会话重读, 无残留 */
     if (s_ws_relay) {
         vTaskDelete(s_ws_relay);
         s_ws_relay = NULL;
@@ -970,7 +947,7 @@ static bool _interrupt_chain(void)
     return true;
 }
 
-/* ── WS 音频流模式 API (1.0.258 聚合二期) ──
+/* ── WS 音频流模式 API ──
  * audio_start: 起播放链 (预冲等 WS 音频). 打断旧链后重置槽 0.
  * ws_feed:     WS 任务上下文调用 (esp_websocket_client 组件任务!) —
  *              必须零阻塞: 写帧队列 (满 = 播放停滞, 丢块计数), 有空间
@@ -1025,7 +1002,7 @@ bool tts_client_ws_start(void)
     s_gen++;
     s_stop_req = false;
     s_ws_mode = true;
-    /* 帧队列 + 搬运任务 (1.0.263 背压闭环) — 缓冲已开机预分配, 失败降级直接写环 */
+    /* 帧队列 + 搬运任务 (背压闭环) — 缓冲已开机预分配, 失败降级直接写环 */
     if (s_ws_q) {
         s_ws_q_wr = s_ws_q_rd = 0;
         s_ws_q_done = false;

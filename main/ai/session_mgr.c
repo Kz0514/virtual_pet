@@ -40,7 +40,7 @@ static const char *TAG = "sess";
 #define LISTEN_WINDOW_MS 10000 /* 每次聆听窗口 */
 #define MAX_RECORD_MS 15000    /* 单段录音上限 */
 #define MIN_SPEECH_MS 300      /* 最短人声 (更短丢弃) */
-#define SILENCE_END_MS 600     /* 静音判定止点 (延迟优化 1.0.25x: 800→600, 每轮省 0.2s) */
+#define SILENCE_END_MS 600     /* 静音判定止点 */
 #define PRE_SPEECH_MS 300      /* 起点往前补的字头 */
 
 #define LOOKBACK_SAMPLES (SAMPLE_RATE * 2) /* 2s 回看 */
@@ -59,7 +59,7 @@ static volatile sess_state_t s_state = SESS_IDLE;
 static volatile bool s_enter_req = false;
 static TaskHandle_t s_task = NULL;
 
-/* 会话期 PM 锁 — 聆听/录音期间轻睡冻结 I2S DMA 会丢语音 (2026-08-22 电源管理 v1);
+/* 会话期 PM 锁 — 聆听/录音期间轻睡冻结 I2S DMA 会丢语音;
  * 粗粒度: 整个会话 (聆听+录音+等待+播放) 持锁, 播放期 tts 锁已覆盖, 双锁嵌套安全 */
 static esp_pm_lock_handle_t s_pm_lock = NULL;
 
@@ -169,8 +169,7 @@ static void wait_playback(void)
 }
 
 /* 300ms 麦克风预填 — 回看缓冲装满当前音频 (防起点补字头时夹带旧数据),
- * 同时把真实环境 RMS 推入滑动窗口 — 每轮聆听前阈值已贴合当前环境,
- * 不再需要重新适应 (曾因每轮重置窗口导致第二轮起 VAD 前 2s 失灵) */
+ * 同时把真实环境 RMS 推入滑动窗口, 每轮聆听前阈值已贴合当前环境 */
 static void prefill_lookback(void)
 {
     s_lb_wr = 0;
@@ -200,8 +199,8 @@ static void sess_task(void *pv)
         stop_tts_and_silence();
 
         /* 会话期禁轻睡 (聆听/录音连续读 I2S) — 会话结束段释放;
-         * 只占 RX (聆听/录音不需要 TX; v1.2: open DAC 会 enable TX
-         * 播放残留数据 → 异响; 播放由 tts 自己 full hold, 嵌套计数) */
+         * 只占 RX (聆听/录音不需要 TX; open DAC 会 enable TX 播放
+         * 残留数据 → 异响; 播放由 tts 自己 full hold, 嵌套计数) */
         if (!s_pm_lock) esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "sess", &s_pm_lock);
         if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock);
         es8311_drv_hold_rx();
@@ -372,8 +371,8 @@ void session_mgr_init(void)
         return;
     }
     xTaskCreateWithCaps(sess_task, "sess", 16384, NULL, 5, &s_task,
-                        MALLOC_CAP_SPIRAM); /* 12KB 曾在 esp_http_client+cJSON
-                                               调用链上栈溢出双异常 */
+                        MALLOC_CAP_SPIRAM); /* PSRAM 栈 — esp_http_client+cJSON
+                                               调用链栈占用大, 内部 RAM 放不下 */
     ESP_LOGI(TAG, "会话模式就绪 (回看 %dms, 录音上限 %ds)",
              LOOKBACK_SAMPLES * 1000 / SAMPLE_RATE, MAX_RECORD_MS / 1000);
 }

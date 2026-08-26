@@ -78,8 +78,8 @@ esp_err_t es8311_drv_init(const es8311_drv_cfg_t *cfg)
         .gpio_cfg = {.mclk = AUDIO_MCLK_IO, .bclk = AUDIO_DMIC_SCL_IO, .ws = AUDIO_LRCK_IO, .dout = AUDIO_DSDIN_IO, .din = AUDIO_ASDOUT_IO},
     };
 
-    /* 通道只 init 不 enable — enable 由 es8311_drv_hold/release 按需管理
-     * (2026-08-22 电源管理 v1: enable 期持 APB 锁禁轻睡, 常开会锁死轻睡) */
+    /* 通道只 init 不 enable — enable 由 es8311_drv_hold/release 按需管理:
+     * enable 期驱动持 APB 锁禁轻睡, 常开会锁死轻睡 */
     if (!_es.cfg.mic_only) {
         ret = i2s_channel_init_std_mode(_es.tx_chan, &sc);
         if (ret != ESP_OK) {
@@ -174,11 +174,10 @@ esp_err_t es8311_drv_init(const es8311_drv_cfg_t *cfg)
     }
 
     /* ── 架构: 启动时 open 一次, 芯片常驻 ──
-     * open = I2S 通道 enable + ES8311 start (上电配置一次后保持);
-     * ★ v1.2 实测: 每周期 open/close → ES8311 start/reset → 模拟瞬态
-     * (VMID/偏置建立/跌落) 被常开 PA 放大 → 周期性咔哒声。
-     * v1.3: 芯片只 start 一次, 采样/播放由 hold/release 只开关 I2S
-     * 时钟 (微秒级, 无模拟瞬态)。
+     * open = I2S 通道 enable + ES8311 start (上电配置一次后保持)。
+     * 芯片只 start 一次, 采样/播放由 hold/release 只开关 I2S 时钟
+     * (微秒级, 无模拟瞬态) — 每次 start/reset 的模拟瞬态 (VMID/偏置
+     * 建立/跌落) 被常开 PA 放大成周期性咔哒声。
      * open 后立即停时钟: dev 层状态保持 (read/write 可用), 物理通道
      * disable → 不持 APB 锁 → 轻睡可用 */
     _es.fs = (esp_codec_dev_sample_info_t){
@@ -237,9 +236,9 @@ esp_err_t es8311_drv_init(const es8311_drv_cfg_t *cfg)
 
 /* hold/release = 只开关 I2S 时钟 —
  * 芯片在 init 已 start 一次并常驻, 这里不再 open/close (每次
- * start/reset 的模拟瞬态经 PA 放大成周期性咔哒, v1.2 实测)。
+ * start/reset 的模拟瞬态经 PA 放大成周期性咔哒)。
  * enable 期间驱动持 APB 锁 (esp_driver_i2s), 空闲 disable → 锁释放
- * → 轻睡解禁 (v1 根因: 常开永久持 2 把锁, 轻睡 0 次)。
+ * → 轻睡解禁 (常开则永久持 2 把锁, 轻睡不可达)。
  *
  * 双通道计数:
  * - full (es8311_drv_hold): TTS 播放 (enable TX)
@@ -253,7 +252,7 @@ static SemaphoreHandle_t s_hold_mux = NULL;
 
 /* 停时钟前冲刷静音 — 防 TTS 残留下次 enable 被播放 (咔哒);
  * TX 未 enable 时跳过 — i2s_channel_write 要求通道已 enable
- * (二进制信号量, v1.3 实测: 未 enable 写 → "The channel is not enabled") */
+ * (未 enable 写会返回 "The channel is not enabled") */
 static void es8311_flush_silence(void)
 {
     if (!_es.dac_dev) return;
@@ -290,9 +289,9 @@ void es8311_drv_hold_rx(void)
     xSemaphoreTake(s_hold_mux, portMAX_DELAY);
     if (s_rx_cnt++ == 0 && s_full_cnt == 0) {
         /* ★ S3 全双工: BCK/WS 时钟由 TX 通道产生 (share_bck_ws) —
-         * 只 enable RX 无时钟 → i2s_channel_read 超时 → 采样失败
-         * (v1.3 实测: noise total=0)。TX 必须同时 enable 提供时钟;
-         * TX buffer 常驻静音 (init 预填 + 归零冲刷) → 喇叭无声 */
+         * 只 enable RX 无时钟 → i2s_channel_read 超时 → 采样失败。
+         * TX 必须同时 enable 提供时钟; TX buffer 常驻静音
+         * (init 预填 + 归零冲刷) → 喇叭无声 */
         if (!_es.cfg.mic_only && _es.tx_chan)
             i2s_channel_enable(_es.tx_chan);
         i2s_channel_enable(_es.rx_chan);

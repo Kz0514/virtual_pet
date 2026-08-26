@@ -40,7 +40,7 @@ uint32_t tts_client_get_playback_ms(void);
 /** TTS全周期是否忙碌 (下载+播放) — 供气泡兜底判断 */
 bool tts_client_is_busy(void);
 
-/** ── WS 音频流模式 (1.0.258 聚合二期): 服务器 LLM 流式期间增量合成,
+/** ── WS 音频流模式: 服务器 LLM 流式期间增量合成,
  *  音频经 WS 二进制帧直推, 设备入环直播 — 无 POST 无下载任务 ── */
 /** audio_start: 起播放链 (预冲等 WS 音频), 打断旧链. 返回是否成功 */
 bool tts_client_ws_start(void);

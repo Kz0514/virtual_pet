@@ -29,7 +29,7 @@ static const char *TAG = "voice";
 static bool s_inited = false;
 static volatile bool s_recording = false;
 
-/* 录音期 PM 锁 — 轻睡冻结 I2S DMA 会丢录音 (2026-08-22 电源管理 v1) */
+/* 录音期 PM 锁 — 轻睡冻结 I2S DMA 会丢录音 */
 static esp_pm_lock_handle_t s_pm_lock = NULL;
 
 bool voice_chat_is_recording(void) { return s_recording; }
@@ -51,8 +51,8 @@ static void ensure_inited(void)
         return;
     }
 
-    /* Let HPF + VREF settle — I2S 未 enable 时读会失败, 需临时占用 (2026-08-22);
-     * 只占 RX (v1.2: open DAC 会 enable TX 播放残留数据 → 异响) */
+    /* Let HPF + VREF settle — I2S 未 enable 时读会失败, 需临时占用;
+     * 只占 RX (open DAC 会 enable TX 播放残留数据 → 异响) */
     es8311_drv_hold_rx();
     int16_t dummy[FRAME_SAMPLES];
     for (int i = 0; i < 50; i++)
@@ -133,9 +133,8 @@ char *voice_asr_transcribe_pcm(const int16_t *pcm, uint32_t sample_count)
     int l1 = strlen(p1), l2 = strlen(p2);
     int total = l1 + 44 + (int)data_bytes + l2;
 
-    /* 流式 POST: 零大块拷贝, 直接复用录音缓冲 pcm — 曾因连续两次
-     * ~880KB PSRAM 分配静默失败导致 ASR 请求根本没发出 (8MB PSRAM
-     * 被字体/动画帧/录音缓冲常驻占满, 大块分配间歇性失败) */
+    /* 流式 POST: 零大块拷贝, 直接复用录音缓冲 pcm — 避免再次申请大块
+     * PSRAM (8MB PSRAM 被字体/动画帧/录音缓冲常驻占满, 大块分配易失败) */
     s_resp_len = 0;
     esp_err_t err = ESP_FAIL;
     if (esp_http_client_open(cli, total) == ESP_OK) {
@@ -145,7 +144,7 @@ char *voice_asr_transcribe_pcm(const int16_t *pcm, uint32_t sample_count)
         w += esp_http_client_write(cli, (char *)pcm, (int)data_bytes);
         w += esp_http_client_write(cli, p2, l2);
         /* fetch_headers 返回 int64_t content-length (≥0=成功, <0=失败),
-         * 不是 esp_err_t — 曾把 46/49 字节的响应体长度当错误码拒绝 */
+         * 不是 esp_err_t, 不能按 esp_err_t 判负 */
         if (w == total && esp_http_client_fetch_headers(cli) >= 0) {
             char rbuf[256];
             int n;
@@ -199,7 +198,7 @@ char *voice_chat_record_and_asr(void)
     ESP_LOGI(TAG, "Recording %ds...", RECORD_SECONDS);
     if (!s_pm_lock) esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "voice_rec", &s_pm_lock);
     if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock);
-    es8311_drv_hold_rx(); /* 录音只占 RX (: 不碰 DAC 防 TX 播放残留异响) */
+    es8311_drv_hold_rx(); /* 录音只占 RX — 不碰 DAC 防 TX 播放残留异响 */
     s_recording = true;
     notify_show(NOTIFY_INFO, "录音中...", 3000);
     int total = 0;
