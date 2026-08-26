@@ -42,7 +42,7 @@ idf_component_register(
         "app/diary_mgr.c"
         "app/life_log.c"
         "app/diary_sync.c"
-        "app/usb_storage.c"
+        "drivers/storage/usb_storage.c"
         "system/config_mgr.c"
         "app/event_bus.c"
         # Network
@@ -83,6 +83,7 @@ idf_component_register(
         "drivers/sensors"
         "drivers/sensors/dmp"
         "drivers/haptic"
+        "drivers/storage"
         "app"
         "network"
         "ai"
