@@ -9,8 +9,7 @@
  * 本模块只负责 memory.txt 的读写。
  * 写盘纪律: 一切 flash 访问 (读与写) 统一由专用写盘任务执行 — 调用方
  * 可能是 PSRAM 栈任务 (esp_websocket_client 任务栈在 PSRAM), 而 flash
- * 操作期间 cache 被禁用, PSRAM 栈一访问即 double exception (聊天回复
- * 崩溃根因: 1.0.213 只移了写, 1.0.214 证实 stat/fopen 读同样崩)。
+ * 操作期间 cache 被禁用, PSRAM 栈一访问即 double exception。
  * 另: TTS 播放期间不写盘, 防 flash 冻结卡音频。
  */
 #include "memory_store.h"
@@ -38,12 +37,9 @@ static const char *MEM_FILE = "/cfg/memory.txt";
 #define MEM_REPAIR_MAX (128 * 1024) /* 自愈读全文件上限 */
 
 /* : UTF-8 清洗 — 坏字节就地替换为 '?' (长度不变, 返回坏字节数,
- * 输出仍合法 UTF-8)。坏点源于 ws_event 的 512B snprintf 行尾截断。
- * 演进: 截断式 (早期版) 坏点后内容全丢 — 连后续完整记录一起删;
- * 剔除式 坏字节跳过 — 相邻字节重新对齐可能错配成假字符;
- * '?' 替换 坏点独立占位, 其余字节解析不受影响, LLM/日志可感知缺失。
- * 背景: 半个字符 append 进 memory.txt → mem_summary 随 chat 帧上送 →
- * 服务端 uvicorn decode 失败直接关连接 (每次语音对话必被踢, 实测 2/2)。 */
+ * 输出仍合法 UTF-8)。坏点源于 ws_event 的 512B snprintf 行尾截断;
+ * '?' 独立占位, 其余字节解析不受影响, LLM/日志可感知缺失。坏字节
+ * 随 mem_summary 上送会被服务端 decoder 拒连, 必须清洗。 */
 static size_t utf8_sanitize_inplace(char *s, size_t len)
 {
     size_t i = 0, bad = 0;
@@ -97,8 +93,7 @@ static void memory_store_refresh_cache(void);
 
 /* ===== 异步读写 — 专用写盘任务 (内部 RAM 栈) =====
  * WS 任务栈在 PSRAM (vendored esp_websocket_client 补丁); flash 操作
- * (读写都一样) 期间 cache 禁用 → PSRAM 栈一访问即 double exception
- * (1.0.213 修了写, 1.0.214 补上读 — 读也走 cache 禁用路径)。
+ * (读写都一样) 期间 cache 禁用 → PSRAM 栈一访问即 double exception。
  * 所有读写一律入队, 由本任务执行 (xTaskCreate 默认内部 RAM 栈,
  * init 在启动初期创建, 内部堆未碎片化可稳定分配)。 */
 typedef enum { MEM_WRITE_APPEND,
@@ -158,7 +153,7 @@ static void memory_store_writer_task(void *arg)
                              tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
                 }
                 /* 分段 write (O_APPEND 每次自动到末尾, 单写盘任务无竞争)。
-                 * v2.19.1: 每段清洗 — 坏字节替换 '?', 全坏行不写 */
+                 * 每段清洗 — 坏字节替换 '?', 全坏行不写 */
                 if (it.user) {
                     size_t ul = strlen(it.user);
                     size_t ubad = utf8_sanitize_inplace(it.user, ul);
@@ -191,7 +186,7 @@ static void memory_store_writer_task(void *arg)
             }
         } else if (it.op == MEM_READ) {
             /* 读也在这里执行 — PSRAM 栈任务 (WS) 上 stat/fopen 同样是
-             * cache 禁用期 flash 访问, 必崩 (1.0.214 根因) */
+             * cache 禁用期 flash 访问, 必崩 */
             char *buf = NULL;
             size_t len = 0;
             if (s_ready) {
@@ -218,12 +213,11 @@ static void memory_store_writer_task(void *arg)
             if (it.cb) it.cb(buf, len, it.arg); /* 回调返回后缓冲即失效 */
             free(buf);
         } else if (it.op == MEM_WRITE_REPAIR) {
-            /* 自愈 (1.0.252): 读全文件 → 清洗坏字节 → O_TRUNC 原子重写。
-             * 全在本任务内执行 → 与 APPEND/OVERWRITE 严格串行。此前修复在
-             * 主循环直接 O_TRUNC 写盘, 与写盘任务并发 append 相互覆盖/交错 →
-             * 坏字节每次对话复现; 且修复写回用 strlen 越读 (读缓冲未终止) →
-             * 附尾 PSRAM 垃圾 → 文件增长。stat 尺寸异常 (崩溃期脏 LittleFS
-             * 元数据垃圾尺寸, memory_store_size 已带 256KB 上限 → 0) 时按
+            /* 自愈: 读全文件 → 清洗坏字节 → O_TRUNC 原子重写。
+             * 全在本任务内执行 → 与 APPEND/OVERWRITE 严格串行 (修复写回
+             * 必须入队单写者, 写回用实际读取长度, 缓冲已补终止)。
+             * stat 尺寸异常 (崩溃期脏 LittleFS 元数据垃圾尺寸,
+             * memory_store_size 已带 256KB 上限 → 0) 时按
              * MEM_REPAIR_MAX 尝试读实际数据, 读 0 字节则不动 (空文件) */
             size_t flen = memory_store_size();
             if (flen == 0 || flen > MEM_REPAIR_MAX) flen = MEM_REPAIR_MAX;
@@ -335,9 +329,8 @@ size_t memory_store_size(void)
     if (!s_ready) return 0;
     struct stat st;
     if (stat(MEM_FILE, &st) != 0) return 0;
-    /* : 崩溃期脏 LittleFS 元数据可给垃圾尺寸 (实测 483 B 文件 stat 出 >100KB
-     * → 假"记忆已超 100KB"告警, 1.0.252 根因); 设计上限 100KB, >256KB 即损坏,
-     * 返回 0 防垃圾尺寸传播 (s_size_cache/读缓冲分配/超限判断) */
+    /* : 崩溃期脏 LittleFS 元数据可给垃圾尺寸; 设计上限 100KB, >256KB
+     * 即损坏, 返回 0 防垃圾尺寸传播 (s_size_cache/读缓冲分配/超限判断) */
     if (st.st_size > (off_t)MEM_MAX_FILE) return 0;
     return (size_t)st.st_size;
 }
@@ -345,10 +338,9 @@ size_t memory_store_size(void)
 esp_err_t memory_store_append(const char *user, const char *assistant)
 {
     if (!s_ready || !s_writes_safe || (!user && !assistant)) return ESP_FAIL;
-    /* 用 tick 刷新的缓存值判超限 — stat 也是 flash 读, PSRAM 栈任务上会崩
-     * (1.0.213 只修了写, 此处残留的 stat 就是 1.0.214 崩点) */
-    if (memory_store_cached_size() > MEM_MAX_BYTES) /* : 漏了 () — 函数指针
-            与整数比较恒真 → 每次对话都误报"记忆已超 100KB" (1.0.252 根因) */
+    /* 用 tick 刷新的缓存值判超限 — stat 也是 flash 读, PSRAM 栈任务上会崩 */
+    if (memory_store_cached_size() > MEM_MAX_BYTES) /* 勿漏 () — 函数指针与整数
+            比较恒真, 会误报"记忆已超 100KB" */
         ESP_LOGW(TAG, "记忆已超 100KB, 等待服务端压缩");
     return memory_store_enqueue(MEM_WRITE_APPEND, user, assistant, NULL);
 }
@@ -390,14 +382,11 @@ static void memory_store_refresh_cache(void)
     ssize_t n = read(fd, s_summary, s_size_cache);
     close(fd);
     if (n < 0) n = 0;
-    s_summary[n] = '\0'; /* : 此前缺此终止 — 修复写回 strlen 越读到 PSRAM
-                          * 垃圾 (非零垃圾 → 写回附尾垃圾 → 文件长大/坏字节
-                          * 每次对话复现, 1.0.252 根因) */
-    /* : UTF-8 校验 — 历史文件可能残留截半字符 (旧版 512B snprintf
-     * 截断 + 崩溃期脏写), 坏字节随 mem_summary 上送会被服务端拒连。
-     * 发现即入队自愈修复 (MEM_WRITE_REPAIR 由写盘任务执行 — O_TRUNC 重写
-     * 与 append 严格串行, 此前主循环直接写盘与写盘任务并发 → 相互覆盖)。
-     * 占位保留记录结构, 服务端 LLM 压缩可整合。 */
+    s_summary[n] = '\0'; /* : 缓冲必补终止 — 否则 strlen/写回越读附尾 */
+    /* : UTF-8 校验 — 历史文件可能残留截半字符 (512B snprintf 截断 +
+     * 崩溃期脏写), 坏字节随 mem_summary 上送会被服务端拒连。
+     * 发现即入队自愈修复 (MEM_WRITE_REPAIR 由写盘任务执行 — O_TRUNC
+     * 重写与 append 严格串行)。占位保留记录结构, 服务端 LLM 压缩可整合。 */
     size_t bad = utf8_sanitize_inplace(s_summary, (size_t)n);
     if (bad > 0) {
         ESP_LOGW(TAG, "记忆文件含无效 UTF-8 (%u 坏字节) — 已入队修复",

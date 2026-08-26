@@ -21,9 +21,8 @@ esp_err_t memory_store_append(const char *user, const char *assistant);
 typedef void (*memory_read_cb_t)(const char *content, size_t len, void *arg);
 
 /** 异步读整个记忆文件 — 读盘由专用写盘任务执行。PSRAM 栈任务 (WS 任务)
- * 禁止任何同步 flash 访问 (flash 读期间同样禁用 cache, 1.0.213 只移了写,
- * stat/fopen 读照样崩, 1.0.214 修复)。arg 透传给回调, 回调返回后由
- * 调用方负责释放 (如 strdup 的 req_id) */
+ * 禁止任何同步 flash 访问 (flash 读期间同样禁用 cache, stat/fopen 照崩)。
+ * arg 透传给回调, 回调返回后由调用方负责释放 (如 strdup 的 req_id) */
 esp_err_t memory_store_read_async(memory_read_cb_t cb, void *arg);
 
 /** 整文件覆盖 (服务端压缩后下发); 实际写盘由专用写盘任务执行 */
@@ -36,7 +35,7 @@ void memory_store_tick(void);
 size_t memory_store_size(void);
 
 /* ── 元数据缓存: 由 memory_store_tick 刷新, 供 ws_client_send_chat 零 FatFS 使用
- * (FatFS+WL 调用链深, sess 任务 12KB 栈曾栈溢出双异常) ── */
+ * (FatFS+WL 调用链深, 收发任务栈上不宜直接访问) ── */
 
 /** 缓存的文件大小 (未刷新过则为 0) */
 size_t memory_store_cached_size(void);
