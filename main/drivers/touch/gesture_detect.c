@@ -57,9 +57,9 @@ static gesture_ctx_t s_gctx = {
 #define NAV_SETTLE_MS 100         /* 按下后 IIR 收敛等待, 之后采样作为滑动基准 */
 #define NAV_SLIDE_THRESHOLD 0.25f /* 右侧滑条滑动判定位移阈值 */
 
-/* 长按连续导航 (2026-08-22): 点击模式逐格选择需点很多下 (用户实报) —
- * 按住超过 NAV_HOLD_REPEAT_MS 后按位置分区持续发射 NAV_UP/DOWN,
- * 直到松开 (释放时 hold 已超 TAP_MAX, 不再补发轻点, 无双事件)。 */
+/* 长按连续导航: 按住超过 NAV_HOLD_REPEAT_MS 后按位置分区持续发射
+ * NAV_UP/DOWN, 直到松开 (释放时 hold 已超 TAP_MAX, 不再补发轻点,
+ * 无双事件)。 */
 #define NAV_HOLD_REPEAT_MS NAV_TAP_MAX_MS /* 与轻点阈值一致: <500ms=轻点, >=500ms=连续 */
 #define NAV_HOLD_INTERVAL_US 120000       /* 连续发射间隔 120ms */
 
@@ -121,8 +121,8 @@ void gesture_process(void)
 
             if (hold_ms < 500) {
                 if (s_gctx.menu_active) {
-                    /* 菜单模式: 单击零延迟发射 — 双击已改为顶条右滑返回,
-                     * 无竞争语义, 不必等 500ms 双击窗口 */
+                    /* 菜单模式: 单击零延迟发射 — 返回由顶条右滑手势承担,
+                     * 双击在菜单模式无语义, 不必等 500ms 双击窗口 */
                     if (s_gctx.screen_on) {
                         emit_event(GESTURE_SINGLE_TAP); /* 确认 */
                     } else {
@@ -159,8 +159,8 @@ void gesture_process(void)
             s_gctx.state = GS_PRESS_PENDING;
             s_gctx.press_start_us = now_us;
         } else {
-            /* 注意: 统一 µs 比较 — 曾误用 ms 值与 µs 窗口比较, 导致
-             * 单击确认分支永假、任意两次按键都被算作双击 */
+            /* 注意: 时间统一用 µs — 与窗口常量同单位比较, 混用单位
+             * 会让比较恒真/恒假 */
             uint32_t elapsed_us = (uint32_t)(now_us - s_gctx.last_tap_us);
             if (elapsed_us > DOUBLE_TAP_WINDOW_US) {
                 /* 超时 — 确认为单击: 主页模式下单击无动作。
@@ -236,7 +236,7 @@ void gesture_process(void)
      * 长按无位移 (主页亮度调节等) 不发射。
      * 息屏时不发射 — 唤醒触摸不得被盲操作消费 (唤醒走 main 循环的
      * touched 检测)。
-     * 方向标定 (2026-08-18 用户实测): 物理上半段 = pos 负侧。 */
+     * 方向标定: 物理上半段 = pos 负侧。 */
     bool right_pressed = touch_is_right_pressed();
     if (right_pressed && !s_nav.tracking) {
         s_nav.tracking = true;

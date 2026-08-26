@@ -56,46 +56,46 @@ void touch_get_raw(uint32_t *raw_out);
 void touch_get_baseline(uint32_t *bl_out);
 /** 获取滤波后的 delta 值 */
 void touch_get_filtered(int *filtered_out);
+/** 获取当前各通道判定阈值 (诊断: 观察抬阈/死区) */
+void touch_fpc_get_thr(int *thr_out);
 
-/** 息屏准备硬件触摸唤醒 (v2): 按软件基线把硬件唤醒阈值调到轻触可及
- * (S3 硬件比较器 = raw − 硬件基准 > 阈值; 出厂 800 对轻触 delta ~150-300
- * 太钝 — 初按压实测最大 ~150)。同时打印 硬件基准 vs 软件基线 对比,
- * 验证比较器基准口径。FSM 自 init 起常跑, 轻睡时硬件继续采样。 */
-void touch_fpc_prepare_wakeup(void);
-
-/** 息屏暂停 50Hz 扫描定时器 — FreeRTOS 软件定时器 20ms 周期会限死轻睡
- * 窗口 (睡眠窗口 20ms→1s)。硬件 FSM 不受影响 (唤醒靠硬件比较器)。 */
+/** 息屏暂停扫描定时器 — FreeRTOS 软件定时器 20ms 周期会限死轻睡
+ * 窗口 (睡眠窗口 20ms→500ms)。息屏唤醒由模块内独立探针任务负责
+ * (esp_timer 节拍, 20Hz 快探 / 2Hz 深闲, 见 probe_task_fn)。 */
 void touch_fpc_pause(void);
 
-/** 亮屏恢复 50Hz 扫描定时器 (读数缓存恢复 → 手势/滑动检测回到正常)。 */
+/** 亮屏恢复扫描定时器: 重校准 (防手指污染守卫) + 50Hz 最高档起步。 */
 void touch_fpc_resume(void);
 
-/** 1Hz 兜底单发扫描 : 息屏期扫描定时器已停, 硬件触摸唤醒依赖
- * 轻睡真正进入 — 轻睡不生效时 (USB 插着等) 触摸无消费者。主循环 1s 块
- * 调用, 保持 filtered/touched 新鲜 → contacted 检查 (filtered>250) 即可
- * 唤醒, 无论轻睡是否生效。 */
-void touch_fpc_poll_once(void);
-
-/** 息屏期唤醒探针 ( 简化, 10Hz): 单发扫描 + 唤醒判定。
- * - 复用触摸模块共享判定 (s_ts.touched — raw vs 模块基线, any_active
- * 门禁 1/32 EMA), 与亮屏触摸同一套数据 — 睡眠侧不再维护专用动态
- * 基线 (v2.15-2.17 的 s_sleep_base 已删, 用户拍板调优归触摸模块)
- * - 连续 3 次 (300ms) 命中才唤醒; 超阈值通道 >10 判环境态
- * - v2.16: USB/供电事件免疫窗内不判唤醒 (拔插瞬态)
- * 返回 true 后调用方亮屏。息屏时主循环 100ms 块调用。 */
+/** 息屏期唤醒探针 (动态频率): 单发扫描 + 唤醒判定。
+ * - 扫描侧判定不落盘 (基线恒追速, 尖峰当帧自回), 唤醒由逐通道独立
+ *   复判 d > thr (无滞回无保活) 的 2 连击承担: 须落 150ms 窗内且同
+ *   通道一致 — 尖峰单帧只计 1 次凑不齐, 供电瞬态跨通道轮换被作废
+ * - USB/供电免疫窗 (5s) 内不判唤醒; 通道 >10 判环境态
+ * 返回 true 后调用方亮屏。息屏时主循环以 touch_fpc_probe_interval_ms()
+ * 返回的间隔调用 (快探 50ms / 深闲 500ms; 由模块内独立任务按
+ * esp_timer 节拍驱动)。 */
 bool touch_fpc_sleep_probe(void);
+
+/** main.c 消费: 探针 2 连击达成置位 → 返回即清除。息屏期主循环
+ * 轮询此接口, true → 走唤醒流程 (屏幕状态机一体化)。 */
+bool touch_fpc_wake_pending(void);
+
+/** 当前息屏探针间隔 (ms): 近场/触摸活动后 50ms (20Hz 快探), 无活动
+ * 15s 后 500ms (2Hz 深闲) — main.c 据此调主循环睡眠窗口。 */
+uint32_t touch_fpc_probe_interval_ms(void);
 
 /** : USB/供电事件通知 — 拔插 USB (充电状态翻转)、U盘模式切换会
  * 引起供电链路瞬态 (VBUS 消失/恢复、PHY 电源域切换), raw 可跳几千且
- * 持续 1-2s, 探针 3 次去抖会被穿透 → 假唤醒。调用后探针进入 5s 免疫窗
- * (不判唤醒)。手动唤醒路径 (左键/摇动/1s 兜底接触轮询) 不受影响。
- * 由 usb_storage (模式切换) 与 main.c (充电翻转) 调用。 */
+ * 持续 1-2s, 探针 2 连击去抖会被穿透 → 假唤醒。调用后探针进入 5s 免疫窗
+ * (不判唤醒) + 复位到快探档。手动唤醒路径 (左键/摇动/1s 兜底接触轮询)
+ * 不受影响。由 usb_storage (模式切换) 与 main.c (充电翻转) 调用。 */
 void touch_fpc_note_usb_event(void);
 
-/** 诊断 : 探针去抖命中数 (0..PROBE_HIT_REQUIRED-1) — CSV ph 列 */
+/** 诊断: 探针去抖命中数 (0..PROBE_HIT_REQUIRED-1) — CSV ph 列 */
 uint8_t touch_fpc_probe_hits(void);
 
-/** 诊断 : 当前超阈值通道数 (0..12) — CSV tc 列 */
+/** 诊断: 当前超阈值通道数 (0..12) — CSV tc 列 */
 uint8_t touch_fpc_touched_count(void);
 
 #ifdef __cplusplus
