@@ -47,6 +47,7 @@
 #include "pet_engine.h"
 #include "pet_avatar.h"
 #include "font_loader.h"
+#include "home_screen.h"
 #include "loading_screen.h"
 #include "screen_switch.h"
 #include "settings_screen.h"
@@ -81,21 +82,6 @@ static const char *TAG = "main";
 
 static char s_http_buf[1024];
 static int s_http_len = 0;
-
-/* ── 主屏幕引用 (用于从子界面恢复) ── */
-static lv_obj_t *s_main_scr = NULL;
-
-/* 前向声明 */
-void main_screen_note_interaction(void);
-void main_restore_home(void)
-{
-    if (s_main_scr) {
-        lvgl_port_lock(0); /* main 线程调 lv_ API 必须持锁 (见 loading_screen.c 注释) */
-        screen_load_full(s_main_scr);
-        lvgl_port_unlock();
-        main_screen_note_interaction();
-    }
-}
 
 static esp_err_t http_event_cb(esp_http_client_event_t *evt)
 {
@@ -612,23 +598,12 @@ void app_main(void)
     tap_detector_init();
     pat_detector_init();
 
-    /* ── 初始化完成: 销毁加载界面, 创建真实 UI ──
-     * 整段持 LVGL 锁: UI 树构建期间若与渲染任务并发, invalidate
-     * 撞上 rendering_in_progress 会断言死循环 (递归锁, 嵌套安全) */
-    lvgl_port_lock(0);
-    loading_screen_destroy();
-    pet_avatar_init();
-    /* boot 预加载摸头动画 (内部堆充足期) — 首次摸头零延迟 */
-    {
-        extern void pet_avatar_preload(void);
-        pet_avatar_preload();
-    }
-    status_bar_init();
-    chat_bubble_init();
-    notify_overlay_init();
-    brightness_bar_init();
+    /* ── 销毁加载界面, 组装真实主页 UI (内部自持 LVGL 锁) ── */
+    home_screen_init();
 
-    /* 手势路由 + 页面交互仲裁 (内部注册回调 + 20ms 定时器) */
+    /* 手势路由 + 页面交互仲裁 (内部注册回调 + 20ms 定时器) —
+     * 与主页组装分持锁 (递归锁嵌套安全, 见 loading_screen.c 注释) */
+    lvgl_port_lock(0);
     input_handler_init();
 
     /* 表情出口: 心情/状态变化 → 动画 (仅 idle 时应用) */
@@ -671,11 +646,6 @@ void app_main(void)
     /* NTP 校时: 须在 esp_netif_init (wifi_manager 内部) 之后启动 SNTP;
      * 启动即轮询, WiFi 连上后 60s 内自动同步 */
     ESP_ERROR_CHECK(time_manager_init());
-
-    /* 保存主屏幕引用 (供设置等子界面返回时恢复) */
-    lvgl_port_lock(0);
-    s_main_scr = lv_scr_act();
-    lvgl_port_unlock();
 
     /* ════ 主循环 ════ */
     ESP_LOGI(TAG, "启动完成.");

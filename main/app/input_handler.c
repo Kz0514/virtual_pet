@@ -19,6 +19,7 @@
  */
 #include "input_handler.h"
 #include "home_interaction.h"
+#include "home_screen.h"
 #include "gesture_detect.h"
 #include "settings_screen.h"
 #include "diary_screen.h"
@@ -51,14 +52,13 @@ static bool nav_mode_is_tap(void)
 }
 
 /* main.c 导出 */
-extern void main_restore_home(void);
 extern void main_screen_note_interaction(void);
 
 /* ── 设置页"退出"回调 (根页 BACK / 顶条右滑到底时触发) ── */
 static void on_settings_close(void)
 {
     settings_screen_destroy();
-    main_restore_home();
+    home_screen_restore();
     input_handler_set_page(APP_PAGE_HOME);
 }
 
