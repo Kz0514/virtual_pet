@@ -24,6 +24,7 @@
 #include "settings_screen.h"
 #include "diary_screen.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "pat_detector.h"
 #include "tap_detector.h"
 #include "shake_detector.h"
@@ -45,7 +46,6 @@ static uint32_t s_settings_open_tick = 0;
  * 1 = 滑动: 右滑条上/下滑动选择; 顶条左滑=确认/右滑=返回
  * 左键单击=确认 恒成立。每事件读取 (config_mgr 有 RAM 缓存, 开销可忽略)。
  * 默认 1 (滑动)。 */
-#define CFG_KEY_NAV_MODE "nav_mode"
 static bool nav_mode_is_tap(void)
 {
     return config_get_u32(CFG_KEY_NAV_MODE, 1) == 0;

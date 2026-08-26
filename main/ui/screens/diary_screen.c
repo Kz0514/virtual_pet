@@ -19,6 +19,7 @@
 #include "font_loader.h"
 #include "tm6604.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "lvgl.h"
@@ -43,9 +44,8 @@ static const char *TAG = "diary";
 #define DOODLE_MAX_SIDE 240   /* 服务端已缩, 解码前防呆校验 */
 #define VIBE_THROTTLE_MS 100
 
-/* 滑动反向开关 (NVS "scroll_flip", 设置页"操作"页可调):
+/* 滑动反向开关 (CFG_KEY_SCROLL_FLIP, 设置页"操作"页可调):
  * 开 → 详情 UP/DOWN 翻页方向反转 */
-#define CFG_KEY_SCROLL_FLIP "scroll_flip"
 
 /* ── 列表条目 ── */
 typedef struct {
@@ -364,7 +364,7 @@ static void build_list_ui(void)
     s_empty = lv_label_create(s_scr);
     char empty_txt[64];
     snprintf(empty_txt, sizeof(empty_txt), "还没有日记…\n多和%s互动吧",
-             config_get_str("pet_name", "萝莉丝"));
+             config_get_str(CFG_KEY_PET_NAME, "萝莉丝"));
     lv_label_set_text(s_empty, empty_txt);
     lv_obj_set_style_text_color(s_empty, lv_color_hex(0x555555), 0);
     if (FONT_ZH) lv_obj_set_style_text_font(s_empty, FONT_ZH, 0);
@@ -586,7 +586,7 @@ static void build_detail_ui(const char *date)
     lv_obj_t *foot = lv_label_create(s_cont);
     char foot_txt[64];
     snprintf(foot_txt, sizeof(foot_txt), "- %s的日记 -",
-             config_get_str("pet_name", "萝莉丝"));
+             config_get_str(CFG_KEY_PET_NAME, "萝莉丝"));
     lv_label_set_text(foot, foot_txt);
     lv_obj_set_style_text_color(foot, lv_color_hex(0xb3a28c), 0);
     if (FONT_ZH) lv_obj_set_style_text_font(foot, FONT_ZH, 0);

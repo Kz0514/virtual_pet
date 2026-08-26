@@ -16,6 +16,7 @@
 #include "time_manager.h"
 #include "tts_client.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -161,7 +162,7 @@ static void memory_store_writer_task(void *arg)
                         write(fd, ts, strlen(ts));
                         char prefix[CFG_STR_MAX + 2];
                         int pl = snprintf(prefix, sizeof(prefix), "%s: ",
-                                          config_get_str("owner_name", "主人"));
+                                          config_get_str(CFG_KEY_OWNER_NAME, "主人"));
                         write(fd, prefix, pl);
                         write(fd, it.user, ul);
                         write(fd, "\n", 1);
@@ -174,7 +175,7 @@ static void memory_store_writer_task(void *arg)
                         write(fd, ts, strlen(ts));
                         char prefix[CFG_STR_MAX + 2];
                         int pl = snprintf(prefix, sizeof(prefix), "%s: ",
-                                          config_get_str("pet_name", "萝莉丝"));
+                                          config_get_str(CFG_KEY_PET_NAME, "萝莉丝"));
                         write(fd, prefix, pl);
                         write(fd, it.assistant, al);
                         write(fd, "\n", 1);

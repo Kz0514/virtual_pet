@@ -7,6 +7,7 @@
 #include "api_client.h"
 #include "server_config.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_mac.h"
@@ -83,8 +84,8 @@ esp_err_t api_client_init(void)
     char body[320];
     snprintf(body, sizeof(body),
              "{\"mac_address\":\"%s\",\"device_name\":\"%s\",\"owner_name\":\"%s\",\"firmware_version\":\"%s\"}",
-             mac, config_get_str("pet_name", "萝莉丝"),
-             config_get_str("owner_name", "主人"), desc->version);
+             mac, config_get_str(CFG_KEY_PET_NAME, "萝莉丝"),
+             config_get_str(CFG_KEY_OWNER_NAME, "主人"), desc->version);
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, body, strlen(body));
 

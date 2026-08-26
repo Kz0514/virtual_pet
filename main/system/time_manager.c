@@ -13,6 +13,7 @@
 #include "time_manager.h"
 #include "api_client.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
 #include <stdio.h>
@@ -22,10 +23,6 @@
 static const char *TAG = "time_manager";
 static volatile bool s_synced = false;
 static volatile int32_t s_tz_offset = 28800; /* 东八区缺省 */
-
-#define CFG_KEY_TZ_AUTO "tz_auto"         /* 1=自动 (IP 定位) 0=手动 */
-#define CFG_KEY_TZ_MANUAL "tz_manual_sec" /* 手动偏移秒 */
-#define CFG_KEY_TZ_LAST "tz_last"         /* 上次成功拉取 unix 秒 */
 
 static void s_sync_cb(struct timeval *tv)
 {

@@ -13,6 +13,7 @@
 #include "board.h"
 #include "wifi_manager.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_check.h"
@@ -757,7 +758,7 @@ static esp_err_t wifi_softap_start(void)
 
     /* 配网页拼装 — 名字取预热缓存 */
     snprintf(s_captive_html, sizeof(s_captive_html), "%s%s%s",
-             CAPTIVE_HTML_HEAD, config_get_str("pet_name", "萝莉丝"),
+             CAPTIVE_HTML_HEAD, config_get_str(CFG_KEY_PET_NAME, "萝莉丝"),
              CAPTIVE_HTML_TAIL);
 
     /* 预扫描: 门户启动前 STA 纯模式扫一次作兜底缓存 (页面打开时的

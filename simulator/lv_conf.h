@@ -1,6 +1,8 @@
 /**
  * @file lv_conf.h
  * @brief LVGL v9.5 配置 — PC 模拟器 (SDL2 后端)
+ * @note 真机不走本文件 — 真机配置由 sdkconfig Kconfig 生成
+ *       (components/lvgl/src/lv_conf_internal.h → lv_conf_kconfig.h)
  */
 #ifndef LV_CONF_H
 #define LV_CONF_H

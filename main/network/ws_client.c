@@ -12,6 +12,7 @@
 #include "memory_store.h"
 #include "life_log.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -398,7 +399,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                             anim = parse_anim_name(llm_anim->valuestring);
 
                         /* 名字取预热缓存 (PSRAM 栈禁 nvs_open, init 期已预热) */
-                        ESP_LOGI(TAG, "%s: %s", config_get_str("pet_name", "萝莉丝"), clean);
+                        ESP_LOGI(TAG, "%s: %s", config_get_str(CFG_KEY_PET_NAME, "萝莉丝"), clean);
 
                         /* 动画先播 — 与流式 TTS 下载/播放并行, 不再等语音 */
                         if (anim < PET_ANIM_COUNT &&
@@ -415,9 +416,9 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 
                         /* 全量交互日志 (USB 直读) — 用户原文 + 宠物回复 */
                         if (s_last_user_text[0])
-                            life_log_line("[%s] %s", config_get_str("owner_name", "主人"), s_last_user_text);
+                            life_log_line("[%s] %s", config_get_str(CFG_KEY_OWNER_NAME, "主人"), s_last_user_text);
                         if (clean[0])
-                            life_log_line("[%s] %s", config_get_str("pet_name", "萝莉丝"), clean);
+                            life_log_line("[%s] %s", config_get_str(CFG_KEY_PET_NAME, "萝莉丝"), clean);
                         ESP_LOGI(TAG, "chat: life_log ok → tts…");
 
                         /* 空文本 = 静默模式 (只做动作不说话) */

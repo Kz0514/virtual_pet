@@ -64,6 +64,7 @@
 #include "face_mapper.h"
 #include "session_mgr.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "input_handler.h"
 #include "home_interaction.h"
 #include "sensor_logger.h"
@@ -496,11 +497,11 @@ void app_main(void)
     }
     config_mgr_init();
     /* 自动息屏时长 (设置页可调): off_s = 彻底息屏秒数, 默认 90 */
-    main_screen_set_off_timeout_s(config_get_u32("off_s", 90));
+    main_screen_set_off_timeout_s(config_get_u32(CFG_KEY_OFF_S, 90));
     /* 宠物名/主人称谓预热 — 首次读会 nvs_open 读 flash, 必须在此 (内部栈) 完成;
      * 后续 PSRAM 栈任务 (ws_client 回调) 只做纯 RAM 缓存读 */
-    config_get_str("pet_name", "萝莉丝");
-    config_get_str("owner_name", "主人");
+    config_get_str(CFG_KEY_PET_NAME, "萝莉丝");
+    config_get_str(CFG_KEY_OWNER_NAME, "主人");
 
     /* 2. SPIFFS (animation assets) */
     esp_vfs_spiffs_conf_t spiffs_cfg = {

@@ -28,6 +28,7 @@
 #include "font_loader.h"
 #include "brightness_bar.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "time_manager.h"
 #include "tm6604.h"
 #include "usb_storage.h"
@@ -43,15 +44,6 @@
 #include <string.h>
 
 static const char *TAG = "settings";
-
-/* NVS 键 (config_mgr, ns "settings") — 与 brightness_bar/main.c 共用 */
-#define CFG_KEY_BRI "bri"
-#define CFG_KEY_OFF_S "off_s"
-#define CFG_KEY_BAR_EN "bri_bar_en"
-#define CFG_KEY_NAV "nav_mode"    /* 与 input_handler 共用: 0=点击 1=滑动 */
-#define CFG_KEY_TZ_AUTO "tz_auto" /* 与 time_manager 共用: 1=自动 0=手动 */
-#define CFG_KEY_TZ_MAN "tz_manual_sec"
-#define CFG_KEY_FLIP "scroll_flip" /* 与 diary_screen 共用: 1=日记翻页方向反转 */
 
 #define MAX_VISIBLE 5 /* 可视行数 */
 #define ITEM_H 42     /* 行高: 28 顶栏 + 5×42 = 238 ≤ 240 */
@@ -269,7 +261,7 @@ static const item_t *page_items(page_id_t p, int *count)
         *count = 3;
         return s_storage_items;
     case PAGE_OPS: /* 翻页方向仅在选择逻辑=滑动时显示 (: 只影响滑动) */
-        *count = (config_get_u32(CFG_KEY_NAV, 1) ? 2 : 1);
+        *count = (config_get_u32(CFG_KEY_NAV_MODE, 1) ? 2 : 1);
         return s_ops_items;
     case PAGE_ABOUT:
         *count = 3;
@@ -353,11 +345,11 @@ static void get_value_text(page_id_t page, int idx, char *buf, size_t len)
         switch (idx) {
         case 0: /* 选择逻辑 (0=点击 1=滑动) */
             snprintf(buf, len, "%s",
-                     config_get_u32(CFG_KEY_NAV, 1) ? "滑动" : "点击");
+                     config_get_u32(CFG_KEY_NAV_MODE, 1) ? "滑动" : "点击");
             break;
         case 1: /* 浏览日记时翻页方向: 向下=默认(flip 0), 向上=反转(flip 1) */
             snprintf(buf, len, "%s",
-                     config_get_u32(CFG_KEY_FLIP, 0) ? "向上" : "向下");
+                     config_get_u32(CFG_KEY_SCROLL_FLIP, 0) ? "向上" : "向下");
             break;
         }
     } else if (page == PAGE_TZ) {
@@ -368,7 +360,7 @@ static void get_value_text(page_id_t page, int idx, char *buf, size_t len)
             if (config_get_u32(CFG_KEY_TZ_AUTO, 1)) {
                 snprintf(buf, len, "自动");
             } else {
-                tz_fmt((int32_t)config_get_u32(CFG_KEY_TZ_MAN, TZ_PRESET_DEF),
+                tz_fmt((int32_t)config_get_u32(CFG_KEY_TZ_MANUAL, TZ_PRESET_DEF),
                        buf, len);
             }
             break;
@@ -419,7 +411,7 @@ static bool get_toggle_state(page_id_t page, int idx)
         return usb_storage_is_active();
     }
     if (page == PAGE_OPS && idx == 1) { /* 滑动反向: 日记翻页方向反转 */
-        return config_get_u32(CFG_KEY_FLIP, 0) != 0;
+        return config_get_u32(CFG_KEY_SCROLL_FLIP, 0) != 0;
     }
     return false;
 }
@@ -607,7 +599,7 @@ static void adjust_step(int dir)
         switch (s_sel) {
         case 1: {                                           /* 时区偏移: 档位循环 (自动开启时置灰不生效) */
             if (config_get_u32(CFG_KEY_TZ_AUTO, 1)) return; /* 自动模式下锁定 */
-            int32_t cur = (int32_t)config_get_u32(CFG_KEY_TZ_MAN, TZ_PRESET_DEF);
+            int32_t cur = (int32_t)config_get_u32(CFG_KEY_TZ_MANUAL, TZ_PRESET_DEF);
             int idx = 0;
             for (int i = 0; i < (int)TZ_PRESET_CNT; i++) {
                 if (s_tz_presets[i] == cur) {
@@ -621,7 +613,7 @@ static void adjust_step(int dir)
             if (idx >= (int)TZ_PRESET_CNT) idx = TZ_PRESET_CNT - 1;
             int32_t preset = s_tz_presets[idx];
             time_manager_apply_tz(preset); /* 立即生效 */
-            config_set_u32(CFG_KEY_TZ_MAN, (uint32_t)preset);
+            config_set_u32(CFG_KEY_TZ_MANUAL, (uint32_t)preset);
             break;
         }
         default:
@@ -634,13 +626,13 @@ static void adjust_step(int dir)
     if (s_page == PAGE_OPS) {
         switch (s_sel) {
         case 0: {                                                /* 选择逻辑: 点击↔滑动 */
-            uint32_t m = config_get_u32(CFG_KEY_NAV, 1) ? 0 : 1; /* 默认 1 (滑动), 与 input_handler 一致 */
-            config_set_u32(CFG_KEY_NAV, m);                      /* input_handler 每事件读缓存 */
+            uint32_t m = config_get_u32(CFG_KEY_NAV_MODE, 1) ? 0 : 1; /* 默认 1 (滑动), 与 input_handler 一致 */
+            config_set_u32(CFG_KEY_NAV_MODE, m);                      /* input_handler 每事件读缓存 */
             break;
         }
         case 1: { /* 浏览日记时翻页方向: 向下 ↔ 向上 (二选一) */
-            uint32_t flip = config_get_u32(CFG_KEY_FLIP, 0) ? 0 : 1;
-            config_set_u32(CFG_KEY_FLIP, flip); /* diary_screen 每事件读缓存 */
+            uint32_t flip = config_get_u32(CFG_KEY_SCROLL_FLIP, 0) ? 0 : 1;
+            config_set_u32(CFG_KEY_SCROLL_FLIP, flip); /* diary_screen 每事件读缓存 */
             break;
         }
         default:
@@ -752,7 +744,7 @@ static void do_confirm(void)
             /* 自动时区: 开 → 应用缺省 +8 等下次拉取; 关 → 应用手动偏移 */
             uint32_t en = config_get_u32(CFG_KEY_TZ_AUTO, 1) ? 0 : 1;
             config_set_u32(CFG_KEY_TZ_AUTO, en);
-            time_manager_apply_tz(en ? 28800 : (int32_t)config_get_u32(CFG_KEY_TZ_MAN, TZ_PRESET_DEF));
+            time_manager_apply_tz(en ? 28800 : (int32_t)config_get_u32(CFG_KEY_TZ_MANUAL, TZ_PRESET_DEF));
             refresh();
             nav_vibe();
         } else if (s_page == PAGE_STORAGE && s_sel == 0) {

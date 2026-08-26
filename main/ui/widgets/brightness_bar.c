@@ -10,6 +10,7 @@
 #include "shake_detector.h"
 #include "settings_screen.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "lvgl.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -17,10 +18,6 @@
 #include <stdio.h>
 
 static const char *TAG = "bri_bar";
-
-/* NVS 配置键 (config_mgr, ns "settings") */
-#define CFG_KEY_BRI     "bri"        /* 用户亮度 1-100 */
-#define CFG_KEY_BAR_EN  "bri_bar_en" /* 主界面亮度条开关 */
 
 static lv_obj_t   *s_bar   = NULL;
 static lv_obj_t   *s_label = NULL;

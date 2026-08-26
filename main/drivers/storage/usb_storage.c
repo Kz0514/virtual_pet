@@ -35,6 +35,7 @@
 #include "usb_storage.h"
 #include "usb_icon.h" /* pet.ico 字节数组 — tools/gen_icon.py 生成 (空=不设图标) */
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "sensor_logger.h"
 #include "touch_fpc.h" /* : USB 事件 → 探针免疫窗 (供电瞬态假唤醒) */
 #include "esp_pm.h"    /* : U盘模式禁轻睡锁 (USB 设备栈冻结掉盘) */
@@ -173,7 +174,7 @@ static void write_data_readme(void)
     int fd = open("/data/README.txt", O_CREAT | O_TRUNC | O_WRONLY);
     if (fd < 0) return;
     char txt[512];
-    const char *pet = config_get_str("pet_name", "萝莉丝");
+    const char *pet = config_get_str(CFG_KEY_PET_NAME, "萝莉丝");
     int n = snprintf(txt, sizeof(txt),
         "欢迎! 这是 Virtualpet 的存储盘, USB 连接电脑后可见。\n"
         "\n"

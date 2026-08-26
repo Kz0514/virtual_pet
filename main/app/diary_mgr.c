@@ -11,6 +11,7 @@
  */
 #include "diary_mgr.h"
 #include "config_mgr.h"
+#include "config_keys.h"
 #include "time_manager.h"
 #include "memory_store.h"
 #include "ws_client.h"
@@ -23,8 +24,6 @@
 
 static const char *TAG = "diary_mgr";
 
-#define CFG_KEY_DAY "diary_day" /* 今日 YYYYMMDD */
-#define CFG_KEY_CNT "diary_cnt" /* 今日互动计数 */
 #define THROTTLE_MS 3000        /* 同事件最小间隔 (防 pat_detector 刷爆) */
 
 static uint32_t s_day = 0; /* 当前缓存的 YYYYMMDD, 0=未知 */
@@ -47,15 +46,15 @@ static void persist(void)
 {
     /* 低电量不写 flash; RAM 计数保留, 恢复后由下次 note_event 补写 */
     if (!memory_store_writes_safe()) return;
-    config_set_u32(CFG_KEY_DAY, s_day);
-    config_set_u32(CFG_KEY_CNT, s_cnt);
+    config_set_u32(CFG_KEY_DIARY_DAY, s_day);
+    config_set_u32(CFG_KEY_DIARY_CNT, s_cnt);
 }
 
 esp_err_t diary_mgr_init(void)
 {
     memset(s_last, 0, sizeof(s_last));
-    s_day = config_get_u32(CFG_KEY_DAY, 0);
-    s_cnt = config_get_u32(CFG_KEY_CNT, 0);
+    s_day = config_get_u32(CFG_KEY_DIARY_DAY, 0);
+    s_cnt = config_get_u32(CFG_KEY_DIARY_CNT, 0);
     uint32_t today = today_stamp();
     if (today && today != s_day) {
         ESP_LOGI(TAG, "跨天翻转: %u -> %u, 计数清零", s_day, today);
