@@ -4,6 +4,7 @@
  */
 #include "loading_screen.h"
 #include "font_loader.h"
+#include "screen_switch.h"
 #include "esp_lvgl_port.h"
 #include "esp_log.h"
 #include "lvgl.h"
@@ -44,7 +45,7 @@ esp_err_t loading_screen_init(void)
     lv_obj_set_style_text_font(s_label, &lv_font_montserrat_16, 0);
     lv_obj_align(s_label, LV_ALIGN_CENTER, 0, 65);
 
-    lv_scr_load(s_scr);
+    screen_load_full(s_scr);
     lvgl_port_unlock();
     ESP_LOGI(TAG, "加载界面已显示");
     return ESP_OK;
@@ -61,7 +62,7 @@ void loading_screen_destroy(void)
             lv_obj_t *tmp = lv_obj_create(NULL);
             lv_obj_set_style_bg_color(tmp, lv_color_hex(0x1a1a2e), 0);
             lv_obj_set_style_bg_opa(tmp, LV_OPA_COVER, 0);
-            lv_scr_load(tmp);
+            screen_load_full(tmp);
         }
         lv_obj_del_async(s_scr);   /* 异步删除, 等 LVGL 当前帧渲染完再释放 */
         s_scr = NULL;
