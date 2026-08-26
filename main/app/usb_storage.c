@@ -2,40 +2,30 @@
  * @file usb_storage.c
  * @brief U盘模式 — USB MSC 将 /data (FatFS) 暴露给电脑直读/写入
  *
- * 架构 (1.0.221 重构, 挂载生命周期全权归本模块):
+ * 架构:
  *   - sensor_logger_init 只做 WL 层初始化 (wl_mount)。FatFS 由本模块在
  *     开机注册一次 (diskio + VFS ctx + f_mount), **运行期永不注销** —
  *     进出 U盘模式只做 f_mount 分离/重挂 (纯 FatFS 操作, 零分配,
- *     不可能因堆失败; 1.0.216-220 反复实测运行期 register_cfg 会
- *     ESP_ERR_NO_MEM 且失败态留悬垂 FatFs 指针 → 0x4c 崩溃, 那套
- *     组件管理挂载 + 运行时重建的架构整体废弃)。
+ *     不可能因堆失败; 运行期 register_cfg 会 NO_MEM 且留悬垂指针崩溃)。
  *   - 组件 (esp_tinyusb) 已被 patch 成纯状态切换: msc_storage_mount /
  *     unmount 不再碰 FatFS, 只切 mount_point 标志; SCSI 读写经 wl 直读
  *     介质, 与 FatFS 无耦合。创建时 mount_point=USB, 组件从出生就不
  *     会尝试挂载。
  *   - **设备栈动态启停**: USB-SERIAL-JTAG 与 USB OTG 共享 D+/D-,
- *     常启 OTG 会抢占串口口 (COM 消失, 开发日志没得看) —
- *     平时不启设备栈 (COM6 保持), 进入 U盘模式才 tinyusb_driver_install,
- *     退出时 tinyusb_driver_uninstall + usb_phy_restore_serial_jtag()
- *     (mux 位在 RTC 域, 仅删 PHY 不会切回, 必须显式切) → 串口口恢复。
+ *     常启 OTG 会抢占串口口 (COM 消失) — 平时不启设备栈, 进入 U盘
+ *     模式才 tinyusb_driver_install, 退出时 uninstall +
+ *     usb_phy_restore_serial_jtag() (mux 位在 RTC 域, 必须显式切回)。
  *     APP 态插线时设备不枚举, 主机无感知。
- * - **模式粘滞 + 禁睡跟随充电状态 (1.0.233 粘滞, v2.18 改禁睡条件)**:
- * U盘开关 = 手动进入/退出 (粘滞); 1.0.232 曾设"拔线 30s 自动退出" —
- * S3 tinyusb dcd 不检测拔线 (dcd_dwc2.c "TODO check GINTSTS_DISCINT"),
- * SEDET 又依赖未接线的 VBUS 感应 → 从未生效, 1.0.232 实测困死在
- * U盘模式。1.0.233 起模式粘滞, 设备栈保持, 重插 USB reset 自动
- * 重枚举。
- * **v2.18 禁睡条件改充电状态 (用户方案, 2026-08-23)**: 不再模式
- * 期间恒禁睡 — usb 禁睡锁跟随 bq27220 电流: 插线 (充电中或满电
- * 停充, current_ma ≥ -5mA) 持锁禁睡保活不掉盘; 拔线 (放电) 30s
- * 宽限后释放锁 → 恢复轻睡。开关常开不再是永久禁睡 (用户明确诉求)。
- * 宽限 30s: 拔线后短期重插 (换电脑/换线) 不掉盘; 重插 → 充电
- * 检测恢复 → 立即重新持锁。睡着时重插 (设备未醒) 会掉盘 — 触摸
- * 唤醒设备后充电检测自动重新持锁, 主机重枚举恢复。
- * Windows"安全弹出" (SCSI EJECT) → 组件状态切回 APP — tick 检测到
- * mount_point 意外回 APP 时重新武装 USB (重插即恢复磁盘, 真 U盘
- * 行为), 不退出模式。
- * - MSC 期间 /cfg (LittleFS) 照常可写 — memory 继续落盘
+ *   - **模式粘滞**: U盘开关 = 手动进入/退出 (拔线不自动退出 — S3 dcd
+ *     不检测拔线, SEDET 依赖 VBUS 感应, 自动退出从未生效)。设备栈保持,
+ *     重插 USB reset 自动重枚举。
+ *   - **禁睡跟随充电状态**: usb 禁睡锁跟随 bq27220 电流 — 插线
+ *     (充电中或满电停充, current_ma ≥ -5mA) 持锁禁睡保活不掉盘;
+ *     拔线 (放电) 30s 宽限后释放锁 → 恢复轻睡。睡着时重插 (设备未醒)
+ *     会掉盘 — 触摸唤醒后充电检测自动重新持锁, 主机重枚举恢复。
+ *   - Windows"安全弹出" (SCSI EJECT) → 组件状态切回 APP — tick 检测到
+ *     mount_point 意外回 APP 时重新武装 USB (重插即恢复磁盘), 不退出模式。
+ *   - MSC 期间 /cfg (LittleFS) 照常可写 — memory 继续落盘
  *
  * 用户数据安全: 运行期自愈只重挂/重建, 永不自动 f_mkfs (主机可能刚
  * 写过文件); 格式化只有两条路: ① 设置页"格式化存储" (NVS 标志 →
@@ -69,11 +59,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-/* 重启后格式化标志 : 设置页确认 → 写 NVS → esp_restart → boot 时
+/* 重启后格式化 : 设置页确认 → 写 NVS → esp_restart → boot 时
  * 整区擦除 data 分区 → boot 挂载失败 → medium_blank → 自动 f_mkfs。
- * 不再运行时做 VFS 注册/f_mkfs — 1.0.216-217 实测运行数小时后堆碎片化
- * 会让那些操作 ESP_ERR_NO_MEM, 且失败态留下悬垂 FatFs 指针导致后续
- * f_getfree 崩溃 (0x4c 垃圾锁句柄 LoadProhibited)。 */
+ * 运行时不碰 VFS 注册/f_mkfs — 运行期堆碎片化 NO_MEM 或悬垂 FatFs
+ * 指针崩溃。 */
 #define FMT_REQ_NS "device" /* 与 api_client 同命名空间 */
 #define FMT_REQ_KEY "fmt_req"
 
@@ -91,13 +80,11 @@ static const char *DATA_MOUNT = "/data";
 static tinyusb_msc_storage_handle_t s_handle = NULL;
 static bool s_active = false; /* U盘模式标志 (粘滞: 开关=手动进/退) */
 
-/* : U盘模式禁轻睡锁 — 息屏 (释放 screen 锁) 后轻睡恢复, 每 ~40ms
- * 冻结 USB OTG 设备栈时钟 → Windows 端枚举失效 "无法识别的设备" + 磁盘
- * 消失 (2026-08-22 实测)。U盘模式 = 用户插着电脑, 功耗无关紧要 →
- * 模式期间禁轻睡。锁创建一次保留, enter acquire / exit release。
- * v2.18: 禁睡跟随充电状态 (用户方案) — 插线 (充电/满电) acquire,
- * 拔线 (放电) 30s 宽限后 release → 平时恢复轻睡, 开关常开不再永久禁睡。
- * 与 WiFi/USJ 锁共存无冲突 (多个 NO_LIGHT_SLEEP 锁 = 禁睡, 无叠加问题) */
+/* : U盘模式禁轻睡锁 — 轻睡每 ~40ms 冻结 USB OTG 设备栈时钟 →
+ * Windows 端枚举失效 "无法识别的设备" + 磁盘消失。锁跟随充电状态:
+ * 插线 (充电/满电) acquire, 拔线 (放电) 30s 宽限后 release → 平时
+ * 恢复轻睡, 开关常开不再是永久禁睡。锁创建一次保留。
+ * 与 WiFi/USJ 锁共存无冲突 (多个 NO_LIGHT_SLEEP 锁 = 禁睡, 无叠加) */
 static esp_pm_lock_handle_t s_usb_pm = NULL;
 
 /* : 充电状态驱动禁睡 — set_charging (main 电池块) 按电流翻转动作。
@@ -112,10 +99,10 @@ static volatile uint32_t s_release_grace_ms = 0; /* 拔线宽限到期时刻 (0=
                                                   * 插线判据在 main.c (SOC≥100 兜底  \
                                                   * 满电停充, 电流 ≥-5mA 判非满电充电) */
 
-/* esp_pm_lock 是引用计数且无查询 API — 本状态机自跟踪 s_pm_held,
- * 所有 acquire/release 必须成对且只在 s_pm_held 翻转处发生, 保证
- * 锁计数恒 0 或 1。s_pm_mux 串行化 enter/exit (LVGL 任务) 与
- * set_charging (main 任务) 与 tick (main 任务) 三处状态转移 */
+/* esp_pm_lock 是引用计数且无查询 API — 自跟踪 s_pm_held, 所有
+ * acquire/release 必须成对且只在 s_pm_held 翻转处发生, 保证锁计数
+ * 恒 0 或 1。s_pm_mux 串行化 enter/exit (LVGL) 与 set_charging (main)
+ * 与 tick (main) 三处状态转移 */
 static portMUX_TYPE s_pm_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_pm_held = false;
 
@@ -136,11 +123,10 @@ static void usb_mode_lock_release(void)
     if (s_usb_pm) esp_pm_lock_release(s_usb_pm);
 }
 
-/* : 充电状态驱动禁睡 (用户方案, 2026-08-23 拍板) — main 任务电池块
- * 每秒按 SOC+电流调用 set_charging (main.c 判据: soc≥100 || ma≥-5):
- * charging → 立即持锁禁睡; 拔线 (放电) → 起 30s 宽限, 到期由 tick 释放
- * → 平时恢复轻睡, 开关常开不再是永久禁睡。宽限防"拔线换电脑/换线"
- * 短期重插掉盘; 重插 → 宽限作废立即重新持锁。*/
+/* : 充电状态驱动禁睡 — main 任务电池块每秒调 set_charging
+ * (判据: soc≥100 || ma≥-5): charging → 立即持锁; 拔线 → 起 30s 宽限,
+ * 到期由 tick 释放。宽限防换电脑/换线短期重插掉盘; 重插 → 宽限作废
+ * 立即重新持锁 */
 void usb_storage_set_charging(bool charging)
 {
     portENTER_CRITICAL(&s_pm_mux);
@@ -165,7 +151,7 @@ void usb_storage_set_charging(bool charging)
 }
 static SemaphoreHandle_t s_fs_mutex = NULL; /* 串行化 探测 vs 挂载切换 —
                                              * 切换窗口 ("盘号已注册卷未挂") 曾被
-                                             * 设置页探测抓到 → FRESULT=12 (1.0.218) */
+                                             * 设置页探测抓到 → FRESULT=12 */
 
 /* 开机注册的 FATFS 对象 — 起 fs 与 VFS ctx 注册一次后运行期
  * 永不释放, f_mount(NULL)+f_mount(fs) 重同步是纯 FatFS 操作 (零分配,
@@ -213,14 +199,11 @@ static void set_hidden_attr(const char *path)
     f_chmod(path, AM_HID | AM_SYS, AM_HID | AM_SYS);
 }
 
-/* /data 预置 USB 展示文件: 内置磁盘图标 + autorun.inf (Windows 读取
- * ICON= 指令在资源管理器显示自定义盘符图标; 无任何自动运行内容)。
- * 只写缺失 (宿主可能删文件, 每次退出 U盘模式后由 exit 兜底重建)。
- * 内置图标来源: tools/gen_icon.py 生成的 usb_icon.h — 想换默认图标把
- * tools/pet.ico 放好后直接构建即可 (build.bat 自动重跑 gen_icon.py)。
- * 无内置图标 (usb_icon_ico_len==0) → 不写图标文件, Windows 用系统默认
- * 磁盘图标。旧固件残留的 pet.ico/autorun.inf 不做自动清理 — 只有这一个
- * 用户, 盘上文件以"用户删了才消失"为准 (1.0.214 起) */
+/* /data 预置 USB 展示文件: 内置磁盘图标 + autorun.inf (仅 ICON= 指令,
+ * 无任何自动运行内容)。只写缺失 (宿主可能删文件, exit 后兜底重建)。
+ * 图标来源: tools/gen_icon.py 生成的 usb_icon.h (put tools/pet.ico 后
+ * 构建自动重跑)。无内置图标 → 不写, Windows 用系统默认磁盘图标。
+ * 旧固件残留文件不自动清理 — 盘上文件以"用户删了才消失"为准 */
 static void write_usb_assets(void)
 {
     struct stat st;
@@ -301,8 +284,7 @@ static void msc_evt_cb(tinyusb_msc_storage_handle_t h, tinyusb_msc_event_t *ev, 
 
 /* 全新分区判定: 前 4 扇区全 0xFF = 擦过的 flash / 新设备, 无数据可保护。
  * 只有这种情形 boot 才自动 f_mkfs — 有数据残留绝不自动销毁。
- * 缓冲 512B 分块读: 4096B 栈缓冲曾在本路径 (main 任务 6144B 栈) 上与
- * ESP_LOGW 链叠加把栈撑爆 → 开机建卷即重启循环, 栈占用必须小 */
+ * 缓冲 512B 分块读: 本路径在 main 任务 6144B 栈上下文, 栈占用必须小 */
 static bool medium_blank(void)
 {
     wl_handle_t wl = sensor_logger_get_wl_handle();
@@ -323,21 +305,17 @@ esp_err_t usb_storage_init(void)
 {
     if (s_handle) return ESP_OK;
 
-    /* : boot 自愈 PHY — 上次会话若 U盘模式启动中途失败 (tinyusb
-     * 设备栈起不来), D+/D- 可能卡在 OTG (RTCCNTL.usb_conf.sw_usb_phy_sel,
-     * RTC 域, esp_restart 不清, 只有断电才复位) → COM 口永久消失。
-     * 这里无条件把 mux 切回 USB-Serial-JTAG: 正常 boot (mux 已在 USJ) 时
-     * usb_new_phy(SERIAL_JTAG)+usb_del_phy 是无害往返 (句柄表清零过,
-     * 不报 IN_USE); 卡在 OTG 时则真正切回 — 软件重启即可恢复串口,
-     * 不再需要物理断电。 */
+    /* : boot 自愈 PHY — 上次会话若 U盘模式启动中途失败, D+/D- 可能卡在
+     * OTG (RTCCNTL.usb_conf.sw_usb_phy_sel, RTC 域, esp_restart 不清,
+     * 只有断电才复位) → COM 口永久消失。这里无条件把 mux 切回
+     * USB-Serial-JTAG: 正常 boot (mux 已在 USJ) 时是无害往返 (句柄表
+     * 已清零, 不报 IN_USE); 卡在 OTG 时则真正切回 — 软件重启即可恢复 */
     esp_err_t phy_err = usb_phy_restore_serial_jtag();
     if (phy_err != ESP_OK)
         ESP_LOGW(TAG, "boot PHY 自愈失败: %s — COM 口可能需断电恢复",
                  esp_err_to_name(phy_err));
 
-    /* 诊断: boot 内存地图 — 曾实测开 U盘模式时内部堆仅剩 3715B
-     * (任务栈 + LVGL DMA 缓冲全挤内部堆, 系统设计满载), 此日志验证
-     * PSRAM 化 + ALWAYSINTERNAL=4096 后的释放效果 */
+    /* 诊断: boot 内存地图 — 验证 PSRAM 化 + ALWAYSINTERNAL 后的释放效果 */
     ESP_LOGI(TAG, "内存地图: 内部堆 free=%u max=%u | PSRAM free=%u max=%u",
              heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
@@ -451,9 +429,8 @@ esp_err_t usb_storage_init(void)
         ensure_volume_label();
     }
 
-    /* 挂载健康检查: f_getfree 扫 FAT 表 — 卷损坏时 FRESULT≠OK。
-     * 曾见"已用 316KB 但无文件" — 可用空间膨胀 = FAT 表与目录不一致
-     * (写失败留下的孤儿簇), 此日志直接暴露: 卷健康行显示膨胀总量 */
+    /* 挂载健康检查: f_getfree 扫 FAT 表 — 卷损坏时 FRESULT≠OK;
+     * 可用空间膨胀 = FAT 表与目录不一致 (孤儿簇), 此日志直接暴露 */
     {
         FRESULT fr;
         FATFS *fs = NULL;
@@ -519,11 +496,9 @@ esp_err_t usb_storage_enter(void)
     if (err != ESP_OK) {
         /* : install 内部 usb_new_phy(OTG) 可能已把 D+/D- 切给 USB
          * Wrap — 组件失败路径只释放句柄, 不切回 mux → 必须显式 restore,
-         * 否则 COM 口永久消失 (RTC 域, 断电才复位)。这是 1.0.221 实测
-         * 症状 (开关仍关 + COM 丢 + 无U盘) 的回滚修复。
-         * 1.0.232: 错误日志必须在 restore 之后发 — install 失败时 PHY 已
-         * 切 OTG (console 已死), 先打日志全丢 (1.0.231 实测只能靠行为
-         * 推断, 见 tinyusb_task.c 静态栈补丁注释), restore 后日志才可见。 */
+         * 否则 COM 口永久消失 (RTC 域, 断电才复位)。错误日志必须在
+         * restore 之后发 — install 失败时 PHY 已切 OTG (console 已死),
+         * 先打日志全丢 */
         esp_err_t perr = usb_phy_restore_serial_jtag();
         if (perr != ESP_OK)
             ESP_LOGE(TAG, "PHY 回滚也失败: %s — COM 口需断电恢复", esp_err_to_name(perr));
@@ -554,7 +529,7 @@ esp_err_t usb_storage_enter(void)
     }
     s_active = true;
     /* : 禁轻睡 (USB 设备栈需连续时钟) + 探针免疫窗 (PHY/供电瞬态)。
-     * v2.18: 禁睡跟随充电状态 — enter 无条件持锁 (计数 1), 后续由
+     * 禁睡跟随充电状态 — enter 无条件持锁 (计数 1), 后续由
      * set_charging (main 电池块) 按电流翻转: 拔线 30s 宽限后 tick 释放,
      * 重插立即重新持锁 */
     portENTER_CRITICAL(&s_pm_mux);
@@ -583,8 +558,8 @@ esp_err_t usb_storage_exit(void)
                        * "已回 APP" 会再次进入本函数, 防并发重入 */
 
     /* : 先放禁睡锁再切 PHY — 卸载/切换期间的供电瞬态探针不判唤醒。
-     * v2.18: s_pm_mux 串行化, s_pm_held 保证 release 恰一次 — 即使拔线
-     * 宽限期已释放过 (set_charging→tick 放锁), exit 也不会重复 release */
+     * s_pm_mux 串行化 + s_pm_held 保证 release 恰一次 — 即使宽限期
+     * 已释放过, exit 也不会重复 release */
     portENTER_CRITICAL(&s_pm_mux);
     if (s_pm_held) {
         s_pm_held = false;
@@ -611,7 +586,7 @@ esp_err_t usb_storage_exit(void)
 
     /* 重挂 FatFS: fs 自开机注册后从未释放, f_mount(NULL)+f_mount(fs)
      * 从磁盘重读 FAT — 主机在 U盘模式期间的改动 (拷入/删除文件) 立即可见;
-     * 零分配, 不可能因堆失败 (1.0.221) */
+     * 零分配, 不可能因堆失败 */
     FRESULT fr = FR_INT_ERR;
     if (xSemaphoreTake(s_fs_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         fr = fatfs_remount();
@@ -634,7 +609,7 @@ esp_err_t usb_storage_exit(void)
 }
 
 /* FatFS 卷可用性探测: 只探 WL 注册盘号 — IDF ff_disk_initialize 对未注册
- * 槽无守卫 (diskio.c:88 直接解引用), 注销盘号后全盘扫描必崩 (1.0.216) */
+ * 槽无守卫 (diskio.c:88 直接解引用), 注销盘号后全盘扫描必崩 */
 static bool data_fs_probe(void)
 {
     wl_handle_t wl = sensor_logger_get_wl_handle();
@@ -668,8 +643,7 @@ static FRESULT fatfs_remount(void)
  * 全量清理: 分离所有卷 → 清 VFS ctx → 清全部盘号注册 → 注册 WL 盘号 →
  * VFS ctx → f_mount, 每步检查错误, 失败回滚不留残留。系统只有唯一 WL
  * 卷, 全量清理不会误伤其他卷。allow_format=true 时 (仅开机调用):
- * f_mount 失败且 medium_blank → f_mkfs 建全新 FAT (FM_ANY, 与出厂
- * 自动格式化一致, 1MB 分区自动选 FAT12/16) */
+ * f_mount 失败且 medium_blank → f_mkfs 建全新 FAT (FM_ANY 自动选类型) */
 static esp_err_t repair_data_mount_locked(bool allow_format)
 {
     wl_handle_t wl = sensor_logger_get_wl_handle();
@@ -678,8 +652,7 @@ static esp_err_t repair_data_mount_locked(bool allow_format)
     /* 先分离所有卷再释放 ctx — f_mount 挂载失败后 FatFs[drv] 仍指向 fs
      * (ff.c 先注册后挂载, 失败无回滚), 若直接 unregister_path 释放 ctx,
      * FatFs[drv] 变悬垂, 此后任意 f_getfree/f_mount 走进已释放内存 →
-     * spinlock 垃圾锁句柄 LoadProhibited (1.0.217 设置页崩溃)。fs 还活着
-     * 时 f_mount(NULL) 分离是唯一安全清理; 空槽 (FatFs 为 NULL) 无操作 */
+     * LoadProhibited 崩溃。fs 还活着时 f_mount(NULL) 分离是唯一安全清理 */
     for (BYTE drv = 0; drv < FF_VOLUMES; drv++) {
         char d[3] = {(char)('0' + drv), ':', 0};
         f_mount(NULL, d, 1);
@@ -739,7 +712,7 @@ static esp_err_t repair_data_mount_locked(bool allow_format)
 }
 
 /* 手动重建 /data 挂载 — 持锁执行, 探测 (LVGL 任务) 在此期间阻塞等待,
- * 不会看到"盘号已注册卷未挂"的中间态 (FRESULT=12, 1.0.218 实测) */
+ * 不会看到"盘号已注册卷未挂"的中间态 (FRESULT=12) */
 static esp_err_t repair_data_mount(bool allow_format)
 {
     if (!s_fs_mutex) return ESP_ERR_INVALID_STATE;
@@ -751,8 +724,8 @@ static esp_err_t repair_data_mount(bool allow_format)
     return ret;
 }
 
-/* 设置页数据分区探测 — 与 repair/挂载切换互斥。f_getfree 在切换窗口会看到
- * FatFs[vol]==NULL → FRESULT=12 (FR_NOT_ENABLED), 曾误报"-" (1.0.218) */
+/* 设置页数据分区探测 — 与 repair/挂载切换互斥。f_getfree 在切换窗口
+ * 会看到 FatFs[vol]==NULL → FRESULT=12 (FR_NOT_ENABLED), 曾误报"-" */
 bool usb_storage_probe_data(uint32_t *total_kb, uint32_t *free_kb)
 {
     if (total_kb) *total_kb = 0;
@@ -790,9 +763,9 @@ bool usb_storage_probe_data(uint32_t *total_kb, uint32_t *free_kb)
     return ok;
 }
 
-/* 非 U盘模式下的卷自愈: 探测失败 → 轻量重挂 (零分配) → 全重建 ( 起
- * 无泄漏源, 安全) → 60s 降频重试。持续失败 = FAT 被主机改动或损坏,
- * 走设置页"格式化存储" (重启后格式化, 出厂路径从未失败) */
+/* 非 U盘模式下的卷自愈: 探测失败 → 轻量重挂 (零分配) → 全重建
+ * (无泄漏源) → 60s 降频重试。持续失败 = FAT 被主机改动或损坏,
+ * 走设置页"格式化存储" */
 static uint32_t s_last_health_ms = 0;
 static uint32_t s_health_interval_ms = 10000;
 
@@ -837,12 +810,10 @@ void usb_storage_tick(void)
     tinyusb_msc_mount_point_t mp;
     if (tinyusb_msc_get_storage_mount_point(s_handle, &mp) != ESP_OK) return;
 
-    /* : 拔线宽限到期 → 释放禁睡锁, 恢复轻睡 (用户方案: U盘模式下
-     * 禁睡跟随充电状态 — 插线 (充电/满电停充) 禁睡保活不掉盘; 拔线
-     * (放电) 30s 宽限后放锁 → 平时能睡, 开关常开不再是永久禁睡)。
-     * 宽限防"拔线换电脑/换线"短期重插掉盘; 重插 → set_charging(true)
-     * 立即重新持锁, 宽限作废。睡着时重插 (设备未醒) 会掉盘 — 触摸唤醒
-     * 后充电检测自动重新持锁, 主机重枚举恢复 (同 1.0.231 行为) */
+    /* : 拔线宽限到期 → 释放禁睡锁, 恢复轻睡。宽限防换电脑/换线短期
+     * 重插掉盘; 重插 → set_charging(true) 立即重新持锁, 宽限作废。
+     * 睡着时重插 (设备未醒) 会掉盘 — 触摸唤醒后充电检测自动重新持锁,
+     * 主机重枚举恢复 */
     bool released = false;
     uint32_t now_ms2 = (uint32_t)(esp_timer_get_time() / 1000);
     portENTER_CRITICAL(&s_pm_mux);
@@ -868,10 +839,9 @@ void usb_storage_tick(void)
 }
 
 /* 设置页"格式化存储"确认 → 请求重启后格式化。运行时不碰 FatFS —
- * 1.0.216-217 实测: 运行数小时后内部堆仅剩 10KB, VFS ctx 注册/f_mkfs
- * 这类操作要么 NO_MEM 失败, 要么失败态留下悬垂 FatFs 指针崩掉设置页。
- * 改为: 写 NVS 标志 → esp_restart → boot 整区擦除 → 自动建 FAT
- * (出厂流程, 从未失败) */
+ * 运行数小时后内部堆仅剩 ~10KB, VFS ctx 注册/f_mkfs 会 NO_MEM 失败或
+ * 留悬垂指针崩设置页。改为: 写 NVS 标志 → esp_restart → boot 整区
+ * 擦除 → 自动建 FAT (出厂流程) */
 esp_err_t usb_storage_request_format(void)
 {
     if (s_active) return ESP_ERR_INVALID_STATE; /* USB 主机正持有, 不可格式化 */

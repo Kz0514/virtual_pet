@@ -30,7 +30,7 @@ void usb_storage_tick(void);
 void usb_storage_set_charging(bool charging);
 
 /** 请求格式化 /data (需 APP 态): 写 NVS 标志 → esp_restart → boot 整区擦除
- * → 组件自动格式化。不在运行时碰 FatFS (1.0.216-217 NO_MEM + 悬垂崩溃教训) */
+ * → 组件自动格式化。不在运行时碰 FatFS (NO_MEM + 悬垂崩溃教训) */
 esp_err_t usb_storage_request_format(void);
 
 /** 存储容量 (扇区数 / 扇区字节), 用于设置页显示 */

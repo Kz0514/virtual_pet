@@ -2,7 +2,7 @@
  * @file sensor_logger.c
  * @brief 存储挂载 (双文件系统) + 传感器日志
  *
- * 存储架构 (v1.0.198 起):
+ * 存储架构:
  *   /cfg  — config 分区 (LittleFS, 880KB) — 设备内部运行数据:
  *           wifi.json / memory.txt / pet.json / sensors.csv / noise.csv
  *           (掉电安全, USB 不可见 — 敏感文件不泄漏)
@@ -48,7 +48,7 @@ static esp_err_t mount_cfg(void)
     esp_vfs_littlefs_conf_t cfg = {
         .base_path = CFG_MOUNT,
         .partition_label = "config",
-        .format_if_mount_failed = true, /* 首启对旧 FAT 内容自动格式化 */
+        .format_if_mount_failed = true, /* 挂载失败自动格式化 (config 分区可重建) */
         .dont_mount = false,
     };
     esp_err_t err = esp_vfs_littlefs_register(&cfg);
