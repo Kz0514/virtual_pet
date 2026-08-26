@@ -4,7 +4,7 @@
  */
 #include "ota_client.h"
 #include "server_config.h"
-#include "settings_screen.h"   /* 1.0.227: OTA 提示走设置页内嵌提示框 */
+#include "settings_screen.h"   /* OTA 提示走设置页内嵌提示框 */
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -24,9 +24,8 @@ static int  s_buf_len = 0;
 static bool s_check_requested = false;   /* 设置页"检查更新"请求标志 */
 static bool s_manual = false;            /* 手动检查: 附加 overlay 结果反馈 */
 
-/* 流式下载: 边读边校验边写 OTA 分区 — 不再整包 malloc 固件 (1.4MB 真机上
- * 曾静默失败且无下载请求到达服务端, 整包缓冲+整包写入是首要嫌疑; 流式 +
- * 逐步日志保证下次失败点可见) */
+/* 流式下载: 边读边校验边写 OTA 分区, 不整包 malloc 固件 — 逐步日志
+ * 保证失败点可见 */
 static esp_err_t ota_stream_download(esp_http_client_handle_t cli, int content_len,
                                      const char *expected_sha)
 {

@@ -25,22 +25,17 @@ static bool s_connected = false;
 static bool s_paused = false;            /* 息屏期暂停 (WiFi 已停, 重连必败) */
 static volatile uint32_t s_chat_seq = 0; /* chat_done 计数 — 会话模式等待回复信号 */
 static char s_last_user_text[512] = {0}; /* 服务端回显的用户原文 — 设备端记忆用 */
-/* P1 流式回复 (chat_text 帧) 的气泡累计 — 逐句追加打字机, chat_done 重置 */
+/* 流式回复 (chat_text 帧) 的气泡累计 — 逐句追加打字机, chat_done 重置 */
 static char s_stream_text[512] = {0};
-/* 聚合协议 (1.0.257→1.0.259): 恒为聚合模式 — 服务器 LLM 流式期间增量
- * 合成, WS 二进制帧直推 (audio_start/binary/audio_end)。单设备恒最新
- * 固件 — 无逐句合成 (旧协议) 兼容路径 (1.0.259 已删)。
- * s_ws_audio_seen = 本轮收到过 audio_start (音频由 WS 流推送,
- * chat_done 时不再 POST; 未收到 = 服务器 TTS 失败 → 兜底整段 POST) */
+/* 恒为聚合模式: 服务器 LLM 流式期间增量合成, WS 二进制帧直推
+ * (audio_start/binary/audio_end)。
+ * s_ws_audio_seen = 本轮收到过 audio_start — 音频已由 WS 流推送,
+ * chat_done 时不再 POST; 未收到 = 服务器 TTS 失败 → 兜底整段 POST */
 static bool s_ws_audio_seen = false;
 
-/* : UTF-8 清洗 — 坏字节就地替换为 '?' (长度不变, 返回坏字节数,
- * 输出仍合法 UTF-8)。坏点源于 512B snprintf 行尾截断。
- * 演进: 截断式 (早期版) 坏点后内容全丢 — 连后续完整记录一起删;
- * 剔除式 坏字节跳过 — 相邻字节重新对齐可能错配成假字符;
- * '?' 替换 坏点独立占位, 其余字节解析不受影响, LLM/日志可感知缺失。
- * 背景: 半个字符 append 进 memory.txt → mem_summary 随 chat 帧上送 →
- * 服务端 uvicorn decode 失败直接关连接 (每次语音必被踢)。 */
+/* UTF-8 清洗: 坏字节就地替换为 '?' (长度不变, 返回坏字节数, 输出仍合法
+ * UTF-8)。坏点源于 512B snprintf 行尾截断 — 半个字符进记忆/上送会致服务端
+ * 拒连, '?' 占位使其余字节解析不受影响。 */
 static size_t utf8_sanitize_inplace(char *s, size_t len)
 {
     size_t i = 0, bad = 0;
@@ -78,9 +73,9 @@ static size_t utf8_sanitize_inplace(char *s, size_t len)
     return bad;
 }
 
-/* chat_done/chat_text 共用的回复清洗 (原两条内联循环收敛为单函数):
+/* chat_done/chat_text 共用的回复清洗:
  * clean  剥 |pXXX / [inst:…] / [tag] / /tools.xxx — 显示/记忆/日志用
- * tts    剥 |pXXX / [inst:…] / /tools.xxx, 保留 [tag] — 语音用 (原行为)
+ * tts    剥 |pXXX / [inst:…] / /tools.xxx, 保留 [tag] — 语音用
  * 均 UTF-8 清洗 (坏字节替换 '?'), 输出显式终止符 */
 static void parse_reply_text(const char *src, char *clean, size_t cs,
                              char *tts_text, size_t ts)
@@ -122,7 +117,7 @@ static void parse_reply_text(const char *src, char *clean, size_t cs,
         }
         clean[ci++] = *s++;
     }
-    clean[ci] = '\0'; /* 必须显式终止 — 缺此 strlen 读到栈垃圾 */
+    clean[ci] = '\0'; /* 必须显式终止 */
     utf8_sanitize_inplace(clean, (size_t)ci);
     if (!tts_text || ts < 1)
         return; /* 仅需显示文本 (聚合协议 chat_text) — 跳过 tts 清洗 */
@@ -155,7 +150,7 @@ static void parse_reply_text(const char *src, char *clean, size_t cs,
         }
         tts_text[ti++] = *s++;
     }
-    tts_text[ti] = '\0'; /* 缺此 → TTS 文本尾部栈垃圾 (实测乱码) */
+    tts_text[ti] = '\0'; /* 必须显式终止 */
     utf8_sanitize_inplace(tts_text, (size_t)ti);
 }
 
@@ -193,9 +188,9 @@ static pet_anim_t parse_anim_name(const char *a)
     return PET_ANIM_COUNT;
 }
 
-/* get_memory 读盘结果回调 — 写盘任务上下文执行 (仅 socket 发送, 零 flash 访问)。
- * WS 任务栈在 PSRAM, flash 读期间同样禁用 cache — 任何 flash 访问都会在
- * PSRAM 栈上 double exception (1.0.213 修了写, 1.0.214 补上读) */
+/* get_memory 读盘结果回调 — 写盘任务上下文执行 (仅 socket 发送, 零 flash 访问):
+ * flash 读期间 cache 禁用, WS 任务栈在 PSRAM, 任何 flash 访问都会
+ * double exception */
 static void ws_memory_read_cb(const char *content, size_t len, void *arg)
 {
     char *rid = (char *)arg;
@@ -227,8 +222,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGW(TAG, "WS 断开");
         s_connected = false;
         /* WS 音频流模式: 断连 = 不会有更多音频也不会有 audio_end —
-         * 立即置 rb_done 让播放排空收尾, 免 10s 死等 (1.0.261:
-         * 1.0.260 实测断连后排空死等 10s 才强制换句) */
+         * 立即置 rb_done 让播放排空收尾, 免等超时 */
         if (tts_client_is_ws_active())
             tts_client_ws_end();
         if (s_rx_buf) {
@@ -238,12 +232,10 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_rx_len = s_rx_total = 0;
         break;
     case WEBSOCKET_EVENT_DATA: {
-        /* ── 二进制帧 = WS 音频流 PCM (1.0.258 聚合二期) ──
+        /* ── 二进制帧 = WS 音频流 PCM ──
          * 逐片直接入环, 绝不分片重组: PCM 是字节流, 环按序消费, 分片
-         * 边界无意义。重组需按消息 malloc 大缓冲 — 播放期 PSRAM 被
-         * 双槽环+动画帧占满, 每条消息每片都分配 payload_len+1 必失败
-         * (1.0.259 实测: 全刷"重组缓冲分配失败", PCM 全丢 = 没听到播完)。
-         * 零分配零拷贝, 组件任务最轻。 */
+         * 边界无意义; 播放期 PSRAM 已被双槽环+动画帧占满, 重组按消息
+         * malloc 大缓冲必失败。零分配零拷贝, 组件任务最轻。 */
         if (evt->op_code == 2 && evt->data_len > 0) {
             tts_client_ws_feed((const uint8_t *)evt->data_ptr,
                                (uint32_t)evt->data_len);
@@ -309,8 +301,8 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 /* ── get_memory: 服务端工具 /tools.history 拉取完整对话记忆 ── */
                 else if (cJSON_IsString(type) && strcmp(type->valuestring, "get_memory") == 0) {
                     /* 读盘委托写盘任务 (回调在写盘任务上下文) — WS 任务栈在
-                     * PSRAM, memory_store_get 的 stat/fopen 同样是 cache 禁用期
-                     * flash 读, 会 double exception (1.0.214 根因) */
+                     * PSRAM, cache 禁用期对 flash 的 stat/fopen 读会
+                     * double exception */
                     cJSON *req_id = cJSON_GetObjectItem(root, "req_id");
                     char *rid = NULL;
                     if (cJSON_IsString(req_id) && req_id->valuestring[0])
@@ -338,9 +330,8 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                     if (cJSON_IsString(content))
                         memory_store_overwrite(content->valuestring);
                 }
-                /* ── audio_start / audio_end: WS 音频流边界 (1.0.258 聚合
-                    二期) — LLM 流式期间增量合成的 PCM 经二进制帧直推, 本
-                    帧只做起链/收尾 ── */
+                /* ── audio_start / audio_end: WS 音频流边界 — LLM 流式期间
+                    增量合成的 PCM 经二进制帧直推, 本帧只做起链/收尾 ── */
                 else if (cJSON_IsString(type) &&
                          strcmp(type->valuestring, "audio_start") == 0) {
                     if (tts_client_ws_start()) {
@@ -354,10 +345,10 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                     tts_client_ws_end();
                     ESP_LOGI(TAG, "WS 音频流结束");
                 }
-                /* ── chat_text: 聚合协议 (1.0.259) — LLM 流式句子逐句到达,
-                    只累计气泡打字机显示; 音频由 WS 二进制帧直推 (audio_start
-                    已起链)。不递增 chat_seq、不落记忆/日志 — 那些只在
-                    chat_done 做一次, 防重复 ── */
+                /* ── chat_text: LLM 流式句子逐句到达, 只累计气泡打字机显示;
+                    音频由 WS 二进制帧直推 (audio_start 已起链)。不递增
+                    chat_seq、不落记忆/日志 — 那些只在 chat_done 做一次,
+                    防重复 ── */
                 else if (cJSON_IsString(type) &&
                          strcmp(type->valuestring, "chat_text") == 0) {
                     if (cJSON_IsString(txt)) {
@@ -385,7 +376,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                         strcmp(type->valuestring, "chat_reply") == 0) {
                         s_chat_seq++; /* 会话模式等回复的信号 */
                         s_stream_text[0] = '\0'; /* 新一轮回复 — 重置流式气泡累计 */
-                        /* 服务端回显的用户原文 (后续阶段用于设备端记忆) */
+                        /* 服务端回显的用户原文 — 设备端记忆用 */
                         cJSON *llm_user = cJSON_GetObjectItem(root, "user_text");
                         if (cJSON_IsString(llm_user)) {
                             snprintf(s_last_user_text, sizeof(s_last_user_text), "%s",
@@ -431,9 +422,9 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 
                         /* 空文本 = 静默模式 (只做动作不说话) */
                         if (tts_text[0]) {
-                            /* 聚合协议 (1.0.259): WS 音频流直推 (audio_start 已
-                             * 收到) → 跳过 POST; 未收到 (服务器 TTS 失败) →
-                             * 兜底整段 POST. 气泡已由 chat_text 打字机显示, 不重刷 */
+                            /* WS 音频流直推 (audio_start 已收到) → 跳过 POST;
+                             * 未收到 (服务器 TTS 失败) → 兜底整段 POST.
+                             * 气泡已由 chat_text 打字机显示, 不重刷 */
                             if (s_ws_audio_seen) {
                                 ESP_LOGI(TAG, "agg: WS 音频流已推, 跳过整段 TTS");
                             } else {
@@ -488,9 +479,8 @@ static void *cjson_psram_malloc(size_t sz) { return heap_caps_malloc(sz, MALLOC_
 
 esp_err_t ws_client_connect(const char *token)
 {
-    /* 幂等 + 可重建: 组件内置重连只覆盖"已连接后断开", 不覆盖任务创建
-     * 失败 (注册后 "Error create websocket task") — 主循环 30s 周期调用
-     * 本函数重建客户端。已连则直接跳过, 避免误杀正常连接。 */
+    /* 幂等 + 可重建: 组件内置重连只覆盖"已连接后断开", 不覆盖创建任务
+     * 失败 — 主循环 30s 周期调用本函数重建客户端; 已连则直接跳过。 */
     if (s_paused) return ESP_OK; /* 息屏期不重建 (WiFi 已停) */
     if (s_connected) return ESP_OK;
     if (s_client) {
@@ -507,9 +497,9 @@ esp_err_t ws_client_connect(const char *token)
         .pingpong_timeout_sec = 10,
         .reconnect_timeout_ms = 10000,
         .network_timeout_ms = 10000,
-        /* 调用链深, 12KB 会溢出; 栈实际由 PSRAM 分配 (vendored 组件已改
-         * xTaskCreatePinnedToCoreWithCaps) — 16384 恰好等于
-         * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, 若用普通 malloc 必走内部 RAM */
+        /* 调用链深需大栈 — 组件栈由 PSRAM 分配 (vendored 组件改用
+         * xTaskCreatePinnedToCoreWithCaps); 16384 恰好对齐
+         * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, 普通 malloc 必走内部 RAM */
         .task_stack = 16384,
     };
     s_client = esp_websocket_client_init(&cfg);
@@ -520,9 +510,9 @@ esp_err_t ws_client_connect(const char *token)
 
 bool ws_client_is_connected(void) { return s_connected; }
 
-/* 息屏暂停/亮屏恢复 (2026-08-22) — 与 main.c 的息屏/亮屏块配对:
- * stop 停掉组件及其内置重连计时器 (10s 周期, WiFi 停后 DNS 必败, 实测与
- * 息屏期 USB TX 静默强相关), start 重新发起连接; 对象保留, 无需重建。 */
+/* 息屏暂停/亮屏恢复 — 与 main.c 的息屏/亮屏块配对:
+ * stop 停掉组件及其内置重连计时器 (WiFi 停后重连必失败), start 重新
+ * 发起连接; 对象保留, 无需重建。 */
 void ws_client_pause(void)
 {
     s_paused = true;
@@ -558,12 +548,12 @@ esp_err_t ws_client_send_json(const char *json)
 esp_err_t ws_client_send_chat(const char *text)
 {
     /* cJSON 构建: 正确处理引号/换行 + 附带记忆元数据 (缓存值, 零 FatFS 访问 —
-     * 本函数会在 sess 任务 12KB 栈上执行, FatFS+WL 调用链曾栈溢出) */
+     * 本函数在 sess 任务 12KB 栈上执行, 不引入文件调用链) */
     if (!s_client || !s_connected) return ESP_FAIL;
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "chat");
-    /* : ASR 文本同样清洗 — 任何坏字节进 WS 帧都会被服务端拒连
-     * v2.19.1: 坏字节替换 '?', 全坏发空串 */
+    /* ASR 文本同样清洗 — 任何坏字节进 WS 帧都会被服务端拒连:
+     * 坏字节替换 '?', 全坏发空串 */
     {
         size_t tl = strlen(text);
         char *ttmp = heap_caps_malloc(tl + 1, MALLOC_CAP_SPIRAM);
@@ -576,8 +566,8 @@ esp_err_t ws_client_send_chat(const char *text)
             cJSON_AddStringToObject(root, "text", text); /* PSRAM 不足 — 原样发 (极端场景) */
         }
     }
-    /* 兜底: 摘要再验一次 UTF-8 — 缓存可能早于文件修复 (修复由
-     * 主循环 tick 触发), 坏字节上送 = 服务端拒连。坏字节替换 '?', 全坏不带。 */
+    /* 兜底: 记忆摘要缓存再验一次 UTF-8 — 坏字节上送 = 服务端拒连;
+     * 坏字节替换 '?', 全坏不带。 */
     const char *summary = memory_store_cached_summary();
     if (summary) {
         size_t sl = strlen(summary);

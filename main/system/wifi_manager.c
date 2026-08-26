@@ -270,7 +270,7 @@ static void load_wifi_list(void)
             if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &rw) == ESP_OK) {
                 nvs_erase_key(rw, NVS_KEY_SSID);
                 nvs_erase_key(rw, NVS_KEY_PASS);
-                nvs_erase_key(rw, "backup"); /* 旧版 NVS 兜底键已废弃, 一并清除 */
+                nvs_erase_key(rw, "backup"); /* NVS 兜底键已废弃, 一并清除 */
                 nvs_commit(rw);
                 nvs_close(rw);
             }
@@ -361,7 +361,7 @@ static void dns_task(void *pv)
         if (p < n && q[p] == 0) p++;
         int qend = p + 4;
         /* 注意: 不能检查 qend+16>n — 普通查询 (无 OPT) 恰好 qend 字节,
-         * 该检查导致所有查询被静默丢弃、应答从未发出 (手机无限重试的根因) */
+         * 该检查会让所有查询被静默丢弃、应答从未发出 */
         uint8_t resp[512];
         memcpy(resp, q, qend);
         resp[2] = 0x81;
@@ -566,7 +566,7 @@ static esp_err_t http_server_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     /* LWIP_MAX_SOCKETS=12 时 httpd 内部占用 3 个 socket, 上限 12-3=9;
-     * 设 12 会 ESP_ERR_INVALID_ARG → 配网门户起不来 (1.0.236 实测)。
+     * 设 12 会 ESP_ERR_INVALID_ARG → 配网门户起不来。
      * 8 = 上限内最大, 激进门户探测并发也够 */
     cfg.max_open_sockets = 8;
     esp_err_t err = httpd_start(&s_httpd, &cfg);
@@ -697,7 +697,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                 ESP_LOGW(TAG, "WiFi 断开: reason=%d, 重连…", d->reason);
                 /* WiFi 断 → TTS 链立即终止: 否则下载任务在劣化期逐句重试
                  * 傻等 (8s 无数据 / connect 重试), 播放器等句 → 长假卡顿。
-                 * 网络已无, 继续下载无意义 — 播完当前句即停 (1.0.25x) */
+                 * 网络已无, 继续下载无意义 — 播完当前句即停 */
                 extern bool tts_client_stop(void);
                 tts_client_stop();
                 s_state = WIFI_CONNECTING;
@@ -709,8 +709,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                     ESP_LOGW(TAG, "连接失败 reason=%d, 重试 %d/%d (先扫描)",
                              d->reason, s_attempts, WIFI_RETRY_MAX);
                     /* 转控制任务重试: 事件回调内阻塞扫描会死锁 (扫描完成事件
-                     * 无法送达); 且无扫描直连在 reason=201 后连败 (驱动用过期
-                     * bssid/channel 缓存直连, 1.0.236 实测 3 连败进配网) */
+                     * 无法送达); 且无扫描直连在 reason=201 后连败 (驱动用
+                     * 过期 bssid/channel 缓存直连) */
                     s_ctrl_cmd = 3;
                     xTaskNotifyGive(s_ctrl_task);
                 } else {
@@ -732,8 +732,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         ip_event_got_ip_t *evt = data;
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&evt->ip_info.ip));
         ESP_LOGI(TAG, "WiFi 已连接! IP: %s", s_ip_str);
-        /* 2026-08-22 电源管理 v1: NONE(全开) → MIN_MODEM — 息屏实测 130mA
-         * 大头就是 WiFi modem 常开; beacon 周期唤醒, 断连风险实测观察 */
+        /* 省电: NONE(全开) → MIN_MODEM — 息屏电流大头是 WiFi modem 常开;
+         * beacon 周期唤醒, MIN_MODEM 下连接保持正常 */
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         esp_timer_stop(s_timeout_timer);
         if (s_cur_idx >= 0) {
@@ -761,7 +761,7 @@ static esp_err_t wifi_softap_start(void)
              CAPTIVE_HTML_TAIL);
 
     /* 预扫描: 门户启动前 STA 纯模式扫一次作兜底缓存 (页面打开时的
-     * 实时扫描为主路径 — 旧版行为, 实测可靠) */
+     * 实时扫描为主路径) */
     esp_wifi_set_mode(WIFI_MODE_STA);
     vTaskDelay(pdMS_TO_TICKS(100));
     s_scan_cache_count = do_scan(s_scan_cache, SCAN_CACHE_MAX);
@@ -783,7 +783,7 @@ static esp_err_t wifi_softap_start(void)
 
     /* AP IP 设为 8.8.8.8 — 部分 Android/ROM 硬编码 8.8.8.8 为 DNS 服务器
      * 无视 DHCP 下发; AP 自己占住 8.8.8.8 后, 这些查询也会落到我们的
-     * DNS 套接字上, 门户探测不再漏 (Arduino 论坛实测 4.3~12 稳定触发) */
+     * DNS 套接字上, 门户探测不漏 */
     esp_netif_ip_info_t ip_info;
     ip_info.ip.addr = esp_ip4addr_aton("8.8.8.8");
     ip_info.gw.addr = esp_ip4addr_aton("8.8.8.8");
@@ -867,11 +867,10 @@ wifi_state_t wifi_get_state(void) { return s_state; }
 bool wifi_is_connected(void) { return s_state == WIFI_CONNECTED; }
 const char *wifi_get_ip(void) { return s_ip_str; }
 
-/* 息屏挂起 / 亮屏恢复 (2026-08-22) — 与 main.c 的 esp_wifi_stop/start 配对:
+/* 息屏挂起 / 亮屏恢复 — 与 main.c 的 esp_wifi_stop/start 配对:
  * 息屏: suspend 后 stop, stop 触发的 DISCONNECTED 事件看到 WIFI_DISCONNECTED
  * 不再进 CONNECTED/CONNECTING 分支, 不会在已停的驱动上误跑重连/切网;
- * 亮屏: start 后 resume, 驱动已起, 重新发起连接 (esp_wifi_start 只启驱动
- * 不自动连 — 实测亮屏后卡 CONNECTING, WS 重连 DNS 失败)。 */
+ * 亮屏: start 后 resume, 重新发起连接 (esp_wifi_start 只启驱动不自动连)。 */
 void wifi_manager_suspend(void)
 {
     esp_timer_stop(s_timeout_timer);

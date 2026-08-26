@@ -13,9 +13,8 @@ extern "C" {
 esp_err_t ws_client_connect(const char *token);
 bool ws_client_is_connected(void);
 
-/** 息屏暂停 (停 WS 组件 + 停止内置重连计时器): WiFi 已停后组件每 10s 重连
- * 一次, 每次都 DNS 必败 — 实测与息屏期 USB 输出静默 (掉串口) 强相关
- * (两次日志静默起点精确对齐第二次重连后 ~3.3s), 息屏期彻底不连。 */
+/** 息屏暂停 (停 WS 组件 + 停止内置重连计时器): WiFi 已停后组件周期重连
+ * 必败 (DNS 失败), 息屏期彻底不连。 */
 void ws_client_pause(void);
 
 /** 亮屏恢复: 重新启动组件连接 (WiFi 恢复后调用)。 */
