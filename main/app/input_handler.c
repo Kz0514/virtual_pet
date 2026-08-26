@@ -1,7 +1,7 @@
-/** @file input_handler.c @brief 页面交互仲裁器 (桩→实现)
+/** @file input_handler.c @brief 页面交互仲裁器
  *
  * 职责:
- *  1. 接管 gesture_detect 事件回调 + 20ms 手势定时器 (原在 main.c)
+ *  1. 接管 gesture_detect 事件回调 + 20ms 手势定时器
  *  2. 维护当前页面 (HOME / SETTINGS), 页面特性表:
  *       HOME:     摇动/敲击/摸头/长按语音/三击静音 全开
  *       SETTINGS: 上述全关 (检测器排空, 手势不路由)
@@ -15,7 +15,7 @@
  *     左键单击 = CONFIRM (恒成立); 顶条左/右滑 = CONFIRM/BACK (恒成立)
  *     点击模式: 右滑条轻点上/下半段 = UP/DOWN; 顶条轻点左/右半区 = BACK/CONFIRM
  *     滑动模式: 右滑条上/下滑动 = UP/DOWN
- *   CLOSE_MENU 不再承担退出 (双击在设置页无动作, 防误触)
+ *   CLOSE_MENU 在设置页无动作 (双击不退出, 防与单击确认误触)
  */
 #include "input_handler.h"
 #include "home_interaction.h"
@@ -43,8 +43,7 @@ static uint32_t s_settings_open_tick = 0;
  * (顶条左右滑动作为超集保留)
  * 1 = 滑动: 右滑条上/下滑动选择; 顶条左滑=确认/右滑=返回
  * 左键单击=确认 恒成立。每事件读取 (config_mgr 有 RAM 缓存, 开销可忽略)。
- * 默认 1 (滑动) — 历史默认 0 点击, 但 NVS 擦除后默认值静默改变交互方式,
- * 曾导致用户滑动无反应 (2026-08-20 实报)。 */
+ * 默认 1 (滑动)。 */
 #define CFG_KEY_NAV_MODE "nav_mode"
 static bool nav_mode_is_tap(void)
 {
@@ -87,7 +86,7 @@ void input_handler_set_page(app_page_t page)
 
 app_page_t input_handler_get_page(void)
 {
-    /* 对账: 旧设置页可能经遗留路径(分区点击)自毁, 未通知本模块 */
+    /* 对账: 设置页可能自行销毁而未通知本模块 */
     if (s_page == APP_PAGE_SETTINGS && !settings_screen_is_active()) {
         input_handler_set_page(APP_PAGE_HOME);
     }
@@ -192,7 +191,7 @@ static void on_gesture_event(gesture_event_t ev)
     }
 }
 
-/* ── 手势 50Hz 驱动: 20ms LVGL 定时器 (原 main.c gesture_timer_cb) ── */
+/* ── 手势驱动: 20ms LVGL 定时器 (50Hz) ── */
 static void gesture_timer_cb(lv_timer_t *t)
 {
     (void)t;

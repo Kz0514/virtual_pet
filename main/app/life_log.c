@@ -56,8 +56,8 @@ static void append_line(const char *ts, const char *line)
         rename(LIFE_FILE, LIFE_OLD_FILE);
     }
 
-    /* 写失败告警 (限频 5s) — 卷损坏/低电写失败曾静默吞掉, 用户只见
-     * 日志缺失与可用空间膨胀; 这里把 open/write 失败暴露出来 */
+    /* 写失败告警 (限频 5s) — 把 open/write 失败暴露出来,
+     * 避免写失败被静默吞掉 */
     static int64_t s_last_warn_us = 0;
     int64_t now_us = esp_timer_get_time();
 
@@ -133,7 +133,7 @@ esp_err_t life_log_init(void)
     if (!s_q) return ESP_ERR_NO_MEM;
     TaskHandle_t th;
     /* 栈保持内部 RAM — 本任务直接写 /data (flash 写期间 cache 冻结,
-     * PSRAM 栈 double exception, memory_store 实测) */
+     * PSRAM 栈会 double exception) */
     if (xTaskCreatePinnedToCore(life_log_task, "life_log", 4096,
                                 NULL, 2, &th, 0) != pdPASS) {
         vQueueDelete(s_q);

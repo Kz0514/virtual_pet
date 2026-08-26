@@ -280,7 +280,7 @@ void diary_sync_tick(void)
 esp_err_t diary_sync_init(void)
 {
     /* 栈保持内部 RAM — 本任务直接写 /data (flash 写期间 cache 冻结,
-     * PSRAM 栈会 double exception, memory_store 实测) */
+     * PSRAM 栈会 double exception) */
     if (xTaskCreate(diary_sync_task, "diary_sync", 8192,
                     NULL, 1, &s_task) != pdPASS) {
         s_task = NULL;

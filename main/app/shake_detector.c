@@ -12,7 +12,7 @@
 
 static const char *TAG = "shake";
 
-/* ── 调参 (基于 40Hz DMP FIFO 速率, 25ms/样本) ── */
+/* ── 检测参数 (40Hz DMP FIFO 速率, 25ms/样本) ── */
 #define SD_LP_ALPHA         0.05f   /* 重力跟踪低通系数 (τ≈0.5s @40Hz) */
 #define SD_FLIP_ARM_G       0.18f   /* 换向计数的幅度门限 (g) — 低于此视为静止 (换向判据抗噪声, 可下探) */
 #define SD_FLIPS_NEEDED     4       /* 触发所需换向数 = 2 个完整振荡周期 */

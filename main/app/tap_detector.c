@@ -1,6 +1,6 @@
 /** @file tap_detector.c @brief 敲击检测 — 20Hz 原始加速度流上的脉冲识别 (单击/双击)
- * 弃用 DMP 内置 tap 特征 (本项目配置下无物理依据地频繁幻报, 调阈值无效),
- * 改为在 dmp_bg 的 20Hz 加速度回调里自研: 短脉冲计数 + 双击分组, 方向由高频向量主分量推算. */
+ * 在 dmp_bg 的 20Hz 加速度回调里实现: 短脉冲计数 + 双击分组,
+ * 方向由高频向量主分量推算. */
 #include "tap_detector.h"
 #include "dmp_mpu.h"
 #include "shake_detector.h"
@@ -11,13 +11,13 @@
 
 static const char *TAG = "tap";
 
-/* ── 调参 (基于 40Hz 采样 = 25ms/样本, 环境背景噪声实测 0.02~0.24g, 实测真敲击 0.18~1.57g) ── */
-#define TD_TAP_ARM_MIN       0.10f   /* 自适应阈值下限 (g) — 轻敲实测 0.10~0.14g 必须能过 */
+/* ── 检测参数 (基于 40Hz 采样 = 25ms/样本) ── */
+#define TD_TAP_ARM_MIN       0.10f   /* 自适应阈值下限 (g) — 须能让轻敲通过 */
 #define TD_TOUCH_ARM_MAX     0.15f   /* 手持期间自适应阈值上限 (手部微颤会抬升基线, 需封顶) */
 #define TD_TOUCH_QUIET_BASE  0.05f   /* 手持且环境基线低于此值才跳过静置前置 (滑动会抬升基线) */
 #define TD_ARM_RATIO         3.0f    /* 首脉冲阈值 = max(下限, 3×近1s环境基线) */
 #define TD_TAP_ARM2_G        0.30f   /* 双击第二脉冲阈值下限 (再取 max(自适应)) —
-                                      * 手搭设备/桌面震动会幻报双脉冲, 0.20g 误判多 */
+                                      * 须盖过手搭设备/桌面震动的双脉冲假象 */
 #define TD_TAP_HOLD_G        0.07f   /* 脉冲持续判定下沿 (上沿 50%) */
 #define TD_QUIET_G           0.10f   /* 静止判定 (滑动中的摩擦颤振会高于此线) */
 #define TD_MIN_QUIET         16      /* 首脉冲前置静置 400ms — 排除滑动粘滑, 且不吞连续敲击 */
@@ -178,7 +178,7 @@ static void accel_cb(short ax, short ay, short az)
         }
     }
 
-    /* 亚阈值峰跟踪: 记录成不了脉冲的"疑似敲击"峰值与原因, 供现场调参 */
+    /* 亚阈值峰跟踪: 记录成不了脉冲的"疑似敲击"峰值与原因 (诊断输出) */
     if (!s_pulse_active) {
         if (mag > 0.05f) {
             s_sub_active = true;
@@ -253,7 +253,7 @@ bool tap_detector_poll(tap_event_t *evt)
     return true;
 }
 
-/** 轮询被拒的"疑似敲击"峰值 (mg) 与原因 (0=低于阈值 1=静置不足) — 现场调参诊断用 */
+/** 轮询被拒的"疑似敲击"峰值 (mg) 与原因 (0=低于阈值 1=静置不足) — 诊断用 */
 bool tap_detector_poll_dbg(uint16_t *mag_mg, uint8_t *reason)
 {
     uint32_t n = s_dbg_seq;

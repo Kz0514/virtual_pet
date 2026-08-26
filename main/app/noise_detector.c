@@ -41,12 +41,10 @@ static uint8_t s_raw_level;
 static uint32_t s_bucket_t0[NOISE_WIN_COUNT]; /* 每个桶的开始时间戳 */
 static bool s_ready = false;
 
-/* : 采样窗 PM 锁 — 采样 (I2S 时钟运行) 期间禁轻睡。
- * 劈里啪啦根因 (拔电实测 v2.13): 采样窗内 I2S 使能 (TX+RX), 轻睡进入
- * 冻结外设时钟, 唤醒后 MCLK/BCK 相位跳变 → 码片 PLL 失锁瞬态经常开
- * PA 放大成噪声。mute bit 挡不住时钟恢复瞬态 (v2.13 实测), PA 又不能
- * 关 (开关即 POP, 用户铁律) → 从源头禁止 I2S 运行期跨轻睡边界。
- * 代价: 每 2s 丢 100ms 睡眠窗 (~5%), 可忽略。 */
+/* 采样窗 PM 锁 — 采样 (I2S 时钟运行) 期间禁轻睡: 轻睡冻结外设时钟,
+ * 唤醒后 MCLK/BCK 相位跳变致码片 PLL 失锁, 瞬态经 PA 放大成噪声;
+ * mute bit 挡不住时钟恢复瞬态, PA 又不可开关 (开关即 POP),
+ * 故从源头禁止 I2S 运行期跨轻睡边界。代价: 每 2s 丢 100ms 睡眠窗 (~5%)。 */
 static esp_pm_lock_handle_t s_noise_lock = NULL;
 
 /* ── CSV 文件路径 ── */
@@ -113,12 +111,12 @@ static void noise_task(void *pv)
             session_mgr_is_capturing()) continue;
 
         /* 采样只占 RX — open DAC 会 enable TX 播放残留数据 (异响) */
-        ESP_LOGI(TAG, "采样: hold_rx"); /* 探针: 确认采样入口 */
+        ESP_LOGI(TAG, "采样: hold_rx");
         if (!s_noise_lock)
             esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "noise", &s_noise_lock);
-        if (s_noise_lock) esp_pm_lock_acquire(s_noise_lock); /* : 禁轻睡 */
+        if (s_noise_lock) esp_pm_lock_acquire(s_noise_lock); /* 禁轻睡 */
         es8311_drv_hold_rx();
-        ESP_LOGI(TAG, "采样: 开始"); /* 探针: hold 完成 (enable 成功) */
+        ESP_LOGI(TAG, "采样: 开始");
         double sum_sq = 0.0;
         int total = 0;
         for (int i = 0; i < TOTAL_FRAMES; i++) {
@@ -133,10 +131,10 @@ static void noise_task(void *pv)
                 sum_sq += v * v;
             }
         }
-        ESP_LOGI(TAG, "采样: release_rx"); /* 探针: read 完成, 停时钟前 */
+        ESP_LOGI(TAG, "采样: release_rx");
         es8311_drv_release_rx();
         if (s_noise_lock) esp_pm_lock_release(s_noise_lock);
-        ESP_LOGI(TAG, "采样: 结束"); /* 探针: 停时钟完成 */
+        ESP_LOGI(TAG, "采样: 结束");
 
         if (total > 0) {
             double rms = sqrt(sum_sq / total);

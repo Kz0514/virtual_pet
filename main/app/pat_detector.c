@@ -38,7 +38,7 @@ static void poll_cb(lv_timer_t *t)
     if (touch_is_top_middle_pressed()) {
         /* 息屏按住 → 先唤醒: 顶部电极的触摸不进 gesture 左键唤醒路径
          * (单击/双击/长按只覆盖导航电极), 主循环轮询 >250 才有接触判定 —
-         * 轻按 (<250) 会无反应 (实测: 按两次才醒)。唤醒幂等
+         * 轻按 (<250) 会无反应。唤醒幂等
          * (main_screen_note_interaction 内部有 s_screen_on 守卫)。 */
         if (!gesture_is_screen_on()) {
             extern void main_screen_note_interaction(void);

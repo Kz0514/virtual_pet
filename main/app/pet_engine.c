@@ -97,7 +97,7 @@ static void set_face(pet_face_t f)
     }
 }
 
-/* ── 存档 (/cfg/pet.json — LittleFS 内部分区, 掉电安全; 不再写 NVS) ── */
+/* ── 存档 (/cfg/pet.json — LittleFS 内部分区, 掉电安全) ── */
 #define SAVE_FILE "/cfg/pet.json"
 #define SAVE_TMP "/cfg/pet.tmp"
 #define NVS_NS "pet" /* 仅用于旧存档一次性迁移 */

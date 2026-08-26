@@ -1,8 +1,7 @@
 /** @file home_interaction.c @brief 主页面交互集中组件
  *
- * 从 main.c 搬入: 摇动/敲击分发(轻重分流、震动闸门排空、养成触发、
- * 动画反馈、ws 上报)、物理交互短句、语音 10s 冷却 + 连续会话、
- * 摸头手势响应、静音占位。
+ * 摇动/敲击分发(轻重分流、震动闸门排空、养成触发、动画反馈、ws 上报)、
+ * 物理交互短句、语音 10s 冷却 + 连续会话、摸头手势响应、静音占位。
  *
  * 页面切换时由 input_handler 调 home_interaction_set_enabled(false):
  * poll 只排空检测器事件不产生反应, 手势事件直接忽略。
@@ -65,10 +64,8 @@ void home_interaction_poll(void)
     /* 排空闸门:
      * - 马达震动期间 — 振动经外壳传给 DMP, 会被误判为摇动/敲击;
      * - 非主页(设置页) — 只排空不处理, 回主页不会积压旧事件;
-     * - 息屏期 — 轻睡周期电气瞬态 → 喇叭"啪" → 纸盆振动 → DMP →
-     * tap/shake 假触发 (tap 阈值仅 0.10g, 实测 2s 内必亮屏, 自动亮屏
-     * 真凶, ph/tc=0 铁证触摸探针无辜)。息屏唤醒只走触摸探针
-     * (10Hz + 去抖) + 左键/摇动等物理路径, 摇动/敲击仅亮屏期有效 */
+     * - 息屏期 — 息屏唤醒只走触摸探针 (10Hz + 去抖) + 左键/摇动等
+     * 物理路径, 摇动/敲击仅亮屏期有效 */
     bool gated = !s_enabled || tm6604_is_vibrating() || !main_screen_is_on();
 
     shake_event_t se;
@@ -156,7 +153,7 @@ void home_interaction_on_gesture(gesture_event_t ev)
     }
 
     case GESTURE_MUTE_TOGGLE:
-        /* 静音在后续阶段接入 (config_mgr) */
+        /* 静音未接入 (config_mgr) */
         chat_bubble_show("静音功能开发中…", 2000);
         break;
 

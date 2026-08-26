@@ -1,10 +1,9 @@
 /** @file face_mapper.c
- * @brief 表情出口 — pet_engine 的心情/状态变化此前无任何视觉出口
- * (pet_engine_on_face_change 零订阅者, 表情只存在内存中).
+ * @brief 表情出口 — 把 pet_face_t 映射为对应动画
+ * (由 pet_engine_on_face_change 回调触发).
  *
- * 这里把 pet_face_t 映射为对应动画; 只在宠物 idle 且未被摸头时应用:
- * LLM 对话动画与物理交互动画播完回 idle 后, 下一次 tick 的表情
- * 重算会自动接管, 不会与更高优先级的动画互相抢占. */
+ * 只在宠物 idle 且未被摸头时应用: LLM 对话动画与物理交互动画播完回 idle 后,
+ * 下一次 tick 的表情重算会自动接管, 不与更高优先级动画互相抢占. */
 #include "face_mapper.h"
 #include "pet_engine.h"
 #include "pet_avatar.h"

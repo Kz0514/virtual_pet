@@ -27,7 +27,7 @@ void tap_detector_suppress(bool on);
 /** 触摸上下文更新 (主循环 1s 节拍): true = 手在设备上, 跳过静置前置并封顶阈值 */
 void tap_detector_set_touched(bool touched);
 
-/** 轮询被拒的"疑似敲击"峰值 (mg) 与原因 (0=低于阈值 1=静置不足) — 现场调参诊断用 */
+/** 轮询被拒的"疑似敲击"峰值 (mg) 与原因 (0=低于阈值 1=静置不足) — 诊断用 */
 bool tap_detector_poll_dbg(uint16_t *mag_mg, uint8_t *reason);
 
 #ifdef __cplusplus
