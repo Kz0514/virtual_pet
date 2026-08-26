@@ -4,8 +4,8 @@
 #include <stdbool.h>
 
 /** 初始化电源管理:
- * - esp_pm_configure(true) 一次使能轻睡眠框架 (v2.5: 运行时开关改用 PM 锁,
- * configure(false) 在临界区内打日志会 abort — IDF 的坑)
+ * - esp_pm_configure(true) 一次使能轻睡眠框架; 运行时开关改用 PM 锁,
+ * configure(false) 在临界区内打日志会 abort — 不做运行时切换
  * - 注册轻睡眠进出日志回调 (CONFIG_PM_LIGHT_SLEEP_CALLBACKS) */
 esp_err_t power_manager_init(void);
 
@@ -24,7 +24,7 @@ esp_err_t power_manager_deep_sleep(uint32_t timeout_ms);
 /** 息屏诊断: 轻睡进出计数 + esp_pm_dump_locks (长持锁 = 轻睡被禁)。调试期用。 */
 void power_manager_dump_stats(void);
 
-/** v2 诊断: vApplicationSleep 回调内窗口统计 (睡眠窗口 >=30000us 即会入睡)。
+/** 诊断: vApplicationSleep 回调内窗口统计 (睡眠窗口 >=30000us 即会入睡)。
  * 回调在 idle 临界区, 只做整数统计, 由主循环安全上下文读取。 */
 void power_manager_get_sleep_stats(uint32_t *total, uint32_t *over30, int64_t *max, int64_t *last);
 
@@ -38,7 +38,7 @@ uint32_t power_manager_get_rejects(void);
  * - 计数>0 且 sleeps=0 → skip 恒 true (锁未放/periph skip) */
 uint32_t power_manager_get_sleep_probe(void);
 
-/** v2: 硬件触摸唤醒消费 — 轻睡退出回调 (pm_exit_cb) 检测到
+/** 硬件触摸唤醒消费 — 轻睡退出回调 (pm_exit_cb) 检测到
  * ESP_SLEEP_WAKEUP_TOUCHPAD 时置位。不能直接在主循环轮询
  * esp_sleep_get_wakeup_cause: 该值粘滞 (亮屏期无睡眠不再覆盖, 保持上次
  * 触摸值), 息屏后立刻轮询会误报。回调只在真实睡眠退出时执行, 无假唤醒。
@@ -46,11 +46,11 @@ uint32_t power_manager_get_sleep_probe(void);
 bool power_manager_touch_woke(uint32_t *pad);
 
 /** : 最后一次睡眠退出的唤醒原因码 (esp_sleep_get_wakeup_cause)。
- * 修复后预期恒 ESP_SLEEP_WAKEUP_TIMER (4) — 定时器唤醒。CSV wk 列。 */
+ * 预期恒为 ESP_SLEEP_WAKEUP_TIMER — 定时器唤醒。CSV wk 列。 */
 uint32_t power_manager_get_wake_cause(void);
 
 /** : USB 连接感知禁睡 — USB-SERIAL-JTAG 的 SOF 帧存在 (主机在
  * 通信) 时持 NO_LIGHT_SLEEP 锁, 息屏轻睡不会冻结串口 (COM 掉口 →
- * 误判"卡死", 插着 USB 静置实测)。SOF 消失 (拔线) 释放恢复轻睡。
+ * 误判"卡死")。SOF 消失 (拔线) 释放恢复轻睡。
  * main.c 主循环 100ms 块检测 SOF 翻转调用, 幂等。 */
 void power_manager_usb_connection(bool connected);
