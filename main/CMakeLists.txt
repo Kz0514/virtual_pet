@@ -43,7 +43,7 @@ idf_component_register(
         "app/life_log.c"
         "app/diary_sync.c"
         "app/usb_storage.c"
-        "app/config_mgr.c"
+        "system/config_mgr.c"
         "app/event_bus.c"
         # Network
         "network/ws_client.c"
