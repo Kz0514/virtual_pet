@@ -1,8 +1,8 @@
 """
 Tencent Map weather API proxy — current conditions and forecast.
 
-注意: 腾讯天气API 2026年起要求 location=lat,lng 参数 (city/adcode 已失效),
-且响应格式变化: realtime 为数组, 天气字段嵌套在 infos 中。
+注意: 腾讯天气 API 只接受 location=lat,lng 参数 (city/adcode 已失效);
+响应中 realtime 为数组, 天气字段嵌套在 infos 中。
 """
 import httpx
 import logging
@@ -57,7 +57,7 @@ async def get_ip_location(client_ip: str = None) -> dict:
 
 
 def _parse_weather(data: dict) -> dict:
-    """解析新版响应: result.realtime[0].infos 嵌套格式"""
+    """解析响应: result.realtime[0].infos 嵌套格式"""
     result = data.get("result", {})
     realtime_list = result.get("realtime", [])
     if not realtime_list:
@@ -76,7 +76,7 @@ def _parse_weather(data: dict) -> dict:
 
 
 async def get_current_weather(city: str = None, lat: float = None, lon: float = None) -> dict:
-    """Get live weather. 天气API现在只接受 location=lat,lng."""
+    """Get live weather. 天气 API 只接受 location=lat,lng."""
     if lat is None or lon is None:
         # 有adcode → 逆地理编码得坐标; 都没有 → 默认北京
         if city:
@@ -94,7 +94,7 @@ async def get_current_weather(city: str = None, lat: float = None, lon: float = 
 
 
 async def get_forecast(city: str = None, lat: float = None, lon: float = None, days: int = 3) -> list[dict]:
-    """Get weather forecast. 天气API现在只接受 location=lat,lng."""
+    """Get weather forecast. 天气 API 只接受 location=lat,lng."""
     if lat is None or lon is None:
         if city:
             coords = await _adcode_to_coords(city)
@@ -106,7 +106,7 @@ async def get_forecast(city: str = None, lat: float = None, lon: float = None, d
     data = await _get(WEATHER_URL, location=f"{lat},{lon}")
     if data.get("status") == 0:
         forecasts = data.get("result", {}).get("forecast", [])
-        # 新版格式每条forecast含infos嵌套
+        # 每条 forecast 含 infos 嵌套
         out = []
         for f in forecasts[:days]:
             infos = f.get("infos", f)

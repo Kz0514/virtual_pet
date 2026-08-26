@@ -6,10 +6,9 @@ from app.config import get_settings
 settings = get_settings()
 logger = logging.getLogger("tts_service")
 
-# 剥离（动作提示）— Qwen 会把括号内文字也朗读出来 (1.0.257 实测:
-# 带提示句的音频时长 = 文本期望 2.1~2.75×, 提示语被完整念出 =
-# 用户听到的"复播句首")。提示词已约束模型少用, 此处兜底:
+# 剥离（动作提示）— Qwen 会把括号内的文字也完整朗读出来, 故从输入文本中剔除:
 # 全角/半角括号内的内容剥掉, 未闭合的全角括号尾巴也剥掉。
+# (提示词已约束模型少用, 此处兜底。)
 _STAGE_DIR_RE = re.compile(r"[（(][^（()）]*[）)]")
 
 
@@ -105,12 +104,8 @@ async def synthesize_stream(text: str, voice: str = None):
     # Run blocking call() in thread pool — doesn't block event loop
     task = loop.run_in_executor(None, _run)
 
-    # 首块攒够 0.5s 预冲后透传 (2026-08-24 修复): 旧版按 1.0x 实时速率匀速
-    # 节流, 实测合成速率仅 1.06x 实时 — 节流把设备端缓冲锁死在 0.5s,
-    # 设备网络一抖(实测 DL rate 3~157KB/s 波动)即欠冲卡顿; 且设备端
-    # 槽容量有限, 长句音频 > 槽容量时下载任务在 rb_put 满等, 播放一旦
-    # 停顿即永久挂死。改为攒够预冲后原速透传: 设备端可积累
-    # "合成领先量(6%) + 预冲" 的缓冲, 对抖动容忍度大幅提升。
+    # 首块攒够 0.5s 预冲后原速透传: 设备端可积累
+    # "合成领先量 + 预冲" 的缓冲, 对网络抖动容忍度高。
     BYTES_PER_SEC = 48000 * 2
     PREFILL_S = 0.5
     prefill = b""
@@ -152,8 +147,7 @@ class TTSSession:
             self.error = "DashScope API key not configured"
             return
 
-        # SpeechSynthesizer 构造即校验 dashscope.api_key, 必须创建前设好
-        # (1.0.258 漏设 → 构造异常在 router try 外 → 整轮对话零回执)
+        # SpeechSynthesizer 构造即校验 dashscope.api_key — 必须先设好再构造
         dashscope.api_key = settings.dashscope_api_key
 
         class _CB(ResultCallback):

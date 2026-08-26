@@ -1,12 +1,11 @@
 """
 Qwen-Image 涂鸦服务 — 网格批量生成 + 缓存池 (token-plan 专属实例 + 独立 key).
 
-背景: 每篇日记单独调一次图像生成太浪费配额 (2K 图 ~60-110s/次, 周配额有限,
-      实测 6 次并发/超时调用可耗尽一周配额)。
-方案: 一次调用生成 8x4 网格贴纸图 (32 格), PIL 裁剪成 32 张小图缓存;
+配额: 每次图像生成调用耗时 (~60-110s/次) 且消耗周配额, 故合并批量生成 —
+      一次调用生成 8x4 网格贴纸图 (32 格), PIL 裁剪成 32 张小图缓存;
       日记按 entry_id 哈希确定性取一张 — 32 篇日记只耗 1 次 API 调用。
 prompt: 只画具体元素 (太阳/云朵/花朵/蛋糕等), 避开动物/人物 —
-        实测 "画一只小猫" 触发 400 IPInfringementSuspect; 具体场景描述可过审。
+        IP 审核对动物/人物设限, 具体场景描述可过审。
 失败 (429/审核/超时) 一律返回 None — 日记落库绝不阻断;
 生成失败后冷却 1h, 防每篇日记都白等一次 90s。
 并发: 模块级 asyncio.Lock, 多设备并发取图时只有第一个补货, 其余复用新池。
@@ -33,7 +32,7 @@ DOODLE_DIR = os.path.join(os.path.dirname(__file__), "..", "doodles")
 BATCH_DIR = os.path.join(DOODLE_DIR, "batch")
 DOODLE_PROBABILITY = 0.25   # 每篇日记附带涂鸦的概率
 DOODLE_MODEL = "qwen-image-3.0-pro"
-DOODLE_CALL_TIMEOUT = 120   # API 调用超时 (实测生成约 60-110s, 无超时会卡死任务)
+DOODLE_CALL_TIMEOUT = 120   # API 调用超时 (一次生成约 60-110s, 无超时任务会挂起)
 DOODLE_DOWNLOAD_TIMEOUT = 30
 
 GRID_COLS = 8               # 网格 8 列 x 4 行 = 32 张小图 (2K 图 2752x1536 → 344x384/格)
@@ -183,7 +182,7 @@ async def maybe_generate_doodle(entry_id: str, title: str, content: str) -> str 
     """小概率配涂鸦: 从缓存池按 entry_id 哈希取一张 (确定性), 返回 URL.
     池空时阻塞补货 (首次部署后第一篇日记会等 ~90s, 之后零等待)."""
     if not settings.doodle_enabled:
-        return None   # 总开关 — 网格生成效果待调优, 先禁用
+        return None   # 总开关 — 默认关闭 (doodle_enabled)
     if not settings.doodle_api_key:
         logger.warning("doodle_api_key 未配置 — 跳过涂鸦")
         return None

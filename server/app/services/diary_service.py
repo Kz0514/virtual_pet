@@ -94,8 +94,8 @@ def render_diary_html(entry, doodle_b64: str | None, pet_name: str = "萝莉丝"
     paras = [escape(line) for line in entry.content.split("\n") if line.strip()]
     content_html = "".join(f"<p>{p}</p>" for p in paras) or "<p>今天没有留下文字。</p>"
 
-    # 纯文字心情 — 设备中文字体子集缺 ☀☔ 等符号会渲染成 tofu "▯",
-    # 不再硬编码装饰符号 (旧数据由固件 symbol_fix 映射兜底)
+    # 纯文字心情 — 设备中文字体子集缺 ☀☔ 等符号 (渲染成 tofu),
+    # 心情字段只用纯文字
     mood_html = f'<div class="mood">{mood}</div>' if mood else ""
     doodle_html = (
         f'<div class="doodle"><img src="{doodle_b64}" alt="今天的涂鸦"></div>'

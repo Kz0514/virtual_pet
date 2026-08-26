@@ -376,8 +376,7 @@ async def tool_static_map(device_id: str, params: dict | None = None) -> str:
     return json.dumps({"status": "ok", "url": url, "_source": source}, ensure_ascii=False)
 
 
-# @_register("network_location", "精准定位:扫描WiFi获取精确位置(需等3-5秒)")
-# ^-- 暂不启用：腾讯智能硬件定位API可能需要额外申请权限
+# 未启用: 腾讯智能硬件定位 API 需额外申请权限
 async def tool_network_location(device_id: str, params: dict | None = None) -> str:
     """Async tool: tells ESP32 to scan WiFi via WS, waits for result, calls Tencent API."""
     # 1. Check if device is connected via WS

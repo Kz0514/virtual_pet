@@ -56,7 +56,7 @@ class TestParseReply(unittest.TestCase):
         self.assertEqual(text, FALLBACK_TEXT)
 
     def test_never_leak_json_structure(self):
-        """用户实测缺陷: JSON 头漏过滤被 TTS 朗读 — 保证任何畸形 JSON 不外泄"""
+        """任何畸形 JSON 结构都不得进入 chat_text (否则会被 TTS 朗读) — 保证不外泄"""
         cases = [
             '{"mood_delta":1,"text":"你好"',   # 漏右括号
             '{"mood_delta":1,',                # 更残

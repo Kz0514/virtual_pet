@@ -138,7 +138,7 @@ async def device_ws(websocket: WebSocket, token: str = Query("")):
                     if loc:
                         src = loc.get("source", "unknown")
                         if src == "ip":
-                            # 实测: LLM 总把 IP 定位的城市中心坐标当实际坐标 — 明示粗略
+                            # IP 定位返回城市中心坐标 — 明示粗略, 防 LLM 误当精确坐标
                             pet_state += (f" | 设备位置:{loc.get('province','')}{loc.get('city','')} "
                                           f"坐标:{loc.get('lat',0):.3f},{loc.get('lng',0):.3f}"
                                           f"(注意:这是IP定位的城市中心粗略坐标, 误差数公里, "
@@ -174,11 +174,11 @@ async def device_ws(websocket: WebSocket, token: str = Query("")):
 
                     reply = ""
 
-                    # 全流式定稿 (1.0.262): LLM 流式句子逐句 feed 给 TTSSession
-                    # (流式输入) → streaming_call 增量合成 → 音频队列 → WS
-                    # 二进制帧限速直推 (流式输出) — 一次性回传, 全程并行.
-                    # LLM 停顿期合成器无输出 = 设备静音等待, 播放链保持存活
-                    # (固件 1.0.262 已禁用 WS 模式排空看门狗), 恢复后无缝续播.
+                    # 全流式: LLM 流式句子逐句 feed 给 TTSSession (流式输入)
+                    # → streaming_call 增量合成 → 音频队列 → WS 二进制帧直推
+                    # (流式输出) — 一次性回传, 全程并行.
+                    # LLM 停顿期合成器无输出 = 设备静音等待, 播放链保持存活,
+                    # 恢复后无缝续播 (固件在 WS 模式已禁用排空看门狗).
                     loop = asyncio.get_running_loop()
                     tts = None
                     audio_push = None
@@ -190,11 +190,9 @@ async def device_ws(websocket: WebSocket, token: str = Query("")):
 
                     if tts is not None:
                         async def _push_audio():
-                            """队列 PCM → WS 二进制帧直推, 全速 (1.0.263).
+                            """队列 PCM → WS 二进制帧直推, 全速.
                             设备端帧队列满 → TCP 窗口收紧 → send_bytes 挂起,
-                            速率恒 = 设备播放消费速率 — 背压闭环, 无需限速
-                            (1.0.261 限速: 预算被句间空闲清零, burst 时失守
-                            实测环满丢块 64+)."""
+                            速率恒等于设备播放消费速率 — 背压闭环, 无需限速."""
                             nonlocal audio_bytes
                             while True:
                                 chunk = await loop.run_in_executor(None, tts.q.get)
@@ -284,10 +282,9 @@ async def device_ws(websocket: WebSocket, token: str = Query("")):
                         logger.warning(f"chat_done send fail: {e}")
 
                     try:
-                        # 本轮 user + assistant + mood 更新同事务原子落库 (延迟优化 1.0.25x):
-                        # user 行原在 LLM 前单独落库 — 当前轮历史已加载完, LLM 调用链在内存
-                        # append, 该行只服务后续轮次/日记; per-device 锁已串行化顺序, 提前落库
-                        # 无必要且多一次 LLM 前的串行 DB 往返。合并后三行要么全成要么全不成。
+                        # 本轮 user + assistant + mood 更新同一事务原子落库:
+                        # 当前轮历史已加载进内存, user 行只服务后续轮次/日记;
+                        # per-device 锁已串行化顺序 — 三行要么全成要么全不成。
                         async with AsyncSessionLocal() as db:
                             now = datetime.now(timezone.utc)
                             await db.execute(

@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     dashscope_base_url: str = _dashscope.get("base_url", "https://dashscope.aliyuncs.com/api/v1")
 
     # ── DashScope 涂鸦 (Qwen-Image, token-plan 专属实例 + 独立 key) ──
-    doodle_enabled: bool = _dashscope_doodle.get("enabled", False)  # 总开关 (网格效果待调优, 默认关)
+    doodle_enabled: bool = _dashscope_doodle.get("enabled", False)  # 总开关, 默认关
     doodle_api_key: str = _dashscope_doodle.get("api_key", "")
     doodle_base_url: str = _dashscope_doodle.get("base_url",
         "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1")

@@ -52,7 +52,7 @@ class Pet(Base):
     id           = Column(UUID, primary_key=True, default=_uuid)
     device_id    = Column(UUID, ForeignKey("devices.id"), unique=True, nullable=False)
     name         = Column(String(32), default="萝莉丝")
-    owner_name   = Column(String(32), default="主人")  # 主人称谓 (可配置, 1.0.269)
+    owner_name   = Column(String(32), default="主人")  # 主人称谓 (可配置)
     mood         = Column(SmallInteger, default=50)   # 0–100
     energy       = Column(SmallInteger, default=80)   # 0–100
     intimacy     = Column(SmallInteger, default=0)    # 0–100

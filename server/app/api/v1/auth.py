@@ -21,7 +21,7 @@ settings = get_settings()
 class DeviceRegisterRequest(BaseModel):
     mac_address: str = Field(..., pattern=r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
     device_name: str = Field(default="萝莉丝", max_length=64)
-    owner_name: str = Field(default="主人", max_length=32)  # 主人称谓 (旧固件缺省兜底)
+    owner_name: str = Field(default="主人", max_length=32)  # 主人称谓 (未传时的缺省值)
     firmware_version: str = Field(default="1.0.0", max_length=16)
     hardware_rev: str = Field(default="A", max_length=8)
 

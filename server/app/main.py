@@ -22,7 +22,7 @@ async def lifespan(app: FastAPI):
     from app.core.database import engine, Base
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # create_all 只建新表不补旧表列 — 幂等迁移: pets.owner_name (1.0.269)
+        # create_all 只建新表不补旧表列 — 幂等补齐老库缺失列 (如 pets.owner_name)
         try:
             await conn.execute(
                 text("ALTER TABLE pets ADD COLUMN owner_name VARCHAR(32) DEFAULT '主人'")
