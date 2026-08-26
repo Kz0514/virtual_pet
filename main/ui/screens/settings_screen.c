@@ -7,8 +7,8 @@
  *   显示页: 亮度(调值 1-100 步长5, 实时生效)
  *           自动息屏(调值 预设 30/60/90/120/300s, 实时生效)
  *           主界面亮度条(开关)
- * 操作页: 选择逻辑(调值 点击/滑动, 实时生效) — 2026-08-22 从显示页移入
- * 滑动反向(开关, 日记翻页方向反转)
+ * 操作页: 选择逻辑(调值 点击/滑动, 实时生效)
+ * 滑动反向(二选, 日记翻页方向反转)
  * 关于页: 固件版本(只读, 不可选中)
  *
  * 两种模式:
@@ -20,8 +20,7 @@
  * IT_TOGGLE 项用 lv_switch 显示状态; IT_INFO 项只读不可选中;
  * 选中状态由行背景(浅灰)/调值(浅蓝)表达。
  *
- * 本文件不轮询触摸、不消费手势 — 旧版双重消费/分区错位/索引混用问题
- * 从结构上消除。
+ * 本文件不轮询触摸、不消费手势 — 输入全部经 settings_screen_input() 注入。
  */
 #include "settings_screen.h"
 #include "screen_switch.h" /* 屏幕切换强制全屏重绘 (残影防护) */
@@ -96,11 +95,11 @@ static const item_t s_display_items[] = {
     {"亮度", IT_ADJUST, 0},
     {"自动息屏", IT_ADJUST, 0},
     {"主界面亮度条", IT_TOGGLE, 0},
-    {"屏幕测试", IT_LAUNCH, 0}, /* 2026-08-22: 纯色背景验证面板图像滞留 */
+    {"屏幕测试", IT_LAUNCH, 0}, /* 纯色背景切换 — 目视验证面板图像滞留 */
 };
 static const item_t s_ops_items[] = {
-    {"选择逻辑", IT_ADJUST, 0},           /* 2026-08-22 从显示页移入 */
-    {"浏览日记时翻页方向", IT_ADJUST, 0}, /* 2026-08-22: 开关 → 向上/向下二选 */
+    {"选择逻辑", IT_ADJUST, 0},
+    {"浏览日记时翻页方向", IT_ADJUST, 0}, /* 向上/向下二选一 */
 };
 static const item_t s_tz_items[] = {
     {"自动时区", IT_TOGGLE, 0},
@@ -193,10 +192,8 @@ static void toast_poll_cb(lv_timer_t *t);
 static void refresh(void);
 static void nav_vibe(void);
 
-/* ── 屏幕测试 (2026-08-22): 纯色背景切换 — 验证 LCD 图像滞留 ──
- * 用户实报: 主页 WiFi/电池/萝莉丝残留可见 — 渲染已证明全屏重绘完整,
- * 疑为面板物理滞留 (高对比静态图案)。进入后上/下切换纯色, 直接目视
- * 残留像是否浮于纯色之上 (滞留 = 像素亮度差, 盖不住)。 */
+/* ── 屏幕测试: 纯色背景切换 — 目视验证面板物理图像滞留 ──
+ * 残留像会浮于高对比纯色之上 (滞留 = 像素亮度差, 纯色盖不住), 直接可见 */
 #define TEST_COLOR_CNT 6
 static const uint32_t s_test_colors[TEST_COLOR_CNT] = {
     0x000000,
@@ -308,15 +305,9 @@ static int first_selectable(page_id_t p)
 }
 
 /* 数据分区信息: U盘模式中 → "U盘模式中"; 未挂载 → "未挂载"; 挂载态 → 总容量 + 空闲空间。
- *
- * 总/空闲**都取自 FatFS 卷本身** (fs->n_fatent/csize/ssize + f_getfree) —
- * 与 Windows 资源管理器一致。卷总大小 = 分区大小减去 WL 磨损均衡保留区
- * (本设备 1MB 分区 → 卷 724K), 总容量小于分区是正常现象; 曾用
- * usb_storage_capacity (WL 容量) 显示总容量 → 与 Windows 差 ~300K。
- * 单位用卷自身扇区字节 (fs->ssize)。
- * 探测: 走 usb_storage 互斥 API — **只探测 WL 注册盘号** (IDF diskio 对未
- * 注册槽无守卫, 全盘扫描必崩 1.0.216) + 与 repair 重建互斥 (中间态 f_getfree
- * 返回 FRESULT=12, 1.0.218) */
+ * 总/空闲均取自 FatFS 卷本身 (fs->n_fatent/csize/ssize + f_getfree), 与
+ * Windows 资源管理器一致; 卷容量 = 分区减去 WL 磨损均衡保留区, 小于分区为正常。
+ * 探测走 usb_storage 互斥 API — 只探测 WL 注册盘号, 且与 repair 重建互斥 */
 static void storage_info_text(char *buf, size_t len)
 {
     if (usb_storage_is_active()) {
@@ -328,8 +319,8 @@ static void storage_info_text(char *buf, size_t len)
         return;
     }
 
-    /* 走 usb_storage 的互斥探测 — 直接 f_getfree 会在 repair 重建中间态
-     * 看到 FatFs 空卷 (FRESULT=12), 误报"-" (1.0.218) */
+    /* 走 usb_storage 的互斥探测 — repair 重建中间态直接 f_getfree 会看到
+     * FatFs 空卷 (FRESULT=12), 误报"-" */
     uint32_t total_kb = 0, free_kb = 0;
     if (!usb_storage_probe_data(&total_kb, &free_kb)) {
         ESP_LOGW(TAG, "数据分区探测失败 — 挂载态与 FatFS 实际状态不一致, "
@@ -405,9 +396,7 @@ static void get_value_text(page_id_t page, int idx, char *buf, size_t len)
             snprintf(buf, len, "%s", app->version);
             break;
         }
-        case 1: /* 检查更新: 二次确认提示仅显示在被调的那一行
-                 * (s_adjusting 是全局的 — 曾漏判 s_sel, 导致确认检查时
-                 * 下方的重启设备行也冒出"再按确认重启") */
+        case 1: /* 检查更新: 二次确认提示仅显示在选中的那一行 (须判 s_sel) */
             if (s_adjusting && s_sel == 1) snprintf(buf, len, "再按确认检查");
             break;
         case 2: /* 重启设备: 同上 */
@@ -442,7 +431,7 @@ static void nav_vibe(void)
     if (now - s_last_vib >= pdMS_TO_TICKS(VIBE_THROTTLE_MS)) {
         s_last_vib = now;
         /* 本马达 ~50% 占空比才起振, 整数百分比粒度不够 —
-         * 537/1023 ≈ 52.5%, 等效约 4% 震感 (用户 2026-08-18 标定) */
+         * 537/1023 ≈ 52.5%, 等效约 4% 震感 */
         tm6604_vibrate_raw(537, 40);
     }
 }
@@ -459,10 +448,8 @@ typedef struct {
     int8_t row_kind; /* -1=未缓存; 0=普通项 1=开关项 */
     bool sw_checked; /* 开关选中态 */
     bool has_arrow;  /* 父项箭头 (LV_SYMBOL_RIGHT) */
-    const char *lbl; /* 行标签 (static 字符串, 指针比较) —
-    2026-08-22: 窗口滚动时缓存漏比 label,
-    行内容变但视觉类别相同 → 判定无变化 → 标签不更新
-    (实报: 滚到底部最后一行仍显示"操作", 打开却是"关于") */
+    const char *lbl; /* 行标签 (static 字符串, 指针比较) — 必须参与缓存比对;
+    漏比则窗口滚动后行内容变化但标签不更新 */
     char val[40];    /* 数值文本 (开关项缓存为 "") ≥ version[32] */
 } row_cache_t;
 
@@ -646,12 +633,12 @@ static void adjust_step(int dir)
     }
     if (s_page == PAGE_OPS) {
         switch (s_sel) {
-        case 0: {                                                /* 选择逻辑: 点击↔滑动 (2026-08-22 从显示页移入操作页) */
+        case 0: {                                                /* 选择逻辑: 点击↔滑动 */
             uint32_t m = config_get_u32(CFG_KEY_NAV, 1) ? 0 : 1; /* 默认 1 (滑动), 与 input_handler 一致 */
             config_set_u32(CFG_KEY_NAV, m);                      /* input_handler 每事件读缓存 */
             break;
         }
-        case 1: { /* 浏览日记时翻页方向: 向下 ↔ 向上 (2026-08-22: 开关改二选) */
+        case 1: { /* 浏览日记时翻页方向: 向下 ↔ 向上 (二选一) */
             uint32_t flip = config_get_u32(CFG_KEY_FLIP, 0) ? 0 : 1;
             config_set_u32(CFG_KEY_FLIP, flip); /* diary_screen 每事件读缓存 */
             break;
@@ -705,13 +692,12 @@ static void do_confirm(void)
     if (s_adjusting) { /* 调值中: 确认 = 退出调值 (存储页=执行格式化, 关于页=检查更新/重启) */
         if (s_page == PAGE_STORAGE && s_sel == 2) {
             /* 重启后格式化: 写 NVS 标志 → esp_restart → boot 整区擦除 →
-             * 组件自动格式化。运行时不再碰 FatFS (1.0.216-217 失败教训) */
+             * 组件自动格式化 (运行时不动 FatFS) */
             if (usb_storage_request_format() != ESP_OK)
                 ESP_LOGW(TAG, "格式化请求失败 — 请确认不在 U盘模式, 详见串口日志");
         } else if (s_page == PAGE_ABOUT && s_sel == 1) {
-            /* 检查更新: 置标志, 由主循环同步执行 (与开机检查同上下文,
-             * 规避独立任务创建在部分启动场景不可靠的老坑; 阻塞主循环期间
-             * LVGL 任务照常渲染, notify overlay 显示进度) */
+            /* 检查更新: 置标志, 由主循环同步执行 (与开机检查同上下文; 阻塞期间
+             * LVGL 任务照常渲染, 提示框显示进度) */
             ESP_LOGI(TAG, "设置页手动触发 OTA 检查…");
             ota_client_request_check();
         } else if (s_page == PAGE_ABOUT && s_sel == 2) {
@@ -1056,8 +1042,7 @@ static void toast_poll_cb(lv_timer_t *t)
     lv_obj_set_style_text_color(s_toast_lbl, tc, 0);
     lv_obj_clear_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
 
-    /* 删除后必须置空 — 曾漏置空导致二次删除已释放定时器
-     * (notify_overlay 同款教训) */
+    /* 删除后必须置空, 防悬空指针二次删除 */
     if (s_toast_hide) {
         lv_timer_delete(s_toast_hide);
         s_toast_hide = NULL;

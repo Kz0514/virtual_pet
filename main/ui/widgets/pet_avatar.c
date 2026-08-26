@@ -27,11 +27,11 @@ static const char *TAG = "avatar";
 #define FRAME_SIZE (FW * FH * 2)
 #define IDLE_FRAMES 5
 #define MAX_ANIM 20
-#define PLAY_FRAMES 6 /* 播放期续载帧数上限 — PSRAM 撞顶防护 (1.0.253) */
+#define PLAY_FRAMES 6 /* 播放期续载帧数上限 — PSRAM 撞顶防护 */
 #define PLAY_LOOPS 3 /* 播放循环次数后回到 idle */
 
-/* anims.bin v2 — magic 与 v1 "ANIM" 不同: 老固件读新包走 magic 失败
- * (优雅降级: 宠物不显示, 系统照常), 不会按 v1 表错位解出垃圾帧.
+/* anims.bin 打包格式 — magic 校验失败即整体拒绝 (优雅降级: 宠物不显示,
+ * 系统照常), 不会按错误帧表解出垃圾帧.
  * size_flags: bit31=原始 RGB565 未压缩; bits30-28=codec (0=RLE,
  * 1=WebP 无损); 低 28 位 = 帧数据字节数 */
 #define PACK_MAGIC_V2    0x32494E41u /* "ANI2" */
@@ -74,15 +74,11 @@ static frame_t s_dynamic[MAX_ANIM];
 static pet_anim_t s_loaded_anim = PET_ANIM_IDLE;
 /* s_dynamic_count 声明见下方共享状态块 (volatile, 跨核) */
 
-/* ══════ anims.bin 动画包 v2 (SPIFFS 单文件 + 帧表) ══════
- * SPIFFS 的 open 线性扫全分区元数据: 83 帧并成单文件后文件数 90→2,
- * open 毫秒级 (原 0.3-1.5s 冻结 UI)。播放 = lseek+read 块读 + 锁外解压,
- * fd 常开。头部 {magic, version, total_frames} + total_frames ×
- * {anim_id, off, size_flags} (12 + total*12B), 帧数据平铺其后 (off 相对
- * 数据区起点)。帧数由文件决定 — 与枚举数解耦 (缺素材的枚举不出条目,
- * 如 SAD)。idle(zhanli) 在包内。双解码器 (tools/gen_anim_bin.py 生成,
- * boot 探针计时后定夺最终 codec)。素材演进只重打包重烧 assets,
- * 分区表永不动。 */
+/* ══════ anims.bin 动画包 (SPIFFS 单文件 + 帧表) ══════
+ * 单文件 + 帧表使 open 毫秒级; 播放 = lseek+read 块读 + 锁外解压, fd 常开。
+ * 头部 {magic,version,total} + total×{anim_id,off,size_flags} + 帧数据平铺
+ * (off 相对数据区起点); 帧数由文件决定, 与枚举数解耦 (缺素材如 SAD 不出条目);
+ * 素材演进只重打包重烧 assets, 分区表不动。 */
 static int s_pack_fd = -1;
 static uint32_t s_pack_data_off;             /* 数据区绝对文件偏移 (头部之后) */
 static uint16_t s_pack_total;                /* 帧表条目数 */
@@ -164,7 +160,7 @@ static bool s_hold; /* 保持模式: 按住期间循环不回 idle */
 
 /* 延迟请求 — WS回调只存请求, LVGL定时器执行(栈更大) */
 static volatile int s_pending_anim = -1;
-static uint32_t s_pending_at = 0; /* 请求时间戳 — 延迟800ms避开TTS下载抢SPI总线 */
+static uint32_t s_pending_at = 0; /* 请求时间戳 (play_fast 置 0 标记立即执行) */
 static uint8_t s_play_loops = 3;  /* 动画总播放轮数 */
 
 /* ══════ SPIFFS ══════ */
@@ -338,9 +334,8 @@ static void unload_frames(frame_t *pool, int count)
     }
 }
 
-/* 帧读取全部在 anim_load 后台任务 (定时器回调零 flash IO) — 曾实测在
- * LVGL 定时器里做 flash 读会冻结整个 UI, 且 flash 跨核互锁极端卡死会
- * 触发看门狗重启 (v1.0.243), 同步读首帧路径已移除, 切换一律异步备帧 */
+/* 帧读取全部在 anim_load 后台任务, 定时器回调零 flash IO —
+ * 切换一律异步备帧 (不在 LVGL 定时器内同步读帧) */
 
 /* ══ 跨核共享状态 (LVGL 定时器 ↔ anim_load 后台任务) ══
  * LVGL 任务不绑核 (affinity=-1), 池所有权转移 (unload/发布/重置) 全部
@@ -355,15 +350,12 @@ static volatile pet_anim_t s_cached_anim = PET_ANIM_IDLE; /* 动态池缓存的�
 static volatile int s_bg_next = 0;               /* 下一个待加载帧索引 */
 static volatile int s_bg_total = 0;              /* 总帧数上限 */
 static frame_t s_load_buf;                       /* 后台加载暂存槽 */
-/* 异步切换备帧: 目标动画首帧由后台任务读入 s_load_buf, 定时器回调零
- * flash IO — v1.0.243 曾实测定时器内同步读在 flash 跨核协调下卡死 >5s
- * → 任务看门狗重启 (TWDT), 此后切换一律异步 */
+/* 异步切换备帧: 目标动画首帧由后台任务读入 s_load_buf, 定时器回调零 flash IO */
 static volatile int s_stage_anim = -1;           /* 备帧请求 (>=0=有请求) */
 static volatile bool s_stage_ready = false;      /* 首帧已备好在 s_load_buf */
 
 /* 异步切换: 目标动画帧不在动态池时, 由后台任务备好首帧后定时器再完成
- * 切换 — 定时器回调内零 flash IO (曾实测定时器内同步帧读冻结 UI, 且
- * flash 跨核互锁存在极端卡死 → 看门狗重启, v1.0.243 全面移除). */
+ * 切换 — 定时器回调内零 flash IO */
 static bool switch_to_anim(pet_anim_t anim)
 {
     if (anim == s_loaded_anim) return true;
@@ -442,8 +434,8 @@ static void anim_load_task(void *arg)
         portEXIT_CRITICAL(&s_load_mux);
 
         /* ══ 阶段 1: 异步切换备帧 — 读目标动画首帧入 s_load_buf (定时器
-         * 零 flash IO). 绕开 TTS 暂停 (与旧同步快启一致: 单帧 32KB 读 +
-         * ~1ms 解码, 不构成音频卡顿) ══ */
+         * 零 flash IO). 绕开 TTS 暂停: 单帧 32KB 读 + ~1ms 解码,
+         * 不构成音频卡顿 ══ */
         if (stage >= 0 && stage < PET_ANIM_COUNT && !stage_ready) {
             if (load_one_frame_off((pet_anim_t)stage, 0, &s_load_buf, true)) {
                 portENTER_CRITICAL(&s_load_mux);
@@ -463,11 +455,9 @@ static void anim_load_task(void *arg)
         }
 
         /* ══ 阶段 2: 正常续载 — 备帧期间暂停 (s_load_buf 被备帧独占);
-         * 播放期 (TTS) 恢复加载但限 6 帧 (1.0.253): 1.0.252 满帧续载 →
-         * 14×112KB 帧池 + TTS 双槽 1MB + 字体 → PSRAM 撞顶 229KB/碎片
-         * (实测) → 分配失败踩 SPI DMA 描述符 → flush polling 死循环 →
-         * 任务看门狗重启 (实测)。播放期 6 帧可动 (视觉可接受), 播放
-         * 结束后补满; 每帧 40ms 延时摊开, 不抢音频时序 ══ */
+         * 播放期 (TTS) 限载 6 帧防 PSRAM 撞顶 (分配失败 → SPI DMA 描述符
+         * 被踩 → flush polling 死循环 → 任务看门狗重启), 播完后再补满;
+         * 每帧 40ms 延时摊开, 不抢音频时序 ══ */
         bool tts_playing = tts_client_is_playing();
         int load_limit = tts_playing ? PLAY_FRAMES : MAX_ANIM;
         if (idx < s_bg_total && idx < load_limit && s_stage_anim < 0) {
@@ -502,12 +492,10 @@ static void anim_load_task(void *arg)
     }
 }
 
-/* 1.0.248: boot 预加载摸头 — 内部堆充足期 (boot ~105KB) 把摸头 7 帧
- * 读进 PSRAM 动态池, 首次摸头缓存命中零延迟。实测首次摸头"连首帧
- * 都卡" = 内部堆枯竭期 32KB 读缓冲分配阻塞 (已知问题 #7 连锁);
- * boot 期加载避开该窗口。播放由 s_loaded_anim 驱动, 预加载只填缓存
- * (s_cached_anim), 不干扰显示; 用户抢在完成前摸头 → 备帧路径正常
- * 切换并卸池, 预加载锁内校验失败自动中止 */
+/* boot 预加载摸头 — 内部堆充足期 (起机早期) 把摸头 7 帧读进 PSRAM
+ * 动态池, 首次播放缓存命中零延迟。播放由 s_loaded_anim 驱动, 预加载
+ * 只填缓存 (s_cached_anim), 不干扰显示; 用户抢在完成前触发 →
+ * 备帧路径先切换, 预加载锁内校验失败自动中止 */
 static void anim_preload_task(void *arg)
 {
     pet_anim_t anim = (pet_anim_t)(intptr_t)arg;
@@ -539,11 +527,9 @@ static void anim_preload_task(void *arg)
             pub = true;
         }
         portEXIT_CRITICAL(&s_load_mux);
-        /* 日志必须在临界区外 — 1.0.248-1.0.250 实崩 (无限重启):
-         * 锁内 printf 的 newlib 锁获取, xPortCanYield 查 PS.INTLEVEL,
-         * 临界区 INTLEVEL≠0 → 误判 ISR 上下文 → locks.c:145 abort;
-         * 与内部堆无关, 堆守卫拦不住 (1.0.250 内部堆 11KB 必崩)。
-         * 堆守卫保留仅作内存诊断双保险 */
+        /* 日志必须在临界区外 — 临界区内 printf 的 newlib 锁获取会被
+         * xPortCanYield (查 INTLEVEL) 误判为 ISR 上下文 → abort;
+         * 内存余量判断仅作诊断 */
         if (pub && heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > 8192) {
             ESP_LOGI(TAG, "boot 预加载完成: anim %d (%d 帧), 首次播放零延迟",
                      anim, s_dynamic_count);
@@ -668,8 +654,7 @@ static void frame_timer_cb(lv_timer_t *t)
         return;
     }
 
-    /* 处理动画请求 — 流式 TTS 下载是 96KB/s 匀速细流,
-     * 不再构成 SPI 突发争用, 立即开播 (原 800ms 最小延迟与下载等待一并移除) */
+    /* 处理动画请求 — 立即开播 (流式 TTS 下载为匀速细流, 不构成 SPI 突发争用) */
     if (s_pending_anim >= 0 && s_pending_anim < PET_ANIM_COUNT) {
         pet_anim_t req = (pet_anim_t)s_pending_anim;
         s_pending_anim = -1;
@@ -704,8 +689,7 @@ static void frame_timer_cb(lv_timer_t *t)
         s_loop_active = false;
     }
 
-    /* 剩余帧由 anim_load 后台任务续载 — 定时器零 flash IO (曾实测
-     * 定时器内 35ms 帧读冻结整个 UI: 文字气泡/文字跟着卡) */
+    /* 剩余帧由 anim_load 后台任务续载 — 定时器零 flash IO */
 
     /* ── 前进到下一帧 ── */
     s_seq_pos++;
@@ -807,9 +791,8 @@ esp_err_t pet_avatar_init(void)
 
     /* 后台帧加载任务 — 独立于 LVGL 定时器; 内部 RAM 栈 (高频访问),
      * 低优先级: 只在 LVGL 空闲时续载, 播放期自暂停 (TTS 检查)。
-     * 栈 4096: 2048 曾实测溢出 (load_one_frame_off 内 ESP_LOGI +
-     * malloc + VFS read 链栈深大 — 与 Tmr Svc 2048 同款问题), 崩溃
-     * 表现 = 摸头播放动画时直接重启 */
+     * 栈 4096: load_one_frame_off 的 ESP_LOGI + malloc + VFS read
+     * 链栈深较大, 2048 不够 */
     if (xTaskCreate(anim_load_task, "anim_load", 4096, NULL, 1, NULL) != pdPASS)
         ESP_LOGE(TAG, "anim_load 任务创建失败 — 动画只能播首帧");
 

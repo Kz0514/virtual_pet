@@ -58,8 +58,8 @@ static void hide_cb(lv_timer_t *t) {
     s_hide = NULL;
 }
 
-/* 强制回到空闲态 — 页面切换/禁用时调用。
- * 修复: busy 期间切入设置页会让 poll 早退, tap/shake 抑制残留。 */
+/* 强制回到空闲态 — 页面切换/禁用时调用; 清除调节期间的 tap/shake 抑制
+ * 与解锁窗口, 避免残留影响其它界面 */
 static void force_idle(void) {
     if (s_was_busy) {
         s_was_busy = false;
@@ -180,11 +180,8 @@ void brightness_bar_init(void) {
     lv_obj_align_to(s_label, s_bar, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
     lv_obj_add_flag(s_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* 修复 "100% 时屏幕底部灰色横条":
-     * "100%" 是唯一 4 字符的标签文本, 居中对齐后比 3 字符值宽出 ~9px,
-     * 右缘越过屏幕右边界 ~2px → LVGL 判定屏幕内容可滚动 →
-     * 主题滚动条样式 (灰色 / RADIUS_CIRCLE 半圆端 / OPA_40) 自动出现在屏幕底部,
-     * 且随本控件隐藏而消失。主屏幕无任何滚动交互 (无 indev), 关闭滚动条显示。 */
+    /* 关闭屏幕滚动条 — 数值标签超过屏幕右缘会让 LVGL 判定内容可滚动,
+     * 主题滚动条样式会在屏幕底部出现; 主屏无滚动交互, 不需要滚动条 */
     lv_obj_set_scrollbar_mode(lv_screen_active(), LV_SCROLLBAR_MODE_OFF);
 
     s_poll = lv_timer_create(poll_cb, POLL_MS, NULL);

@@ -19,7 +19,7 @@ void screen_load_full(lv_obj_t *scr)
  lv_display_enable_invalidation(disp, true);
 
  /* 强制整屏重绘 — 部分刷新模式下切换后首帧必须完整覆盖,
- * 否则未刷新的行残留旧屏幕像素 (残影: 设置页顶栏显示日记日期) */
+ * 否则未刷新的行残留旧屏幕像素 (残影) */
  lv_obj_invalidate(scr);
  ESP_LOGI(TAG, "已加载屏幕 (强制全屏重绘)");
 }

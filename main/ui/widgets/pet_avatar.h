@@ -41,9 +41,8 @@ typedef enum {
 /** 初始化动画系统 */
 esp_err_t pet_avatar_init(void);
 
-/** 1.0.248: boot 预加载常用动画 (摸头) — 内部堆充足期加载进 PSRAM
- * 池, 首次播放缓存命中零延迟 (实测首次摸头卡 = 内部堆枯竭期读缓冲
- * 分配阻塞, 见 PROJECT_MAP 已知问题 #7) */
+/** boot 预加载常用动画 (摸头) — 起机早期内部堆充足时加载进 PSRAM
+ * 池, 首次播放缓存命中零延迟 */
 void pet_avatar_preload(void);
 
 /** 切换到指定动画序列 */

@@ -44,7 +44,7 @@ static const char *TAG = "diary";
 #define VIBE_THROTTLE_MS 100
 
 /* 滑动反向开关 (NVS "scroll_flip", 设置页"操作"页可调):
- * 开 → 详情 UP/DOWN 翻页方向反转 (上滑翻页的适配, 2026-08-22) */
+ * 开 → 详情 UP/DOWN 翻页方向反转 */
 #define CFG_KEY_SCROLL_FLIP "scroll_flip"
 
 /* ── 列表条目 ── */
@@ -214,8 +214,7 @@ static char *parse_content(const char *html)
     bool first = true;
     while (p < e && o + 8 < cap) {
         if (strncmp(p, "<p>", 3) == 0) {
-            /* 首段不换行, 段间空一行 — 2026-08-21 空行太疏是 line_space +6 时
-             * (段距 44px); 现在 -6 负行距下空行段距 32px, 紧凑且段落可辨 */
+            /* 首段不换行, 段间空一行 — -6 负行距下空行段距 32px, 紧凑且段落可辨 */
             if (!first) {
                 out[o++] = '\n';
                 out[o++] = '\n';
@@ -486,8 +485,8 @@ static void build_detail_ui(const char *date)
     lv_obj_set_flex_flow(s_cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_flex_cross_place(s_cont, LV_FLEX_ALIGN_CENTER, 0);
 
-    /* 标题组: 标题 + 信纸装饰线一体 (线贴标题下方, 不独占一行)
-     * tbox 显式宽 216 — 自动宽曾让内容偏离容器中心 (2026-08-22 实报) */
+    /* 标题组: 标题 + 信纸装饰线一体 (线贴标题下方, 不独占一行);
+     * tbox 显式宽 216, 保持内容居中 */
     if (d_title && d_title[0]) {
         lv_obj_t *tbox = lv_obj_create(s_cont);
         lv_obj_set_size(tbox, 216, LV_SIZE_CONTENT);
@@ -507,9 +506,7 @@ static void build_detail_ui(const char *date)
         lv_obj_set_style_text_color(h1, lv_color_hex(0x2a211a), 0);
         lv_obj_set_style_text_align(h1, LV_TEXT_ALIGN_CENTER, 0);
         if (FONT_ZH) lv_obj_set_style_text_font(h1, FONT_ZH, 0);
-        /* 269 = 256×1.05 — 用户实测 1.05× (256 = LV_SCALE_NONE = 1.0×,
-         * 且 =256 时无 transform 绘制层, 见 lv_obj_style.c)。
-         * pivot 50%: 放大以中心对称, 防内容向一侧偏移 */
+        /* 269 = LV_SCALE_NONE(256)×1.05 放大; pivot 50% 令放大以中心对称, 防偏移 */
         lv_obj_set_style_transform_scale(h1, 269, 0);
         lv_obj_set_style_transform_pivot_x(h1, LV_PCT(50), 0);
         lv_obj_set_style_transform_pivot_y(h1, LV_PCT(50), 0);
@@ -523,7 +520,7 @@ static void build_detail_ui(const char *date)
         lv_obj_clear_flag(rule, LV_OBJ_FLAG_SCROLLABLE);
     }
 
-    /* 心情文字 (纯文字居中红字 — 粉底胶囊已按实报移除, 观感像白色大圆) */
+    /* 心情 — 纯文字居中红字 */
     if (d_mood && d_mood[0]) {
         lv_obj_t *ml = lv_label_create(s_cont);
         lv_label_set_text(ml, d_mood);
@@ -532,8 +529,8 @@ static void build_detail_ui(const char *date)
         if (FONT_ZH) lv_obj_set_style_text_font(ml, FONT_ZH, 0);
     }
 
-    /* 正文: 段落拆独立 label — 段距由容器 pad_row 控制 (10px), 行距 line_space -6
-     * 各自独立; 单 label 段间空行的段距与行距耦合, 调一行全变 (2026-08-22) */
+    /* 正文: 段落拆独立 label — 段距由容器 pad_row 控制, 行距 line_space -6,
+     * 互不耦合 */
     if (d_text && d_text[0]) {
         lv_obj_t *pbox = lv_obj_create(s_cont);
         lv_obj_set_size(pbox, 216, LV_SIZE_CONTENT);
@@ -541,7 +538,7 @@ static void build_detail_ui(const char *date)
         lv_obj_set_style_border_width(pbox, 0, 0);
         lv_obj_set_style_radius(pbox, 0, 0);
         lv_obj_set_style_pad_all(pbox, 0, 0);
-        lv_obj_set_style_pad_row(pbox, 6, 0); /* 段落间距 (2026-08-22: 10→6) */
+        lv_obj_set_style_pad_row(pbox, 6, 0); /* 段落间距 6px */
         lv_obj_clear_flag(pbox, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_flex_flow(pbox, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_style_flex_cross_place(pbox, LV_FLEX_ALIGN_CENTER, 0);
@@ -560,8 +557,7 @@ static void build_detail_ui(const char *date)
                     lv_label_set_long_mode(pl, LV_LABEL_LONG_WRAP);
                     lv_obj_set_width(pl, 216);
                     lv_obj_set_style_text_color(pl, lv_color_hex(0x4a3f35), 0);
-                    /* zh.bin 行高 22px (16px 字), 正 line_space 占比小感知弱 →
-                     * 负行距直接收紧 (2026-08-21 实报) */
+                    /* zh.bin 行高 22px (16px 字) — 用负行距 (-6) 收紧段落行距 */
                     lv_obj_set_style_text_line_space(pl, -6, 0);
                     if (FONT_ZH) lv_obj_set_style_text_font(pl, FONT_ZH, 0);
                     heap_caps_free(para);
@@ -595,7 +591,6 @@ static void build_detail_ui(const char *date)
     lv_obj_set_style_text_color(foot, lv_color_hex(0xb3a28c), 0);
     if (FONT_ZH) lv_obj_set_style_text_font(foot, FONT_ZH, 0);
 
-    /* 临时排查日志 (2026-08-22): 详情子元素坐标 — 定位"标题与心情大空隙" */
     lv_obj_update_layout(s_scr);
     uint32_t ci = 0;
     lv_obj_t *ch = NULL;
@@ -670,7 +665,7 @@ void diary_screen_input(settings_event_t ev)
         case SETTINGS_EV_DOWN: {
             /* scroll_to_y 会 clamp 到可滚动范围 (scroll_by 会无限滚出边界) */
             int dy = (ev == SETTINGS_EV_UP) ? -20 : 20;
-            /* 滑动反向开关 (设置页"操作"页) — 翻页方向反转 (2026-08-22) */
+            /* 滑动反向开关 (设置页"操作"页) — 翻页方向反转 */
             if (config_get_u32(CFG_KEY_SCROLL_FLIP, 0)) dy = -dy;
             lv_obj_scroll_to_y(s_cont, lv_obj_get_scroll_y(s_cont) + dy,
                                LV_ANIM_OFF);
@@ -678,7 +673,7 @@ void diary_screen_input(settings_event_t ev)
         }
         case SETTINGS_EV_BACK: {
             /* 删屏重建: 详情/列表切换走完整屏幕切换 (与 destroy 同机制),
-             * 绕开部分刷新下 clean+重建的残留 — 2026-08-21 两轮实报未根治 */
+             * 绕开部分刷新下 clean+重建的残留 */
             detail_free();
             s_detail = false;
             s_cont = NULL;
