@@ -19,6 +19,7 @@
 #include "tts_client.h"
 #include "asr_client.h"
 #include "ws_client.h"
+#include "message_handler.h"
 #include "notify_overlay.h"
 #include "chat_bubble.h"
 #include "noise_detector.h"
@@ -326,21 +327,21 @@ static void sess_task(void *pv)
                 chat_bubble_show("网络不可用…", 4000);
                 break;
             }
-            uint32_t seq0 = ws_client_get_chat_seq();
+            uint32_t seq0 = message_handler_get_chat_seq();
             ws_client_send_chat(text);
             free(text);
 
             sess_set_state(SESS_WAIT_REPLY);
             for (int i = 0; i < 450; i++) { /* 45s, 100ms 步进 */
                 vTaskDelay(pdMS_TO_TICKS(100));
-                if (ws_client_get_chat_seq() != seq0) break;
+                if (message_handler_get_chat_seq() != seq0) break;
                 if (!ws_client_is_connected()) break;
             }
             if (!ws_client_is_connected()) {
                 chat_bubble_show("网络不可用…", 4000);
                 break;
             }
-            if (ws_client_get_chat_seq() == seq0) {
+            if (message_handler_get_chat_seq() == seq0) {
                 ESP_LOGW(TAG, "等回复超时 — 回聆听");
                 continue;
             }

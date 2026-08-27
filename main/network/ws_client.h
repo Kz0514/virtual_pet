@@ -4,11 +4,18 @@
  */
 #pragma once
 #include "esp_err.h"
+#include "cJSON.h"
 #include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/** 协议帧回调 — ws_client 解析出 type 后调用 (WS 任务上下文, 同步);
+ *  返回 true = 本回调已认领该帧, ws_client 不再走内部默认链。
+ *  app/message_handler 注册 (④-3+ 协议层逐步迁入)。 */
+typedef bool (*ws_frame_handler_t)(const char *type, cJSON *root);
+void ws_client_set_frame_handler(ws_frame_handler_t cb);
 
 esp_err_t ws_client_connect(const char *token);
 bool ws_client_is_connected(void);

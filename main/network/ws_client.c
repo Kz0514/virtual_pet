@@ -161,6 +161,12 @@ static int s_rx_len = 0, s_rx_total = 0;
 
 uint32_t ws_client_get_chat_seq(void) { return s_chat_seq; }
 
+/* 协议帧回调 (app/message_handler 注册): 返回 true = 已认领, 跳过默认链。
+ * 未注册时全部帧走内部默认链 — 与重构前逐位一致。 */
+static ws_frame_handler_t s_frame_handler = NULL;
+
+void ws_client_set_frame_handler(ws_frame_handler_t cb) { s_frame_handler = cb; }
+
 /* 动画名 → pet_anim_t (PET_ANIM_COUNT = 未识别) */
 static pet_anim_t parse_anim_name(const char *a)
 {
@@ -283,6 +289,13 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 cJSON *type = cJSON_GetObjectItem(root, "type");
                 cJSON *txt = cJSON_GetObjectItem(root, "text");
 
+                /* 协议帧回调: 已注册且认领 (返回 true) → 跳过默认链;
+                 * 未注册/未认领 → 走下方默认链, 与重构前逐位一致 */
+                if (cJSON_IsString(type) && s_frame_handler &&
+                    s_frame_handler(type->valuestring, root)) {
+                    cJSON_Delete(root);
+                    break;
+                }
                 /* ── scan_wifi: server requests WiFi scan for network location ── */
                 if (cJSON_IsString(type) && strcmp(type->valuestring, "scan_wifi") == 0) {
                     ESP_LOGI(TAG, "scan_wifi: starting scan");

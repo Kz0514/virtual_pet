@@ -44,6 +44,7 @@ idf_component_register(
         "drivers/storage/usb_storage.c"
         "system/config_mgr.c"
         "app/event_bus.c"
+        "app/message_handler.c"
         # Network
         "network/ws_client.c"
         "system/wifi_scanner.c"

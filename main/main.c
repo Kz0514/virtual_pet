@@ -62,6 +62,7 @@
 #include "pat_detector.h"
 #include "face_mapper.h"
 #include "session_mgr.h"
+#include "message_handler.h"
 #include "config_mgr.h"
 #include "config_keys.h"
 #include "input_handler.h"
@@ -525,6 +526,9 @@ void app_main(void)
 
     /* 连续会话模式 (VAD 半双工多轮对话) */
     session_mgr_init();
+
+    /* 协议帧分发: ws_client 只做传输, 帧语义层从这里注册 */
+    message_handler_init();
     lvgl_port_unlock();
 
     /* 电源管理: 轻睡眠使能 (esp_pm_configure) — 在 UI/会话就绪后、WiFi 之前 */
