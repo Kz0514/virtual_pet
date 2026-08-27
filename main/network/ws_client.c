@@ -4,15 +4,9 @@
  */
 #include "ws_client.h"
 #include "server_config.h"
-#include "chat_bubble.h"
 #include "tts_client.h"
-#include "pet_engine.h"
-#include "pet_avatar.h"
 #include "wifi_scanner.h"
 #include "memory_store.h"
-#include "life_log.h"
-#include "config_mgr.h"
-#include "config_keys.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -24,14 +18,12 @@ static const char *TAG = "ws";
 static esp_websocket_client_handle_t s_client = NULL;
 static bool s_connected = false;
 static bool s_paused = false;            /* 息屏期暂停 (WiFi 已停, 重连必败) */
-static volatile uint32_t s_chat_seq = 0; /* chat_done 计数 — 会话模式等待回复信号 */
-static char s_last_user_text[512] = {0}; /* 服务端回显的用户原文 — 设备端记忆用 */
-/* 流式回复 (chat_text 帧) 的气泡累计 — 逐句追加打字机, chat_done 重置 */
-static char s_stream_text[512] = {0};
 /* 恒为聚合模式: 服务器 LLM 流式期间增量合成, WS 二进制帧直推
  * (audio_start/binary/audio_end)。
- * s_ws_audio_seen = 本轮收到过 audio_start — 音频已由 WS 流推送,
- * chat_done 时不再 POST; 未收到 = 服务器 TTS 失败 → 兜底整段 POST */
+ * s_ws_audio_seen = 本轮收到过 audio_start — 音频已由 WS 流推送。
+ * 置位归传输层 (audio_start), 消费归协议层 (message_handler 在 chat_done
+ * 经 ws_audio_stream_take_seen() 读出即清零);
+ * 未收到 = 服务器 TTS 失败 → 兜底整段 POST */
 static bool s_ws_audio_seen = false;
 
 /* UTF-8 清洗: 坏字节就地替换为 '?' (长度不变, 返回坏字节数, 输出仍合法
@@ -74,126 +66,25 @@ static size_t utf8_sanitize_inplace(char *s, size_t len)
     return bad;
 }
 
-/* chat_done/chat_text 共用的回复清洗:
- * clean  剥 |pXXX / [inst:…] / [tag] / /tools.xxx — 显示/记忆/日志用
- * tts    剥 |pXXX / [inst:…] / /tools.xxx, 保留 [tag] — 语音用
- * 均 UTF-8 清洗 (坏字节替换 '?'), 输出显式终止符 */
-static void parse_reply_text(const char *src, char *clean, size_t cs,
-                             char *tts_text, size_t ts)
-{
-    int ci = 0, ti = 0;
-    const char *s = src;
-    while (*s && ci < (int)cs - 1) {
-        if (s[0] == '|' && s[1] == 'p' && s[2] >= '0' && s[2] <= '9') {
-            s += 2;
-            while (*s >= '0' && *s <= '9')
-                s++;
-            continue;
-        }
-        if (strncmp(s, "[inst:", 6) == 0) {
-            const char *end = strchr(s + 6, ']');
-            if (end) {
-                s = end + 1;
-                continue;
-            }
-        }
-        if (*s == '[') {
-            const char *end = strchr(s, ']');
-            if (end) {
-                s = end + 1;
-                continue;
-            }
-        }
-        if (strncmp(s, "/tools.", 7) == 0) {
-            s += 7;
-            while (*s && (*s != ' ' && *s != '(' && *s != ','))
-                s++;
-            if (*s == '(') {
-                const char *e = strchr(s, ')');
-                if (e) s = e + 1;
-            }
-            while (*s == ' ')
-                s++;
-            continue;
-        }
-        clean[ci++] = *s++;
-    }
-    clean[ci] = '\0'; /* 必须显式终止 */
-    utf8_sanitize_inplace(clean, (size_t)ci);
-    if (!tts_text || ts < 1)
-        return; /* 仅需显示文本 (聚合协议 chat_text) — 跳过 tts 清洗 */
-    s = src;
-    while (*s && ti < (int)ts - 1) {
-        if (s[0] == '|' && s[1] == 'p' && s[2] >= '0' && s[2] <= '9') {
-            s += 2;
-            while (*s >= '0' && *s <= '9')
-                s++;
-            continue;
-        }
-        if (strncmp(s, "[inst:", 6) == 0) {
-            const char *end = strchr(s + 6, ']');
-            if (end) {
-                s = end + 1;
-                continue;
-            }
-        }
-        if (strncmp(s, "/tools.", 7) == 0) {
-            s += 7;
-            while (*s && (*s != ' ' && *s != '(' && *s != ','))
-                s++;
-            if (*s == '(') {
-                const char *e = strchr(s, ')');
-                if (e) s = e + 1;
-            }
-            while (*s == ' ')
-                s++;
-            continue;
-        }
-        tts_text[ti++] = *s++;
-    }
-    tts_text[ti] = '\0'; /* 必须显式终止 */
-    utf8_sanitize_inplace(tts_text, (size_t)ti);
-}
-
 /* 分片重组缓冲 (PSRAM) — 大消息 (memory_update 等) 按片到达 */
 static char *s_rx_buf = NULL;
 static int s_rx_len = 0, s_rx_total = 0;
 
-uint32_t ws_client_get_chat_seq(void) { return s_chat_seq; }
+/* 本轮 WS 音频流消费接口 — 读出即清零 (message_handler 在 chat_done 用):
+ * true = audio_start 收到过 (音频已 WS 直推, 跳过整段 TTS POST)。
+ * 清零同时承担原"一轮结束"语义 — 防跨轮误判兜底 POST */
+bool ws_audio_stream_take_seen(void)
+{
+    bool v = s_ws_audio_seen;
+    s_ws_audio_seen = false;
+    return v;
+}
 
 /* 协议帧回调 (app/message_handler 注册): 返回 true = 已认领, 跳过默认链。
  * 未注册时全部帧走内部默认链 — 与重构前逐位一致。 */
 static ws_frame_handler_t s_frame_handler = NULL;
 
 void ws_client_set_frame_handler(ws_frame_handler_t cb) { s_frame_handler = cb; }
-
-/* 动画名 → pet_anim_t (PET_ANIM_COUNT = 未识别) */
-static pet_anim_t parse_anim_name(const char *a)
-{
-    if (strcmp(a, "idle") == 0)
-        return PET_ANIM_IDLE;
-    else if (strcmp(a, "happy") == 0)
-        return PET_ANIM_HAPPY;
-    else if (strcmp(a, "sad") == 0)
-        return PET_ANIM_SAD;
-    else if (strcmp(a, "excited") == 0)
-        return PET_ANIM_EXCITED;
-    else if (strcmp(a, "surprised") == 0)
-        return PET_ANIM_SURPRISED;
-    else if (strcmp(a, "sleepy") == 0)
-        return PET_ANIM_SLEEPY;
-    else if (strcmp(a, "eating") == 0)
-        return PET_ANIM_EATING;
-    else if (strcmp(a, "blush") == 0)
-        return PET_ANIM_BLUSH;
-    else if (strcmp(a, "pathead") == 0)
-        return PET_ANIM_PATHEAD;
-    else if (strcmp(a, "scratch") == 0)
-        return PET_ANIM_SCRATCH;
-    else if (strcmp(a, "pointself") == 0)
-        return PET_ANIM_POINTSELF;
-    return PET_ANIM_COUNT;
-}
 
 static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -305,121 +196,6 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                            strcmp(type->valuestring, "audio_end") == 0) {
                     tts_client_ws_end();
                     ESP_LOGI(TAG, "WS 音频流结束");
-                }
-                /* ── chat_text: LLM 流式句子逐句到达, 只累计气泡打字机显示;
-                    音频由 WS 二进制帧直推 (audio_start 已起链)。不递增
-                    chat_seq、不落记忆/日志 — 那些只在 chat_done 做一次,
-                    防重复 ── */
-                else if (cJSON_IsString(type) &&
-                         strcmp(type->valuestring, "chat_text") == 0) {
-                    if (cJSON_IsString(txt)) {
-                        char clean[512];
-                        parse_reply_text(txt->valuestring, clean, sizeof(clean),
-                                         NULL, 0);
-                        /* 气泡累计 — 每次到达都刷新打字机与停留时长,
-                         * chat_done 会以整段文本刷新总时长 */
-                        size_t bl = strlen(s_stream_text);
-                        size_t cl = strlen(clean);
-                        if (cl > 0) {
-                            if (bl + cl + 1 > sizeof(s_stream_text))
-                                cl = sizeof(s_stream_text) - bl - 1; /* 截断保护 */
-                            if (cl > 0) {
-                                memcpy(s_stream_text + bl, clean, cl);
-                                s_stream_text[bl + cl] = '\0';
-                                chat_bubble_show(s_stream_text,
-                                                 2000 + strlen(s_stream_text) * 220);
-                            }
-                        }
-                        ESP_LOGI(TAG, "chat_text: %s", clean);
-                    }
-                } else if (cJSON_IsString(type) && cJSON_IsString(txt)) {
-                    if (strcmp(type->valuestring, "chat_done") == 0 ||
-                        strcmp(type->valuestring, "chat_reply") == 0) {
-                        s_chat_seq++; /* 会话模式等回复的信号 */
-                        s_stream_text[0] = '\0'; /* 新一轮回复 — 重置流式气泡累计 */
-                        /* 服务端回显的用户原文 — 设备端记忆用 */
-                        cJSON *llm_user = cJSON_GetObjectItem(root, "user_text");
-                        if (cJSON_IsString(llm_user)) {
-                            snprintf(s_last_user_text, sizeof(s_last_user_text), "%s",
-                                     llm_user->valuestring);
-                            /* : 512B 截断可能切在 UTF-8 字符中间 —
-                             * 半个字符进记忆文件 = 每次 chat 被服务端拒连 */
-                            utf8_sanitize_inplace(s_last_user_text,
-                                                  strlen(s_last_user_text));
-                        }
-                        /* strip |pXXX and [tags] for log, |pXXX only for TTS */
-                        char clean[512], tts_text[512];
-                        parse_reply_text(txt->valuestring, clean, sizeof(clean),
-                                         tts_text, sizeof(tts_text));
-
-                        /* 解析动画 */
-                        cJSON *llm_anim = cJSON_GetObjectItem(root, "animation");
-                        pet_anim_t anim = PET_ANIM_COUNT;
-                        if (cJSON_IsString(llm_anim))
-                            anim = parse_anim_name(llm_anim->valuestring);
-
-                        /* 名字取预热缓存 (PSRAM 栈禁 nvs_open, init 期已预热) */
-                        ESP_LOGI(TAG, "%s: %s", config_get_str(CFG_KEY_PET_NAME, "萝莉丝"), clean);
-
-                        /* 动画先播 — 与流式 TTS 下载/播放并行, 不再等语音 */
-                        if (anim < PET_ANIM_COUNT &&
-                            strcmp(llm_anim->valuestring, "none") != 0)
-                            pet_avatar_play(anim);
-
-                        /* 设备端记忆: 追加本轮对话 (flash 写在 TTS 开播前, 不卡音频)。
-                         * marker 日志: 崩溃定位 — 若停在 mem_append 之后 / TTS 之前,
-                         * 即为 /cfg 写入 (LittleFS) 卡死或 INTWDT 复位点 */
-                        ESP_LOGI(TAG, "chat: memory_store_append…");
-                        if (s_last_user_text[0] && clean[0])
-                            memory_store_append(s_last_user_text, clean);
-                        ESP_LOGI(TAG, "chat: memory ok → life_log…");
-
-                        /* 全量交互日志 (USB 直读) — 用户原文 + 宠物回复 */
-                        if (s_last_user_text[0])
-                            life_log_line("[%s] %s", config_get_str(CFG_KEY_OWNER_NAME, "主人"), s_last_user_text);
-                        if (clean[0])
-                            life_log_line("[%s] %s", config_get_str(CFG_KEY_PET_NAME, "萝莉丝"), clean);
-                        ESP_LOGI(TAG, "chat: life_log ok → tts…");
-
-                        /* 空文本 = 静默模式 (只做动作不说话) */
-                        if (tts_text[0]) {
-                            /* WS 音频流直推 (audio_start 已收到) → 跳过 POST;
-                             * 未收到 (服务器 TTS 失败) → 兜底整段 POST.
-                             * 气泡已由 chat_text 打字机显示, 不重刷 */
-                            if (s_ws_audio_seen) {
-                                ESP_LOGI(TAG, "agg: WS 音频流已推, 跳过整段 TTS");
-                            } else {
-                                ESP_LOGW(TAG, "agg: 无 WS 音频 — 兜底整段 POST");
-                                bool tts_ok = tts_speak(tts_text);
-                                if (!tts_ok)
-                                    tts_ok = tts_client_interrupt_speak(tts_text);
-                                if (!tts_ok) {
-                                    ESP_LOGE(TAG, "tts FAILED (兜底整段)");
-                                    chat_bubble_show(txt->valuestring, 8000);
-                                }
-                            }
-                        } else {
-                            chat_bubble_show(txt->valuestring, 8000);
-                        }
-
-                        /* Pet engine: 新协议 mood_delta 增量直喂; 旧服务端(mood 绝对值)降级求差 */
-                        cJSON *llm_mood_d = cJSON_GetObjectItem(root, "mood_delta");
-                        cJSON *llm_mood = cJSON_GetObjectItem(root, "mood");
-                        cJSON *llm_exp = cJSON_GetObjectItem(root, "exp");
-                        int8_t exp_d = cJSON_IsNumber(llm_exp)
-                                           ? (int8_t)llm_exp->valueint
-                                           : 0;
-                        if (cJSON_IsNumber(llm_mood_d)) {
-                            pet_process_chat((int8_t)llm_mood_d->valueint, exp_d);
-                        } else if (cJSON_IsNumber(llm_mood)) {
-                            pet_state_t st = pet_engine_get_state();
-                            pet_process_chat((int8_t)llm_mood->valueint - (int8_t)st.mood,
-                                             exp_d);
-                        }
-                        /* 一轮结束 — 下轮 audio_start 重新置位 (防跨轮误判
-                         * 兜底 POST: 上轮 WS 推过、本轮服务器 TTS 失败) */
-                        s_ws_audio_seen = false;
-                    }
                 }
                 cJSON_Delete(root);
             }

@@ -27,8 +27,9 @@ void ws_client_pause(void);
 /** 亮屏恢复: 重新启动组件连接 (WiFi 恢复后调用)。 */
 void ws_client_resume(void);
 
-/** chat_done 累计计数 — 会话模式等待回复的信号 (变化 = 新回复到达) */
-uint32_t ws_client_get_chat_seq(void);
+/** 本轮 WS 音频流消费接口 — 读出即清零 (message_handler 在 chat_done 用):
+ *  true = 本轮收到过 audio_start (音频已 WS 直推, 跳过整段 TTS POST) */
+bool ws_audio_stream_take_seen(void);
 esp_err_t ws_client_send_text(const char *text);
 esp_err_t ws_client_send_json(const char *json);
 

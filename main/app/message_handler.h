@@ -19,7 +19,7 @@ void message_handler_init(void);
 bool message_handler_handle_frame(const char *type, cJSON *root);
 
 /** chat_done 累计计数 — 会话模式等待回复的信号 (变化 = 新回复到达)。
- *  ④-5: chat 分支迁入后改为自持计数, 回收桥。 */
+ *  自持计数 (④-5 起, chat_done 分支迁入本层)。 */
 uint32_t message_handler_get_chat_seq(void);
 
 #ifdef __cplusplus
