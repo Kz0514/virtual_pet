@@ -195,27 +195,6 @@ static pet_anim_t parse_anim_name(const char *a)
     return PET_ANIM_COUNT;
 }
 
-/* get_memory 读盘结果回调 — 写盘任务上下文执行 (仅 socket 发送, 零 flash 访问):
- * flash 读期间 cache 禁用, WS 任务栈在 PSRAM, 任何 flash 访问都会
- * double exception */
-static void ws_memory_read_cb(const char *content, size_t len, void *arg)
-{
-    char *rid = (char *)arg;
-    cJSON *resp = cJSON_CreateObject();
-    cJSON_AddStringToObject(resp, "type", "memory_data");
-    if (rid && rid[0]) cJSON_AddStringToObject(resp, "req_id", rid);
-    cJSON_AddNumberToObject(resp, "size", (double)len);
-    cJSON_AddStringToObject(resp, "content", content ? content : "");
-    char *json = cJSON_PrintUnformatted(resp);
-    cJSON_Delete(resp);
-    if (json) {
-        ESP_LOGI(TAG, "memory_data: %u B (req=%s)", (unsigned)len, rid ? rid : "?");
-        ws_client_send_json(json);
-        cJSON_free(json);
-    }
-    free(rid); /* 调用方 strdup 的 req_id, 回调上下文释放 */
-}
-
 static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     esp_websocket_event_data_t *evt = data;
@@ -311,38 +290,6 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                                      wj_len > 0 ? wifi_json : "[]");
                     ESP_LOGI(TAG, "scan_wifi: sending result (%d bytes, %d APs)", n, count);
                     ws_client_send_json(resp);
-                }
-                /* ── get_memory: 服务端工具 /tools.history 拉取完整对话记忆 ── */
-                else if (cJSON_IsString(type) && strcmp(type->valuestring, "get_memory") == 0) {
-                    /* 读盘委托写盘任务 (回调在写盘任务上下文) — WS 任务栈在
-                     * PSRAM, cache 禁用期对 flash 的 stat/fopen 读会
-                     * double exception */
-                    cJSON *req_id = cJSON_GetObjectItem(root, "req_id");
-                    char *rid = NULL;
-                    if (cJSON_IsString(req_id) && req_id->valuestring[0])
-                        rid = strdup(req_id->valuestring); /* 回调上下文释放 */
-                    if (memory_store_read_async(ws_memory_read_cb, rid) != ESP_OK) {
-                        free(rid);
-                        /* 入队失败仍要应答, 否则服务端工具调用挂起 */
-                        cJSON *resp = cJSON_CreateObject();
-                        cJSON_AddStringToObject(resp, "type", "memory_data");
-                        if (cJSON_IsString(req_id))
-                            cJSON_AddStringToObject(resp, "req_id", req_id->valuestring);
-                        cJSON_AddNumberToObject(resp, "size", 0);
-                        cJSON_AddStringToObject(resp, "content", "");
-                        char *json = cJSON_PrintUnformatted(resp);
-                        cJSON_Delete(resp);
-                        if (json) {
-                            ws_client_send_json(json);
-                            cJSON_free(json);
-                        }
-                    }
-                }
-                /* ── memory_update: 服务端压缩后下发覆盖 ── */
-                else if (cJSON_IsString(type) && strcmp(type->valuestring, "memory_update") == 0) {
-                    cJSON *content = cJSON_GetObjectItem(root, "content");
-                    if (cJSON_IsString(content))
-                        memory_store_overwrite(content->valuestring);
                 }
                 /* ── audio_start / audio_end: WS 音频流边界 — LLM 流式期间
                     增量合成的 PCM 经二进制帧直推, 本帧只做起链/收尾 ── */
