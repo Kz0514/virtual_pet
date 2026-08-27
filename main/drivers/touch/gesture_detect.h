@@ -21,8 +21,6 @@ typedef enum {
     GESTURE_VOICE_TRIGGER,    /* 长按左侧键：手动触发语音对话 */
     GESTURE_MUTE_TOGGLE,      /* 三击左侧键切换静音 */
     GESTURE_SINGLE_TAP,       /* 菜单模式下单击确认（非菜单模式不产生; 菜单模式下零延迟发射） */
-    GESTURE_PETTING_HEAD,     /* >=3 个顶部通道被触摸超过 500ms */
-    GESTURE_SHAKE,            /* MPU6500 检测到摇晃 */
     GESTURE_SWIPE_LEFT,       /* 顶部滑块左滑 */
     GESTURE_SWIPE_RIGHT,      /* 顶部滑块右滑 */
     GESTURE_NAV_UP,           /* 右侧滑条轻点上半段(释放分类, 中央死区忽略) */
@@ -44,7 +42,9 @@ bool gesture_poll_event(gesture_event_t *out_event);
 typedef void (*gesture_event_cb_t)(gesture_event_t ev);
 void gesture_set_event_handler(gesture_event_cb_t cb);
 
-/** 更新屏幕/菜单状态，供手势上下文使用 */
+/** 更新屏幕/菜单状态，供手势上下文使用
+ *  screen_on 仅 main.c 调用 (屏幕状态机唯一写入方); menu_active
+ *  仅 input_handler 调用 (页面状态唯一写入方)。均为镜像, 见 .c 注释。 */
 void gesture_set_screen_on(bool on);
 void gesture_set_menu_active(bool active);
 bool gesture_is_menu_active(void);

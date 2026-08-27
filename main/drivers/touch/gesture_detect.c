@@ -32,15 +32,22 @@ typedef struct {
     int tap_count;                 /* 当前序列中的连续点击次数 */
     float swipe_start_pos;         /* 滑动起始位置 */
     float swipe_current_pos;       /* 滑动当前位置 */
-    bool screen_on;                /* 当前屏幕状态 */
-    bool menu_active;              /* UI 菜单是否打开 */
+    /* 状态镜像 (只读, 唯一写入方见注释):
+     *  screen_on   = main.c 屏幕状态机的只读镜像 — 唯一写入方 main.c
+     *                (唤醒/息屏翻转点), 本驱动与 pat_detector 只读。禁止
+     *                新增第二写入方, 分叉会导致息屏假唤/唤醒失效;
+     *  menu_active = input_handler 页面状态的只读镜像 — 唯一写入方
+     *                input_handler (进出设置页), 本驱动只读。
+     *  完整状态上移 input_handler 的语义降级见 backlog。 */
+    bool screen_on;
+    bool menu_active;
     gesture_event_t pending_event; /* 待报告的事件 */
     bool event_pending;
 } gesture_ctx_t;
 
 static gesture_ctx_t s_gctx = {
     .state = GS_IDLE,
-    .screen_on = true, /* 启动后屏幕默认开启 */
+    .screen_on = true, /* 引导期镜像初值 (屏幕亮) — 首次 note_interaction 前有效 */
     .menu_active = false,
     .event_pending = false,
 };
@@ -218,13 +225,7 @@ void gesture_process(void)
         s_gctx.tap_count = 0;
     }
 
-    /* 摸头事件: touch_fpc 内部判定 >=3 顶部通道持续 500ms; 2s 冷却防重复 */
-    static uint32_t s_last_petting_us = 0;
-    if (touch_is_petting_head() &&
-        (uint32_t)(now_us - s_last_petting_us) > 2000000) {
-        s_last_petting_us = now_us;
-        emit_event(GESTURE_PETTING_HEAD);
-    }
+    /* 摸头事件已收敛至 pat_detector (顶部滑条来回滑动) — 见 ③-2 */
 
     /* ── 右侧滑条: 轻点 NAV_UP/DOWN + 滑动 NAV_SLIDE_UP/DOWN ──
      * 独立于左键状态机 (不同电极, 并行不冲突)。

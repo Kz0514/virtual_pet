@@ -657,29 +657,6 @@ bool touch_is_right_pressed(void)
     return false;
 }
 
-bool touch_is_petting_head(void)
-{
-    int n = 0;
-    for (int i = 1; i <= TOUCH_TOP_CH_COUNT; i++) {
-        if (s_ts.touched[i]) n++;
-    }
-    if (n < 3) return false;
-    uint32_t ms = UINT32_MAX;
-    for (int i = 1; i <= TOUCH_TOP_CH_COUNT; i++) {
-        if (s_ts.touched[i] && s_ts.touch_start_tick[i] < ms) ms = s_ts.touch_start_tick[i];
-    }
-    return (xTaskGetTickCount() - ms) * portTICK_PERIOD_MS > 500;
-}
-
-bool touch_is_top_middle_pressed(void)
-{
-    /* 顶部通道 1-5 的中间三个 (GPIO4/5/6 = 通道索引 2-4) */
-    for (int i = 2; i <= 4; i++) {
-        if (s_ts.touched[i]) return true;
-    }
-    return false;
-}
-
 void touch_get_raw(uint32_t *out) { memcpy(out, s_ts.raw, sizeof(s_ts.raw)); }
 void touch_get_baseline(uint32_t *out)
 {

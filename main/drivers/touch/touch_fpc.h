@@ -44,12 +44,6 @@ float touch_right_position(void);
 /** 右侧是否有手指触摸 */
 bool touch_is_right_pressed(void);
 
-/** 检测到"抚摸头部"手势（>=3 个顶部通道超过 500ms） */
-bool touch_is_petting_head(void);
-
-/** 顶部滑条中间三电极 (GPIO4/5/6) 任一被触摸 */
-bool touch_is_top_middle_pressed(void);
-
 /** 获取原始触摸读数（用于校准/调试） */
 void touch_get_raw(uint32_t *raw_out);
 /** 获取基线值 */
