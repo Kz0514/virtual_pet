@@ -14,7 +14,7 @@
  * (动态频率兜底扫描 + 摇动), 见 touch_fpc_pause
  * - 息屏关 PA: 静音不停 PA 的残余漂移经喇叭电磁耦合右侧触摸通道,
  * 会超阈值假唤醒 — 见 screen_off
- * - TTS 播放/录音期由 tts_client/voice_chat/session_mgr 持 PM 锁
+ * - TTS 播放/录音期由 tts_client/asr_client/session_mgr 持 PM 锁
  * 禁止轻睡 (冻结 I2S DMA 会破音/丢录音), 见各模块
  * - 深度睡眠预留: 唤醒=重启, 需处理会话/记忆/重连, 后续版本实现
  */

@@ -55,7 +55,6 @@
 #include "chat_bubble.h"
 #include "notify_overlay.h"
 #include "brightness_bar.h"
-#include "voice_chat.h"
 #include "tts_client.h"
 #include "noise_detector.h"
 #include "shake_detector.h"

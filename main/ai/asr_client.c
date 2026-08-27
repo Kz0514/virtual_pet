@@ -1,69 +1,25 @@
 /**
- * Voice chat — press-and-hold recording → ASR → LLM via WebSocket.
+ * ASR client — 上传 PCM 到服务器识别为文本 (HTTP multipart)。
+ * 原 voice_chat 录音通路 (press-and-hold → record_and_asr → WS 发送)
+ * 已被会话模式 VAD 录音取代 (session_mgr), 旧通路 ④-1 随搬迁删除。
  */
-#include "voice_chat.h"
+#include "asr_client.h"
 #include "board.h"
 #include "server_config.h"
 #include "api_client.h"
-#include "es8311_drv.h"
-#include "ws_client.h"
-#include "tts_client.h"
-#include "notify_overlay.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
-#include "esp_heap_caps.h"
-#include "esp_pm.h"
 #include "cJSON.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include <string.h>
 #include <stdlib.h>
 
-static const char *TAG = "voice";
+static const char *TAG = "asr";
 
-#define RECORD_SECONDS 3
 #define SAMPLE_RATE 48000
-#define FRAME_MS 20
-#define FRAME_SAMPLES (SAMPLE_RATE * FRAME_MS / 1000) /* 320 */
 
-static bool s_inited = false;
 static volatile bool s_recording = false;
 
-/* 录音期 PM 锁 — 轻睡冻结 I2S DMA 会丢录音 */
-static esp_pm_lock_handle_t s_pm_lock = NULL;
-
-bool voice_chat_is_recording(void) { return s_recording; }
-
-static void ensure_inited(void)
-{
-    if (s_inited) return;
-
-    es8311_drv_cfg_t cfg = {
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = 16,
-        .channels = 1,
-        .frame_ms = FRAME_MS,
-        .mic_only = true,
-        .mic_gain_db = 24.0f,
-    };
-    if (es8311_drv_init(&cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "ES8311 init fail");
-        return;
-    }
-
-    /* Let HPF + VREF settle — I2S 未 enable 时读会失败, 需临时占用;
-     * 只占 RX (open DAC 会 enable TX 播放残留数据 → 异响) */
-    es8311_drv_hold_rx();
-    int16_t dummy[FRAME_SAMPLES];
-    for (int i = 0; i < 50; i++)
-        es8311_drv_read(dummy, FRAME_SAMPLES);
-    es8311_drv_release_rx();
-
-    s_inited = true;
-    ESP_LOGI(TAG, "Voice chat ready");
-}
-
-void voice_chat_init(void) { /* kept for header compat, lazy init on first use */ }
+bool asr_is_recording(void) { return s_recording; }
 
 /* ── HTTP response buffer ── */
 static char s_resp[1024];
@@ -104,7 +60,7 @@ static void wav_hdr(uint8_t *b, uint32_t data_sz)
     memcpy(b + 40, &data_sz, 4);
 }
 
-char *voice_asr_transcribe_pcm(const int16_t *pcm, uint32_t sample_count)
+char *asr_transcribe_pcm(const int16_t *pcm, uint32_t sample_count)
 {
     if (!pcm || sample_count == 0) return NULL;
 
@@ -172,66 +128,4 @@ char *voice_asr_transcribe_pcm(const int16_t *pcm, uint32_t sample_count)
     cJSON_Delete(r);
     ESP_LOGI(TAG, "ASR: %s", text ? text : "(empty)");
     return text;
-}
-
-char *voice_chat_record_and_asr(void)
-{
-    ensure_inited();
-    if (!s_inited) return NULL;
-
-    /* 录音前静音扬声器通路并停 TTS — 麦克风与扬声器物理近距,
-     * 播放尾音/PA 底噪会被录进 ASR, 边播边录会把上一句内容整段录进去 */
-    if (tts_client_is_busy()) {
-        ESP_LOGI(TAG, "录音前停止 TTS");
-        tts_client_stop();
-        for (int i = 0; i < 60 && tts_client_is_busy(); i++)
-            vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    es8311_drv_set_vol(0); /* 音量门控静音 (PA 常开, DAC 已断电) */
-
-    int total_samples = SAMPLE_RATE * RECORD_SECONDS;
-    uint8_t *buf = heap_caps_malloc(44 + total_samples * 2, MALLOC_CAP_SPIRAM);
-    if (!buf) return NULL;
-    int16_t *pcm = (int16_t *)(buf + 44);
-
-    /* Record — 录音期禁轻睡 (I2S DMA 冻结丢录音) */
-    ESP_LOGI(TAG, "Recording %ds...", RECORD_SECONDS);
-    if (!s_pm_lock) esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "voice_rec", &s_pm_lock);
-    if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock);
-    es8311_drv_hold_rx(); /* 录音只占 RX — 不碰 DAC 防 TX 播放残留异响 */
-    s_recording = true;
-    notify_show(NOTIFY_INFO, "录音中...", 3000);
-    int total = 0;
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(RECORD_SECONDS * 1000 + 500);
-    while (xTaskGetTickCount() < deadline) {
-        int rem = total_samples - total;
-        if (rem <= 0) break;
-        int n = es8311_drv_read(pcm + total, rem < FRAME_SAMPLES ? rem : FRAME_SAMPLES);
-        if (n > 0) total += n / sizeof(int16_t);
-    }
-    s_recording = false;
-    es8311_drv_release_rx();
-    if (s_pm_lock) esp_pm_lock_release(s_pm_lock);
-
-    char *text = voice_asr_transcribe_pcm(pcm, (uint32_t)total);
-    free(buf);
-    return text;
-}
-
-/* ── FreeRTOS task ── */
-void voice_chat_task(void *pvParameter)
-{
-    char *text = voice_chat_record_and_asr();
-    if (text && text[0]) {
-        /* Wait for WS to reconnect if needed (up to 5s) */
-        for (int retry = 0; retry < 50 && !ws_client_is_connected(); retry++) {
-            if (retry == 0) ESP_LOGW(TAG, "WS disconnected, waiting...");
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        if (ws_client_is_connected()) {
-            ws_client_send_chat(text);
-        }
-        free(text);
-    }
-    vTaskDelete(NULL);
 }

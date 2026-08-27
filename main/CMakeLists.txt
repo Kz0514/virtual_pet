@@ -1,7 +1,6 @@
 idf_component_register(
     SRCS
         "main.c"
-        "voice_chat.c"
         "lvgl_mem.c"
         # System
         "system/gpio_utils.c"
@@ -54,6 +53,7 @@ idf_component_register(
         # AI
         "ai/wake_word.c"
         "ai/prompt_builder.c"
+        "ai/asr_client.c"
         "ai/tts_client.c"
         "ai/session_mgr.c"
         # UI Screens

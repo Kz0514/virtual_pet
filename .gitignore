@@ -45,6 +45,9 @@ PROJECT_MAP.md
 *.bak
 *.tmp
 
+# 本机临时工作区 (构建脚本/串口日志, 不入库)
+tmp/
+
 # Log files
 *.log
 

@@ -1,7 +1,7 @@
 /** @file noise_detector.c @brief 噪音检测 + 级联累加器 → CSV */
 #include "noise_detector.h"
 #include "es8311_drv.h"
-#include "voice_chat.h"
+#include "asr_client.h"
 #include "tts_client.h"
 #include "session_mgr.h"
 #include "esp_log.h"
@@ -107,7 +107,7 @@ static void noise_task(void *pv)
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_INTERVAL_MS));
 
-        if (voice_chat_is_recording() || tts_client_is_playing() ||
+        if (asr_is_recording() || tts_client_is_playing() ||
             session_mgr_is_capturing()) continue;
 
         /* 采样只占 RX — open DAC 会 enable TX 播放残留数据 (异响) */
@@ -121,7 +121,7 @@ static void noise_task(void *pv)
         int total = 0;
         for (int i = 0; i < TOTAL_FRAMES; i++) {
             /* 每次读取前再检查 — 防止TTS在检查后启动导致I2S竞争噪音 */
-            if (voice_chat_is_recording() || tts_client_is_playing() ||
+            if (asr_is_recording() || tts_client_is_playing() ||
                 session_mgr_is_capturing()) break;
             int n = es8311_drv_read(s_noise_buf, FRAME_SAMPLES);
             if (n <= 0) break;

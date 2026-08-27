@@ -17,7 +17,7 @@
 #include "session_mgr.h"
 #include "es8311_drv.h"
 #include "tts_client.h"
-#include "voice_chat.h"
+#include "asr_client.h"
 #include "ws_client.h"
 #include "notify_overlay.h"
 #include "chat_bubble.h"
@@ -305,7 +305,7 @@ static void sess_task(void *pv)
             /* ════ ASR (只传人声段) ════ */
             sess_set_state(SESS_ASR);
             notify_show(NOTIFY_INFO, "思考中…", 15000);
-            char *text = voice_asr_transcribe_pcm(s_rec, s_rec_len);
+            char *text = asr_transcribe_pcm(s_rec, s_rec_len);
             if (!text || !text[0]) {
                 if (text) free(text);
                 if (++asr_fails >= 3) {
