@@ -153,38 +153,9 @@ static esp_err_t i2c_bus_init(void)
 
 i2c_master_bus_handle_t board_get_i2c_bus(void) { return s_i2c_bus; }
 
-/* ── 屏幕节能状态机: 亮 → (off_s-30s) 渐变变暗 → 保持暗态 → off_s 渐变息屏 ── */
-static bool s_screen_on = true;
-static bool s_screen_dim = false;    /* 已处于变暗态 */
-static bool s_off_fade_done = false; /* 息屏渐变(目标0)是否已完成 — 变暗后保持暗态直到 off 超时 */
-static uint32_t s_last_interact = 0;
-
-#define DIM_RATIO_PCT 30 /* 变暗 = 设定亮度的 30% */
-#define DIM_CAP_PCT 10   /* 变暗上限 10% */
-/* 息屏时序 (设置页可调, NVS "off_s" 持久化, 默认 90s):
- * dim = off−30s (下限 15s) */
-static uint32_t s_dim_after_ms = 60000; /* 无操作多久 → 开始变暗 */
-static uint32_t s_off_after_ms = 90000; /* 无操作多久 → 开始息屏 */
-#define FADE_STEP_MS 20                 /* 渐变步进 20ms (50Hz) */
-#define FADE_STEPS 100                  /* 总步数 100 → 每阶段 2s, 线性 */
-
-/** 设置自动息屏时长 (设置页调值): off_s = 彻底息屏秒数 */
-void main_screen_set_off_timeout_s(uint32_t off_s)
-{
-    if (off_s < 30)
-        off_s = 30;
-    uint32_t dim_s = (off_s > 30) ? off_s - 30 : 15;
-    s_off_after_ms = off_s * 1000;
-    s_dim_after_ms = dim_s * 1000;
-    ESP_LOGI(TAG, "息屏时序: %lus 变暗 / %lus 息屏", dim_s, off_s);
-}
-
-/* 渐变状态 (LVGL 定时器驱动) */
-static bool s_fade_active = false;
-static volatile bool s_fade_cancel = false;
-static uint8_t s_fade_cur, s_fade_target;
-static uint8_t s_fade_steps_left;
-static uint8_t s_fade_step_size; /* 线性步进量 (×10 精度) */
+/* 屏幕显示电源状态机已并入 power_manager.c (③-4′) — 外部一律经
+ * power_manager_screen_state/note_interaction/poll/set_off_timeout_s
+ * 交互, main.c 不再持有该域状态。 */
 
 /* : WiFi TSF 激活查询 — 声明于 esp_private/wifi.h:524 (预编译库实现)。
  * 息屏后直查: 1 = WiFi skip 回调在阻断轻睡 (见 wifi_manager_detach_light_sleep_skip) */
@@ -282,7 +253,6 @@ static int32_t s_seg_ma_sum = 0;     /* 段内电流累计 */
 static uint32_t s_seg_ma_cnt = 0, s_seg_mv_cnt = 0, s_seg_soc_sum = 0;
 static uint32_t s_seg_mv_sum = 0;
 static uint32_t s_seg_wake_cnt = 0;  /* 段内唤醒次数 */
-static uint8_t s_seg_wake_src = 0;   /* 本次唤醒来源 (1=探针, 0=其他) */
 static bool s_bat_last_ok = false;   /* W 行电量取最近一次 bq27220 读数 */
 static uint16_t s_bat_last_mv = 0;
 static int16_t s_bat_last_ma = 0;
@@ -305,8 +275,10 @@ static void power_seg_write_row(const char *buf, int len)
         remove("/data/power_seg.csv");
 }
 
-/* 唤醒翻转点调用: 记录 W 行 (主要靠二次分析来源) */
-static void power_seg_note_wake(void)
+/* 唤醒翻转点调用: 记录 W 行 (主要靠二次分析来源)。
+ * ③-4′ 桥: 实现已迁 power_manager (note_interaction 内临时 extern 调用) —
+ * 非 static 仅为此跨文件桥; ⑤-1 迁出 power_diag 时随记账函数一并收敛。 */
+void power_seg_note_wake_source(uint8_t wake_src)
 {
     s_seg_wake_cnt++;
     char line[160];
@@ -317,7 +289,7 @@ static void power_seg_note_wake(void)
                       (int)(s_bat_last_ok ? s_bat_last_ma : 0),
                       (int)(s_bat_last_ok ? s_bat_last_mv : 0),
                       (unsigned)(s_bat_last_ok ? s_bat_last_soc : 0),
-                      (unsigned)s_seg_wake_src);
+                      (unsigned)wake_src);
     power_seg_write_row(line, ln);
 }
 
@@ -330,7 +302,7 @@ static void power_seg_tick(const bq27220_data_t *bat)
     s_bat_last_ma = (int16_t)bat->current_ma;
     s_bat_last_soc = (uint8_t)bat->soc_pct;
     if (s_seg_last_us && s_seg_start_us) {
-        if (s_screen_on)
+        if (power_manager_is_screen_on())
             s_seg_on_us += (nowus - s_seg_last_us);
         s_seg_ma_sum += bat->current_ma;
         s_seg_ma_cnt++;
@@ -363,64 +335,6 @@ static void power_seg_tick(const bq27220_data_t *bat)
         s_seg_wake_cnt = 0;
         s_seg_start_us = nowus;
     }
-}
-
-static void fade_tick(lv_timer_t *t)
-{
-    if (s_fade_cancel) {
-        s_fade_cancel = false;
-        s_fade_active = false;
-        lv_timer_delete(t);
-        return;
-    }
-    if (s_fade_cur > s_fade_target) {
-        uint8_t dec = (s_fade_step_size + 5) / 10; /* 四舍五入 */
-        if (dec < 1)
-            dec = 1;
-        s_fade_cur = (s_fade_cur > s_fade_target + dec)
-                         ? s_fade_cur - dec
-                         : s_fade_target;
-        st7789_backlight_set(s_fade_cur);
-    }
-    if (--s_fade_steps_left == 0) {
-        st7789_backlight_set(s_fade_target);
-        s_fade_active = false;
-        if (s_fade_target == 0)
-            s_off_fade_done = true; /* 仅息屏渐变完成置位 */
-    }
-}
-
-/** 屏幕是否亮着 — home_interaction gated 查询 (息屏期禁摇动/敲击唤醒:
- * 轻睡周期电气瞬态 → 喇叭"啪" → DMP 振动 → tap/shake 假触发 → 假唤醒) */
-bool main_screen_is_on(void) { return s_screen_on; }
-
-/** 有操作: 唤醒/恢复亮度并重置空闲计时 (input_handler/home_interaction 亦调用) */
-void main_screen_note_interaction(void)
-{
-    if (s_fade_active) {
-        s_fade_cancel = true;
-        s_fade_active = false;
-        st7789_backlight_set(brightness_bar_get());
-    }
-    if (!s_screen_on) {
-        ESP_LOGI(TAG, "唤醒屏幕");
-        st7789_backlight_set(brightness_bar_get());
-        gesture_set_screen_on(true);
-        s_screen_on = true;
-        s_screen_dim = false;
-        s_off_fade_done = false;
-        /* power_seg.csv W 行: 任一唤醒翻转点 (探针 src=1 已前置标记) */
-        power_seg_note_wake();
-        s_seg_wake_src = 0;
-        /* WiFi 保持连接态浅睡 (息屏不再 stop) — 唤醒零重连延迟:
-         * 语音回执/消息推送不再等 3-5s WiFi 重连 + WS 重挂 */
-        power_manager_screen_on(); /* 恢复动画 + LVGL 刷新 + 全屏重绘 */
-    } else if (s_screen_dim) {
-        ESP_LOGI(TAG, "恢复亮度");
-        st7789_backlight_set(brightness_bar_get());
-        s_screen_dim = false;
-    }
-    s_last_interact = xTaskGetTickCount();
 }
 
 void app_main(void)
@@ -497,7 +411,7 @@ void app_main(void)
     }
     config_mgr_init();
     /* 自动息屏时长 (设置页可调): off_s = 彻底息屏秒数, 默认 90 */
-    main_screen_set_off_timeout_s(config_get_u32(CFG_KEY_OFF_S, 90));
+    power_manager_set_off_timeout_s(config_get_u32(CFG_KEY_OFF_S, 90));
     /* 宠物名/主人称谓预热 — 首次读会 nvs_open 读 flash, 必须在此 (内部栈) 完成;
      * 后续 PSRAM 栈任务 (ws_client 回调) 只做纯 RAM 缓存读 */
     config_get_str(CFG_KEY_PET_NAME, "萝莉丝");
@@ -653,7 +567,7 @@ void app_main(void)
     uint32_t last_tick = 0;
     uint32_t last_touch_dbg = 0;
     bool registered = false;
-    s_last_interact = xTaskGetTickCount();
+    power_manager_note_interaction(); /* 启动: 空闲计时归零 (亮屏亮态下仅重置计时) */
 
     while (1) {
         /* 手势处理已移入 LVGL 20ms 定时器 (gesture_timer_cb) */
@@ -696,82 +610,14 @@ void app_main(void)
                 /* v2: 硬件触摸唤醒 (睡眠退出回调置位, 主循环消费) —
                  * 轻触/快速点击在 50Hz 扫描停止期间也能可靠唤醒 */
                 ESP_LOGI(TAG, "触摸硬件唤醒 (pad %u) — 亮屏", (unsigned)wake_pad);
-                main_screen_note_interaction();
-            } else if (contacted && s_screen_on) {
+                power_manager_note_interaction();
+            } else if (contacted && power_manager_is_screen_on()) {
                 /* 息屏期不直判 contacted — 唤醒统一走动态频率探针
                  * (touch_fpc_sleep_probe: 限速基线 + 抖动自适应阈值 +
                  * 2 连击去抖; 拔电后 raw 持续偏移时此处会重复误报) */
-                main_screen_note_interaction();
+                power_manager_note_interaction();
             } else {
-                uint32_t idle = xTaskGetTickCount() - s_last_interact;
-
-                /* ── 渐变完成后的状态推进 ──
-                 * 只认息屏渐变 (目标 0) 完成标志 — 变暗渐变完成后保持暗态,
-                 * 直到 off 超时才彻底息屏 */
-                if (s_screen_on && s_screen_dim && s_off_fade_done) {
-                    ESP_LOGI(TAG, "息屏完成");
-                    st7789_backlight_set(0);
-                    gesture_set_screen_on(false);
-                    s_screen_on = false;
-                    s_screen_dim = false;
-                    s_off_fade_done = false;
-                    power_manager_screen_off(); /* 停动画 + 停 LVGL 刷新 */
-
-                    /* WiFi 保持连接态浅睡: 不再 stop — 唤醒零重连延迟
-                     * (语音回执/消息推送立即可用), 代价 = modem sleep 的
-                     * DTIM 周期唤醒电流 (~15-25mA vs 停 WiFi 全停)。
-                     * wifi 驱动 skip 回调保留 (TSF active 期间跳过轻睡
-                     * 保传输完整, beacon 间隔空闲期轻睡正常进入)。
-                     * WS 心跳 (30s ping) 继续维持服务器端连接。 */
-                }
-
-                /* ── 触发渐变 ── */
-                if (s_screen_on && !s_fade_active) {
-                    if (!s_screen_dim && idle > pdMS_TO_TICKS(s_dim_after_ms)) {
-                        /* 无操作超时 → 线性渐变变暗 (4s) */
-                        uint8_t bri = brightness_bar_get();
-                        uint8_t target = (uint8_t)(bri * DIM_RATIO_PCT / 100);
-                        if (target > DIM_CAP_PCT)
-                            target = DIM_CAP_PCT;
-                        if (target < 1)
-                            target = 1;
-                        s_fade_cur = bri;
-                        s_fade_target = target;
-                        s_fade_steps_left = FADE_STEPS;
-                        s_fade_step_size = (uint8_t)(((uint16_t)(bri - target) * 10) / FADE_STEPS);
-                        if (s_fade_step_size < 1)
-                            s_fade_step_size = 1;
-                        s_fade_cancel = false;
-                        s_fade_active = true;
-                        s_screen_dim = true; /* 标记进入 dim 态 */
-                        lvgl_port_lock(0);   /* main 线程创建 LVGL 定时器须持锁 */
-                        lv_timer_t *t = lv_timer_create(fade_tick, FADE_STEP_MS, NULL);
-                        if (t)
-                            lv_timer_set_repeat_count(t, FADE_STEPS);
-                        lvgl_port_unlock();
-                        ESP_LOGI(TAG, "变暗渐变 %u→%u%% (%lus 无操作)",
-                                 bri, target, s_dim_after_ms / 1000);
-                    } else if (s_screen_dim && idle > pdMS_TO_TICKS(s_off_after_ms)) {
-                        /* 无操作超时 → 线性渐变息屏 (暗态保持期结束) */
-                        s_off_fade_done = false; /* 重开息屏渐变时复位 */
-                        uint8_t cur = s_fade_cur;
-                        s_fade_cur = cur;
-                        s_fade_target = 0;
-                        s_fade_steps_left = FADE_STEPS;
-                        s_fade_step_size = (uint8_t)(((uint16_t)cur * 10) / FADE_STEPS);
-                        if (s_fade_step_size < 1)
-                            s_fade_step_size = 1;
-                        s_fade_cancel = false;
-                        s_fade_active = true;
-                        lvgl_port_lock(0); /* main 线程创建 LVGL 定时器须持锁 */
-                        lv_timer_t *t = lv_timer_create(fade_tick, FADE_STEP_MS, NULL);
-                        if (t)
-                            lv_timer_set_repeat_count(t, FADE_STEPS);
-                        lvgl_port_unlock();
-                        ESP_LOGI(TAG, "息屏渐变 %u→0%% (%lus 无操作)",
-                                 cur, s_off_after_ms / 1000);
-                    }
-                }
+                power_manager_poll(); /* 空闲判定 + 渐变触发 + 息屏推进 (状态机已于 ③-4′ 归位) */
             }
         }
         } /* : 触摸调试块闭合 — 判定/唤醒逻辑保持 1Hz 节拍 */
@@ -839,10 +685,8 @@ void app_main(void)
          * probe_interval 节拍驱动 (20Hz 快探/深闲 2Hz — 独立任务保证节拍
          * 不被主循环拖慢)。本循环只消费唤醒结果: 判定+去抖+免疫窗全在
          * 触摸模块内完成 */
-        if (!s_screen_on && touch_fpc_wake_pending()) {
-            ESP_LOGI(TAG, "触摸唤醒 (动态探针, 150ms 窗内 2 连击确认)");
-            s_seg_wake_src = 1; /* power_seg.csv W 行来源: 探针 */
-            main_screen_note_interaction();
+        if (!power_manager_is_screen_on() && touch_fpc_wake_pending()) {
+            power_manager_note_probe_wake(); /* 日志 + W 行 src=1 记账 + 唤醒全流程 */
             /* DMP 轮询跟随息屏档 (唤醒=回亮屏 50ms) */
             dmp_mpu_set_off_interval(250);
         }
@@ -893,7 +737,7 @@ void app_main(void)
                 if (env_log_now)
                     ESP_LOGI(TAG, "⚡ %umV %u%% %dmA",
                              bat.voltage_mv, bat.soc_pct, bat.current_ma);
-                power_log_append(&bat, s_screen_on ? (s_screen_dim ? 1 : 0) : 2);
+                power_log_append(&bat, power_manager_screen_state());
                 power_seg_tick(&bat); /* power_seg.csv 段统计 */
                 /* 充电状态翻转 = USB 拔/插 → 供电链路瞬态 (VBUS 消失/恢复 +
                  * 充电路径切换) 会跳变触摸 raw → 探针假唤醒; 翻转时通知
@@ -922,7 +766,7 @@ void app_main(void)
                 usb_storage_set_charging(bat.soc_pct >= 100 ||
                                          bat.current_ma >= -5);
                 /* 息屏每 60s 诊断一次: 轻睡计数 + PM 锁列表 */
-                if (!s_screen_on) {
+                if (!power_manager_is_screen_on()) {
                     static uint8_t diag_cnt = 0;
                     if (++diag_cnt >= 7) { /* 息屏 15s 一次诊断 (加密锁采样) */
                         diag_cnt = 0;
@@ -1046,6 +890,6 @@ void app_main(void)
 
         /* 亮屏 100ms 粒度 (轮询/状态机节拍); 息屏跟随触摸探针动态间隔:
          * 快探 50ms / 深闲 500ms — 深闲时睡眠窗口 50ms→500ms (主功耗收益) */
-        vTaskDelay(pdMS_TO_TICKS(s_screen_on ? 100 : touch_fpc_probe_interval_ms()));
+        vTaskDelay(pdMS_TO_TICKS(power_manager_is_screen_on() ? 100 : touch_fpc_probe_interval_ms()));
     }
 }

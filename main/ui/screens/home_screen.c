@@ -14,6 +14,7 @@
 #include "chat_bubble.h"
 #include "notify_overlay.h"
 #include "brightness_bar.h"
+#include "power_manager.h"
 #include "esp_lvgl_port.h"
 #include "esp_log.h"
 #include "lvgl.h"
@@ -22,9 +23,6 @@ static const char *TAG = "home";
 
 /* 主屏幕引用 (供设置等子界面返回时恢复) — 初始化时取 lv_scr_act() */
 static lv_obj_t *s_main_scr = NULL;
-
-/* 屏幕节能 API 由 main.c 提供 (③-4 将归入 ui/screen_power.h 正式声明) */
-extern void main_screen_note_interaction(void);
 
 esp_err_t home_screen_init(void)
 {
@@ -56,6 +54,6 @@ void home_screen_restore(void)
         lvgl_port_lock(0); /* main 线程调 lv_ API 必须持锁 (见 loading_screen.c 注释) */
         screen_load_full(s_main_scr);
         lvgl_port_unlock();
-        main_screen_note_interaction();
+        power_manager_note_interaction();
     }
 }

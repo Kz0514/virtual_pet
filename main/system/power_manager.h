@@ -1,7 +1,8 @@
-/** @file power_manager.h @brief 电源管理: 轻睡眠 + 屏幕关闭降载 接口 */
+/** @file power_manager.h @brief 电源管理: 轻睡眠 + 屏幕显示电源时序 接口 */
 #pragma once
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 /** 初始化电源管理:
  * - esp_pm_configure(true) 一次使能轻睡眠框架; 运行时开关改用 PM 锁,
@@ -54,3 +55,33 @@ uint32_t power_manager_get_wake_cause(void);
  * 误判"卡死")。SOF 消失 (拔线) 释放恢复轻睡。
  * main.c 主循环 100ms 块检测 SOF 翻转调用, 幂等。 */
 void power_manager_usb_connection(bool connected);
+
+/* ── 屏幕显示电源时序 (亮/暗/息三态 + 线性渐变 + 空闲超时) ──
+ * 状态机 + fade 定时器 + 空闲计时整体驻留本模块 (自 main.c 并入,
+ * ③-4′: 与它操控的背光/面板/轻睡锁/LVGL 刷新同处一域)。本模块是
+ * s_screen_on 等状态的唯一真相源 — 外部一律经下述 API 查询, 禁止
+ * 复制状态镜像。 */
+
+/** 屏幕状态: 0=亮 1=变暗 2=息屏 (power_log.csv state 列同义) */
+int power_manager_screen_state(void);
+
+/** 屏幕亮着? (等价 state != 2 — 变暗视为亮)。主循环节拍/交互 gating 用。 */
+bool power_manager_is_screen_on(void);
+
+/** 有操作: 唤醒/恢复亮度并重置空闲计时。触摸/摇动/敲击/语音等
+ * 任意交互入口调用 (main.c 主循环 + input_handler/home_interaction/
+ * pat_detector/home_screen)。 */
+void power_manager_note_interaction(void);
+
+/** 息屏触摸探针唤醒入口: 记账 src=1 (power_seg.csv W 行来源) +
+ * note_interaction 全流程。main.c 探针消费点专用。 */
+void power_manager_note_probe_wake(void);
+
+/** 设置自动息屏时长 (设置页调值): off_s = 彻底息屏秒数; dim = off−30s
+ * (下限 15s)。限幅 [30, UINT32_MAX/1000]s。 */
+void power_manager_set_off_timeout_s(uint32_t off_s);
+
+/** 主循环节拍驱动: 空闲超时 → dim/off 渐变触发 + 渐变完成后的息屏
+ * 推进 (调用方持 LVGL 锁或与 LVGL 上下文无冲突即可 — fade 定时器创建
+ * 内部自行持锁)。亮屏 100ms / 息屏探针节拍同改前一致。 */
+void power_manager_poll(void);

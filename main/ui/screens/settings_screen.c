@@ -33,6 +33,7 @@
 #include "tm6604.h"
 #include "usb_storage.h"
 #include "ota_client.h"
+#include "power_manager.h"
 #include "esp_log.h"
 #include "esp_system.h" /* esp_restart — 设置页重启设备 */
 #include "esp_app_desc.h"
@@ -49,8 +50,7 @@ static const char *TAG = "settings";
 #define ITEM_H 42     /* 行高: 28 顶栏 + 5×42 = 238 ≤ 240 */
 #define VIBE_THROTTLE_MS 100
 
-/* main.c 导出: 息屏时长调节实时生效 */
-extern void main_screen_set_off_timeout_s(uint32_t off_s);
+/* 息屏时长调节实时生效 (屏幕状态机全权在 power_manager) */
 
 /* ── 页面与菜单定义 ── */
 typedef enum { PAGE_ROOT = 0,
@@ -667,7 +667,7 @@ static void adjust_step(int dir)
         if (idx < 0) idx = 0;
         if (idx >= (int)OFF_PRESET_CNT) idx = OFF_PRESET_CNT - 1;
         uint32_t preset = s_off_presets[idx];
-        main_screen_set_off_timeout_s(preset); /* dim/off 时序立即生效 */
+        power_manager_set_off_timeout_s(preset); /* dim/off 时序立即生效 */
         config_set_u32(CFG_KEY_OFF_S, preset);
         break;
     }

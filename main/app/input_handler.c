@@ -28,6 +28,7 @@
 #include "pat_detector.h"
 #include "tap_detector.h"
 #include "shake_detector.h"
+#include "power_manager.h"
 #include "esp_log.h"
 #include "lvgl.h"
 
@@ -50,9 +51,6 @@ static bool nav_mode_is_tap(void)
 {
     return config_get_u32(CFG_KEY_NAV_MODE, 1) == 0;
 }
-
-/* main.c 导出 */
-extern void main_screen_note_interaction(void);
 
 /* ── 设置页"退出"回调 (根页 BACK / 顶条右滑到底时触发) ── */
 static void on_settings_close(void)
@@ -111,12 +109,12 @@ static void on_gesture_event(gesture_event_t ev)
 
     switch (ev) {
     case GESTURE_WAKE_SCREEN:
-        main_screen_note_interaction();
+        power_manager_note_interaction();
         break;
 
     case GESTURE_OPEN_MENU:
         if (page == APP_PAGE_HOME && !settings_screen_is_active()) {
-            main_screen_note_interaction();
+            power_manager_note_interaction();
             input_handler_set_page(APP_PAGE_SETTINGS);
             settings_screen_set_close_cb(on_settings_close);
             settings_screen_init();
@@ -128,7 +126,6 @@ static void on_gesture_event(gesture_event_t ev)
         /* 双击在设置页无动作 — 退出统一走顶条右滑 (防与单击确认误触) */
         break;
 
-    case GESTURE_PETTING_HEAD:
     case GESTURE_VOICE_TRIGGER:
     case GESTURE_MUTE_TOGGLE:
         if (page == APP_PAGE_HOME) {
@@ -150,7 +147,7 @@ static void on_gesture_event(gesture_event_t ev)
             if ((uint32_t)(lv_tick_get() - s_settings_open_tick) < SETTINGS_OPEN_COOLDOWN_MS) {
                 break;
             }
-            main_screen_note_interaction(); /* 操作中保持常亮 */
+            power_manager_note_interaction(); /* 操作中保持常亮 */
             bool tap = nav_mode_is_tap();
             switch (ev) {
             case GESTURE_SINGLE_TAP: /* 左键确认恒成立 */

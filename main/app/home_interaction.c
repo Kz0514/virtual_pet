@@ -18,6 +18,7 @@
 #include "tts_client.h"
 #include "chat_bubble.h"
 #include "session_mgr.h"
+#include "power_manager.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_random.h"
@@ -29,10 +30,6 @@ static const char *TAG = "home_ix";
 
 static bool s_enabled = true;     /* 页面级开关 (设置页禁用) */
 static uint32_t s_last_voice = 0; /* 语音触发 10s 冷却 */
-
-/* main.c 导出: 交互唤醒/亮度恢复 + 空闲计时重置 + 屏幕状态查询 */
-extern void main_screen_note_interaction(void);
-extern bool main_screen_is_on(void);
 
 void home_interaction_set_enabled(bool en)
 {
@@ -66,7 +63,7 @@ void home_interaction_poll(void)
      * - 非主页(设置页) — 只排空不处理, 回主页不会积压旧事件;
      * - 息屏期 — 息屏唤醒只走触摸探针 (10Hz + 去抖) + 左键/摇动等
      * 物理路径, 摇动/敲击仅亮屏期有效 */
-    bool gated = !s_enabled || tm6604_is_vibrating() || !main_screen_is_on();
+    bool gated = !s_enabled || tm6604_is_vibrating() || !power_manager_is_screen_on();
 
     shake_event_t se;
     bool got_shake = shake_detector_poll(&se);
@@ -81,7 +78,7 @@ void home_interaction_poll(void)
     /* 摇动 — 轻摇/重摇按幅度分流; 可唤醒屏幕 */
     if (got_shake) {
         bool hard = se.magnitude_g >= 0.8f;
-        main_screen_note_interaction();
+        power_manager_note_interaction();
         ESP_LOGI(TAG, "摇动! |a|=%.2fg (%s)", se.magnitude_g, hard ? "重" : "轻");
         tm6604_vibrate(70, hard ? 200 : 100);
         pet_engine_trigger(hard ? PET_EVENT_HARD_SHAKE : PET_EVENT_SHAKE);
@@ -101,7 +98,7 @@ void home_interaction_poll(void)
     /* 敲击 — 单击=轻拍, 双击=加倍奖励; 可唤醒屏幕
      * 注意: 不振动反馈 — 马达振动会打到桌面被 DMP 误判为敲击, 形成自激环路 */
     if (got_tap) {
-        main_screen_note_interaction();
+        power_manager_note_interaction();
         ESP_LOGI(TAG, "敲击 x%d (dir=%u) |a|=%.2fg", te.count, te.direction, te.magnitude_g);
         if (te.count >= 2) {
             pet_engine_trigger(PET_EVENT_DOUBLE_TOUCH);
@@ -134,18 +131,14 @@ void home_interaction_on_gesture(gesture_event_t ev)
     if (!s_enabled) return; /* input_handler 只在主页路由, 双保险 */
 
     switch (ev) {
-    case GESTURE_PETTING_HEAD:
-        main_screen_note_interaction();
-        pet_engine_trigger(PET_EVENT_TOUCH);
-        diary_mgr_note_event(DIARY_EVENT_PETTING);
-        break;
+    /* 摸头不再经手势路由 — pat_detector 单一源 (动画/养成/日记/震动内聚) */
 
     case GESTURE_VOICE_TRIGGER: {
         uint32_t now = xTaskGetTickCount();
         if (now - s_last_voice < pdMS_TO_TICKS(10000)) break; /* 10s cooldown */
         s_last_voice = now;
         ESP_LOGI(TAG, "Voice trigger!");
-        main_screen_note_interaction();
+        power_manager_note_interaction();
         pet_engine_trigger(PET_EVENT_VOICE);
         diary_mgr_note_event(DIARY_EVENT_VOICE);
         session_mgr_enter(); /* 进入连续会话; 会话中 = 打断进聆听 */
