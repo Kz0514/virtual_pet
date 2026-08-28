@@ -46,6 +46,8 @@ idf_component_register(
         "app/event_bus.c"
         "app/message_handler.c"
         # Network
+        "network/http_util.c"
+        "network/weather_client.c"
         "network/ws_client.c"
         "system/wifi_scanner.c"
         "network/api_client.c"

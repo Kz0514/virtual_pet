@@ -75,64 +75,10 @@
 #include "diary_sync.h"
 #include "usb_storage.h"
 #include "power_manager.h"
-#include "esp_http_client.h"
-#include "cJSON.h"
+#include "weather_client.h"
 #include <math.h>
 
 static const char *TAG = "main";
-
-static char s_http_buf[1024];
-static int s_http_len = 0;
-
-static esp_err_t http_event_cb(esp_http_client_event_t *evt)
-{
-    if (evt->event_id == HTTP_EVENT_ON_DATA && s_http_len + evt->data_len < sizeof(s_http_buf) - 1) {
-        memcpy(s_http_buf + s_http_len, evt->data, evt->data_len);
-        s_http_len += evt->data_len;
-        s_http_buf[s_http_len] = '\0';
-    }
-    return ESP_OK;
-}
-
-static void http_get(const char *url)
-{
-    s_http_len = 0;
-    esp_http_client_config_t cfg = {.url = url, .event_handler = http_event_cb, .timeout_ms = 10000};
-    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-    esp_http_client_perform(cli);
-    esp_http_client_cleanup(cli);
-}
-
-static void fetch_weather_once(void)
-{
-    const char *token = api_client_get_token();
-    char url[384];
-    snprintf(url, sizeof(url), "http://%s:%d/api/v1/weather/ip_location?token=%s",
-             SERVER_HOST, SERVER_PORT, token);
-    http_get(url);
-    cJSON *loc = cJSON_Parse(s_http_buf);
-    if (!loc)
-        return;
-    cJSON *ad = cJSON_GetObjectItem(loc, "adcode");
-    char adcode_str[16] = "110101";
-    if (cJSON_IsString(ad))
-        strncpy(adcode_str, ad->valuestring, sizeof(adcode_str) - 1);
-    ESP_LOGI(TAG, "📍 %s (adcode=%s)",
-             cJSON_GetObjectItem(loc, "city")->valuestring, adcode_str);
-    cJSON_Delete(loc);
-
-    snprintf(url, sizeof(url), "http://%s:%d/api/v1/weather/current?city=%s&token=%s",
-             SERVER_HOST, SERVER_PORT, adcode_str, token);
-    http_get(url);
-    cJSON *w = cJSON_Parse(s_http_buf);
-    if (w) {
-        ESP_LOGI(TAG, "🌤 %s %s°C 湿度:%s%%",
-                 cJSON_GetObjectItem(w, "weather")->valuestring,
-                 cJSON_GetObjectItem(w, "temperature")->valuestring,
-                 cJSON_GetObjectItem(w, "humidity")->valuestring);
-        cJSON_Delete(w);
-    }
-}
 
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 
@@ -636,7 +582,7 @@ void app_main(void)
                     registered = true;
                     ESP_LOGI(TAG, "设备已认证");
                     ws_client_connect(api_client_get_token());
-                    fetch_weather_once();
+                    weather_fetch_once();
                     /* OTA 检查 — 与 register 同上下文同步执行 (独立任务曾被调度跳过导致
                      * OTA 永不触发) */
                     ota_client_check_sync();

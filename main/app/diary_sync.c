@@ -11,6 +11,7 @@
  * 闸门: 低电量 (writes_safe) 与 TTS 播放期间不写 — 与 life_log 同策略。
  */
 #include "diary_sync.h"
+#include "http_util.h"
 #include "api_client.h"
 #include "server_config.h"
 #include "time_manager.h"
@@ -19,8 +20,6 @@
 #include "memory_store.h"
 #include "tts_client.h"
 #include "esp_log.h"
-#include "esp_heap_caps.h"
-#include "esp_http_client.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,7 +38,6 @@ static const char *TAG = "diary_sync";
 #define RETRY_INTERVAL_S (10 * 60) /* 失败重试 10min (服务端未就绪/断网) */
 #define LIST_CAP (64 * 1024)       /* 列表 JSON 上限 (31 篇 × ~700B) */
 #define HTML_CAP (192 * 1024)      /* 单篇 HTML 上限 (含涂鸦 b64) */
-#define HTTP_TIMEOUT_MS 10000
 #define DIARY_DIR "/data/diary"
 #define MAX_FILES 30
 #define MAX_TOTAL_BYTES (512 * 1024)
@@ -49,57 +47,7 @@ static bool s_busy = false; /* 任务执行中 (tick 不再触发) */
 static bool s_first_done = false;
 static uint32_t s_next_run = 0; /* unix 秒 */
 
-/* ── HTTP GET → PSRAM 动态缓冲 (响应可至 ~200KB) ── */
-typedef struct {
-    char *buf;
-    size_t cap;
-    size_t len;
-} get_ctx_t;
-
-static esp_err_t get_handler(esp_http_client_event_t *evt)
-{
-    if (evt->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
-    get_ctx_t *ctx = evt->user_data;
-    size_t room = ctx->cap - ctx->len - 1;
-    size_t n = evt->data_len < room ? evt->data_len : room;
-    memcpy(ctx->buf + ctx->len, evt->data, n);
-    ctx->len += n;
-    return ESP_OK;
-}
-
-static char *http_get(const char *url, size_t cap)
-{
-    char *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
-    if (!buf) {
-        ESP_LOGE(TAG, "缓冲分配失败 (%uB)", (unsigned)cap);
-        return NULL;
-    }
-    get_ctx_t ctx = {buf, cap, 0};
-
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .method = HTTP_METHOD_GET,
-        .event_handler = get_handler,
-        .user_data = &ctx,
-        .timeout_ms = HTTP_TIMEOUT_MS,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) {
-        free(buf);
-        return NULL;
-    }
-    esp_err_t err = esp_http_client_perform(client);
-    int status = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-
-    if (err != ESP_OK || status != 200) {
-        ESP_LOGW(TAG, "GET 失败: err=%d status=%d", err, status);
-        free(buf);
-        return NULL;
-    }
-    buf[ctx.len] = '\0';
-    return buf;
-}
+/* ── HTTP GET 走共享封装 http_util (④-7a 抽出, 见 main/network/http_util) ── */
 
 /* ── 配额: 文件数/总大小超限 → 按文件名删最旧 (YYYY-MM-DD.html 字典序=时间序) ── */
 static void enforce_quota(void)
