@@ -5,7 +5,6 @@
 #include "ws_client.h"
 #include "server_config.h"
 #include "tts_client.h"
-#include "wifi_scanner.h"
 #include "memory_store.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -17,7 +16,6 @@
 static const char *TAG = "ws";
 static esp_websocket_client_handle_t s_client = NULL;
 static bool s_connected = false;
-static bool s_paused = false;            /* 息屏期暂停 (WiFi 已停, 重连必败) */
 /* 恒为聚合模式: 服务器 LLM 流式期间增量合成, WS 二进制帧直推
  * (audio_start/binary/audio_end)。
  * s_ws_audio_seen = 本轮收到过 audio_start — 音频已由 WS 流推送。
@@ -157,30 +155,13 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             cJSON *root = cJSON_ParseWithLength(msg, msg_len);
             if (root) {
                 cJSON *type = cJSON_GetObjectItem(root, "type");
-                cJSON *txt = cJSON_GetObjectItem(root, "text");
 
                 /* 协议帧回调: 已注册且认领 (返回 true) → 跳过默认链;
-                 * 未注册/未认领 → 走下方默认链, 与重构前逐位一致 */
+                 * 未注册/未认领 → chat 链已迁空, 等价丢弃 */
                 if (cJSON_IsString(type) && s_frame_handler &&
                     s_frame_handler(type->valuestring, root)) {
                     cJSON_Delete(root);
                     break;
-                }
-                /* ── scan_wifi: server requests WiFi scan for network location ── */
-                if (cJSON_IsString(type) && strcmp(type->valuestring, "scan_wifi") == 0) {
-                    ESP_LOGI(TAG, "scan_wifi: starting scan");
-                    wifi_ap_info_t aps[WIFI_SCAN_MAX_APS];
-                    int count = wifi_scan_aps(aps);
-                    ESP_LOGI(TAG, "scan_wifi: found %d APs", count);
-                    static char wifi_json[800];
-                    static char resp[1024];
-                    int wj_len = wifi_scan_build_json(aps, count, wifi_json, sizeof(wifi_json));
-                    int n = snprintf(resp, sizeof(resp),
-                                     "{\"type\":\"scan_result\",\"wifiinfo\":%.*s}",
-                                     wj_len > 0 ? wj_len : 2,
-                                     wj_len > 0 ? wifi_json : "[]");
-                    ESP_LOGI(TAG, "scan_wifi: sending result (%d bytes, %d APs)", n, count);
-                    ws_client_send_json(resp);
                 }
                 /* ── audio_start / audio_end: WS 音频流边界 — LLM 流式期间
                     增量合成的 PCM 经二进制帧直推, 本帧只做起链/收尾 ── */
@@ -218,7 +199,6 @@ esp_err_t ws_client_connect(const char *token)
 {
     /* 幂等 + 可重建: 组件内置重连只覆盖"已连接后断开", 不覆盖创建任务
      * 失败 — 主循环 30s 周期调用本函数重建客户端; 已连则直接跳过。 */
-    if (s_paused) return ESP_OK; /* 息屏期不重建 (WiFi 已停) */
     if (s_connected) return ESP_OK;
     if (s_client) {
         esp_websocket_client_destroy(s_client);
@@ -246,36 +226,6 @@ esp_err_t ws_client_connect(const char *token)
 }
 
 bool ws_client_is_connected(void) { return s_connected; }
-
-/* 息屏暂停/亮屏恢复 — 与 main.c 的息屏/亮屏块配对:
- * stop 停掉组件及其内置重连计时器 (WiFi 停后重连必失败), start 重新
- * 发起连接; 对象保留, 无需重建。 */
-void ws_client_pause(void)
-{
-    s_paused = true;
-    if (s_client) esp_websocket_client_stop(s_client);
-    s_connected = false;
-    ESP_LOGI(TAG, "WS 暂停 (息屏)");
-}
-
-void ws_client_resume(void)
-{
-    s_paused = false;
-    if (s_client) {
-        esp_err_t ret = esp_websocket_client_start(s_client);
-        if (ret != ESP_OK)
-            ESP_LOGE(TAG, "WS 恢复失败: %s — 主循环 30s 周期会重建",
-                     esp_err_to_name(ret));
-    }
-    ESP_LOGI(TAG, "WS 恢复 (亮屏)");
-}
-esp_err_t ws_client_send_text(const char *text)
-{
-    if (!s_client || !s_connected) return ESP_FAIL;
-    char json[512];
-    snprintf(json, sizeof(json), "{\"type\":\"chat\",\"text\":\"%s\"}", text);
-    return esp_websocket_client_send_text(s_client, json, strlen(json), pdMS_TO_TICKS(100));
-}
 esp_err_t ws_client_send_json(const char *json)
 {
     if (!s_client || !s_connected) return ESP_FAIL;

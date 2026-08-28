@@ -5,10 +5,9 @@
  * 迁移路线 (与 ws_client 默认链删分支同 commit 闭合, 逐位可对账):
  *   ④-4 ✅ get_memory / memory_update 已迁入
  *   ④-5 ✅ chat_text / chat_done 已迁入 (chat_seq 落地, 桥已回收)
- *   ④-6  scan_wifi 迁入
+ *   ④-6 ✅ scan_wifi 已迁入 — ws_client 不再有默认链
  *
- * 已认领的帧返回 true; 未认领的返回 false → ws_client 走内部默认链
- * (audio 起止等传输耦合物, 留在传输层)。
+ * 全部协议帧均已认领; ws_client 只做传输 (audio 起止 + 二进制喂环等)。
  */
 #include "message_handler.h"
 #include "ws_client.h"
@@ -18,9 +17,11 @@
 #include "pet_avatar.h"
 #include "pet_engine.h"
 #include "life_log.h"
+#include "wifi_scanner.h"
 #include "config_mgr.h"
 #include "config_keys.h"
 #include "esp_log.h"
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "msg";
@@ -355,8 +356,24 @@ bool message_handler_handle_frame(const char *type, cJSON *root)
          * (防跨轮误判兜底 POST: 上轮 WS 推过、本轮服务器 TTS 失败) */
         return true;
     }
-    /* ④-6: scan_wifi 迁入这里 */
-    return false; /* 未认领 → ws_client 默认链 */
+    /* ── scan_wifi: server requests WiFi scan for network location ── */
+    if (strcmp(type, "scan_wifi") == 0) {
+        ESP_LOGI(TAG, "scan_wifi: starting scan");
+        wifi_ap_info_t aps[WIFI_SCAN_MAX_APS];
+        int count = wifi_scan_aps(aps);
+        ESP_LOGI(TAG, "scan_wifi: found %d APs", count);
+        static char wifi_json[800];
+        static char resp[1024];
+        int wj_len = wifi_scan_build_json(aps, count, wifi_json, sizeof(wifi_json));
+        int n = snprintf(resp, sizeof(resp),
+                         "{\"type\":\"scan_result\",\"wifiinfo\":%.*s}",
+                         wj_len > 0 ? wj_len : 2,
+                         wj_len > 0 ? wifi_json : "[]");
+        ESP_LOGI(TAG, "scan_wifi: sending result (%d bytes, %d APs)", n, count);
+        ws_client_send_json(resp);
+        return true;
+    }
+    return false; /* 未认领 — ws_client 已无默认链, 等价丢弃 */
 }
 
 uint32_t message_handler_get_chat_seq(void)
