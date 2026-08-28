@@ -21,12 +21,9 @@
 #include "esp_pm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "lwip/sockets.h"
-#include "lwip/dns.h"
-#include "lwip/netdb.h"
+#include "esp_http_client.h"
 #include <string.h>
 #include <stdlib.h>
-#include <errno.h>
 
 static const char *TAG = "tts";
 
@@ -237,90 +234,64 @@ typedef struct {
     uint32_t gen;  /* 世代 — 打断后旧任务不再触碰槽 */
 } tts_args_t;
 
-/* ── chunked transfer 解码状态机 ── */
-typedef enum { CH_SIZE,
-               CH_SIZE_LF,
-               CH_DATA,
-               CH_DATA_CR,
-               CH_DATA_LF,
-               CH_DONE } ch_state_t;
-
+/* ── HTTP 兜底下载 (vendored esp_http_client 补丁版) ──
+ * 2026-08-28 ④-7b 换栈: raw lwip socket → esp_http_client.
+ * 行为差异登记 (弱网问题将来靠日志/此注释定位):
+ *   - 打断粒度 200ms 保持 (read_timeout_ms=200 轮询粒度)
+ *   - 头部 deadline 10s 保持; body 无数据看门狗 8s→10s (统一 idle 计数)
+ *   - 服务器提前断开/非 200/槽满放弃/失败重试一次 语义保持
+ *   - 新增失败面: esp_http_client 内部 malloc (rx buffer 2048 + query strdup) */
 typedef struct {
-    ch_state_t st;
-    uint32_t remaining; /* CH_DATA 剩余字节 */
-    uint32_t size_val;  /* 当前 chunk 大小 (十六进制) */
-    uint32_t gen;       /* 世代守卫 */
-} chunk_parser_t;
+    int slot;
+    uint32_t gen;
+    int32_t status_code;    /* 首个数据帧时填 (头部已解析完) */
+    uint32_t dl_bytes, dl_last;
+    TickType_t dl_last_t, t_start;
+    bool slot_full;         /* 槽满放弃 — 播放侧疑死, 调用方据此不重试 */
+} tts_http_ctx_t;
 
-static void cp_reset(chunk_parser_t *p, uint32_t gen)
+static volatile bool s_tts_http_abort = false; /* 打断/槽满 → 轮询点中止请求 */
+
+/* 每个轮询醒来 (200ms) 由组件调用 — true = 中止请求 */
+static bool tts_http_idle_check(void)
 {
-    p->st = CH_SIZE;
-    p->remaining = 0;
-    p->size_val = 0;
-    p->gen = gen;
+    return s_stop_req || s_tts_http_abort;
 }
 
-/* 喂入原始字节, 只把 chunk 数据写入环形缓冲 (宽容解析, 容忍 \r 丢失).
- * 返回 false = rb_put 槽满放弃 (本句已结束, 调用方停止喂入) */
-static bool cp_feed(chunk_parser_t *p, int slot, const uint8_t *d, uint32_t len)
+static esp_err_t tts_http_evt(esp_http_client_event_t *evt)
 {
-    uint32_t i = 0;
-    while (i < len && p->st != CH_DONE) {
-        uint8_t c = d[i];
-        switch (p->st) {
-        case CH_SIZE: /* 十六进制大小行 */
-            if (c >= '0' && c <= '9')
-                p->size_val = p->size_val * 16 + (c - '0');
-            else if (c >= 'a' && c <= 'f')
-                p->size_val = p->size_val * 16 + (c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F')
-                p->size_val = p->size_val * 16 + (c - 'A' + 10);
-            else if (c == '\r')
-                p->st = CH_SIZE_LF;
-            i++;
-            break;
-        case CH_SIZE_LF:
-            i++;
-            if (p->size_val == 0) {
-                p->st = CH_DONE;
-                break;
-            }
-            p->st = CH_DATA;
-            p->remaining = p->size_val;
-            break;
-        case CH_DATA: {
-            uint32_t avail = len - i;
-            uint32_t n = (avail < p->remaining) ? avail : p->remaining;
-            if (n > 0) {
-                if (!rb_put(slot, p->gen, d + i, n)) return false;
-                i += n;
-                p->remaining -= n;
-            }
-            if (p->remaining == 0) p->st = CH_DATA_CR;
-            break;
+    tts_http_ctx_t *c = (tts_http_ctx_t *)evt->user_data;
+    switch (evt->event_id) {
+    case HTTP_EVENT_ON_DATA:
+        /* 首个数据帧时头部已解析完 — 取状态码, 非 200 的 body 不喂环 */
+        if (c->status_code < 0)
+            c->status_code = esp_http_client_get_status_code(evt->client);
+        if (c->status_code != 200 || evt->data_len <= 0) break;
+        /* 每 5s 打印下载速率 — 卡顿时可区分: 服务端合成慢 vs 设备网络慢 */
+        if (xTaskGetTickCount() - c->dl_last_t >= pdMS_TO_TICKS(5000)) {
+            uint32_t dt_ms = (xTaskGetTickCount() - c->dl_last_t) * portTICK_PERIOD_MS;
+            ESP_LOGI(TAG, "DL rate: %d KB/s (总 %dKB)",
+                     (int)((c->dl_bytes - c->dl_last) * 1000 / (dt_ms * 1024)),
+                     (int)(c->dl_bytes / 1024));
+            c->dl_last = c->dl_bytes;
+            c->dl_last_t = xTaskGetTickCount();
         }
-        case CH_DATA_CR:
-            i++;
-            p->st = (c == '\r') ? CH_DATA_LF : CH_SIZE;
-            if (p->st == CH_SIZE) p->size_val = 0;
-            break;
-        case CH_DATA_LF:
-            i++;
-            p->st = CH_SIZE;
-            p->size_val = 0;
-            break;
-        case CH_DONE:
-            return true;
+        c->dl_bytes += evt->data_len;
+        if (!rb_put(c->slot, c->gen, evt->data, evt->data_len)) {
+            c->slot_full = true;
+            s_tts_http_abort = true;
         }
+        break;
+    default:
+        break;
     }
-    return true;
+    return ESP_OK;
 }
 
 /* download 任务统一退出 (永不返回) — 世代守卫: 旧任务不再触碰共享状态.
  * rb_done[slot] 置位 — 播放侧预冲等待/排空据此终止 */
-static void dl_exit(tts_args_t *args, int sock)
+static void dl_exit(tts_args_t *args)
 {
-    if (sock >= 0) close(sock);
     if (args->gen == s_gen) {
         rb_done[args->slot] = true;
     }
@@ -334,11 +305,10 @@ static void dl_exit(tts_args_t *args, int sock)
     vTaskDelete(NULL);
 }
 
-/* 单次 TTS 下载尝试 — 成功返回 true (sock 已关闭)。
+/* 单次 TTS 下载尝试 — 成功返回 true。
  * *out_slot_full: 槽满放弃 (播放侧疑死) — 非网络问题, 重试只会重写同槽
  * 造成数据混叠, 调用方据此不重试。
- * 所有失败路径打日志 — 静默失败 (头部超时即退/send 未检) 会让网络瞬断
- * 时的 TTS 丢失无任何痕迹 */
+ * 所有失败路径打日志 — 静默失败会让网络瞬断时的 TTS 丢失无任何痕迹 */
 static bool tts_dl_attempt(tts_args_t *args, bool *out_slot_full)
 {
     *out_slot_full = false;
@@ -349,9 +319,10 @@ static bool tts_dl_attempt(tts_args_t *args, bool *out_slot_full)
         return false;
     }
 
-    /* URL-encode text (Chinese char = 3 bytes → 9 URL chars, need headroom)
+    /* URL-encode text (Chinese char = 3 bytes → 9 URL chars).
+     * enc static 768B: 服务器契约 text max_length=200 (Query) → 200*3+1 ≈ 601B.
      * 大缓冲全部 static — TTS 单飞, 省栈防碎片化 (栈申请失败会整段丢 TTS) */
-    static char enc[1536];
+    static char enc[768];
     const char *s = text;
     char *d = enc, *e = enc + sizeof(enc) - 1;
     while (*s && d < e) {
@@ -365,149 +336,69 @@ static bool tts_dl_attempt(tts_args_t *args, bool *out_slot_full)
     *d = 0;
     ESP_LOGI(TAG, "TTS: %s", text);
 
-    /* HTTP/1.0 POST */
-    static char req[3584];
-    snprintf(req, sizeof(req),
-             "POST /api/v1/tts/synthesize-stream?text=%s"
-             "&token=%s"
-             " HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
-             enc, token, SERVER_HOST);
+    /* POST /api/v1/tts/synthesize-stream (StreamingResponse → chunked,
+     * esp_http_client 自动解码). 打断/看门狗语义经补丁字段承接:
+     * read_timeout_ms=200 轮询粒度, idle_timeout_ms=10000 无数据看门狗
+     * (头部 deadline 同源), idle_check_cb 打断检查 (≤200ms 响应) */
+    tts_http_ctx_t ctx = {
+        .slot = args->slot, .gen = args->gen,
+        .status_code = -1,
+        .dl_last_t = xTaskGetTickCount(), .t_start = xTaskGetTickCount(),
+    };
+    s_tts_http_abort = false;
 
-    struct addrinfo h = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM}, *r;
-    char ps[8];
-    snprintf(ps, sizeof(ps), "%d", SERVER_PORT);
-    if (getaddrinfo(SERVER_HOST, ps, &h, &r) || !r) {
-        ESP_LOGE(TAG, "TTS: DNS fail");
+    esp_http_client_config_t cfg = {
+        .host = SERVER_HOST,
+        .port = SERVER_PORT,
+        .path = "/api/v1/tts/synthesize-stream",
+        .query = NULL, /* 下面拼 text&token */
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 10000,      /* connect/write 超时 */
+        .read_timeout_ms = 200,   /* [patch] 读轮询粒度 — 打断及时性 */
+        .idle_timeout_ms = 10000, /* [patch] 无数据看门狗 (头/体统一) */
+        .idle_check_cb = tts_http_idle_check,
+        .event_handler = tts_http_evt,
+        .user_data = &ctx,
+        .buffer_size = 2048,      /* rx 缓冲 (运行时 malloc) */
+    };
+    /* query 动态拼 — strdup 进组件内部, 短存活 (perform 期间) */
+    static char query[900]; /* 601 (text) + token + "text=&token=" 头 ~30 */
+    snprintf(query, sizeof(query), "text=%s&token=%s", enc, token);
+    cfg.query = query;
+
+    esp_http_client_handle_t hc = esp_http_client_init(&cfg);
+    if (!hc) {
+        ESP_LOGE(TAG, "TTS: http client init 失败 (内存不足?)");
         return false;
     }
-    int sock = socket(r->ai_family, r->ai_socktype, 0);
-    if (sock < 0 || connect(sock, r->ai_addr, r->ai_addrlen) < 0) {
-        ESP_LOGE(TAG, "TTS: connect fail (errno %d)", errno);
-        freeaddrinfo(r);
-        if (sock >= 0) close(sock);
+    esp_err_t err = esp_http_client_perform(hc);
+    bool aborted = s_tts_http_abort;
+    if (ctx.status_code < 0) /* 无任何数据帧 (空响应/失败) — 取头里解析的状态 */
+        ctx.status_code = esp_http_client_get_status_code(hc);
+    int32_t sc = ctx.status_code;
+    esp_http_client_cleanup(hc);
+
+    if (s_stop_req) {
+        ESP_LOGI(TAG, "TTS: 已停止 (%s)", esp_err_to_name(err));
+        return false; /* 用户打断 — 静默, 不重试 */
+    }
+    if (sc > 0 && sc != 200) {
+        ESP_LOGE(TAG, "TTS HTTP 非200: %d", (int)sc);
         return false;
     }
-    freeaddrinfo(r);
-
-    /* 200ms 收超时 — 停止标志能被及时轮询 */
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    ssize_t sn = send(sock, req, strlen(req), 0);
-    if (sn < 0 || sn != (ssize_t)strlen(req)) {
-        ESP_LOGE(TAG, "TTS: send 失败 (%d/%d, errno %d)",
-                 (int)sn, (int)strlen(req), errno);
-        close(sock);
+    if (aborted && ctx.slot_full) {
+        ESP_LOGW(TAG, "TTS: 槽满放弃 (总 %dKB) — 本句结束", (int)(ctx.dl_bytes / 1024));
+        *out_slot_full = true;
         return false;
     }
-
-    /* 头部 200ms/轮轮询, 总超时 10s — 网络瞬断与服务端抖动通常在数秒内
-     * 恢复; EOF/无头/超时均打日志 */
-    static char t[4096];
-    int n = 0;
-    TickType_t hdr_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(10000);
-    while (n < (int)sizeof(t) - 1) {
-        int r = recv(sock, t + n, sizeof(t) - 1 - n, 0);
-        if (r > 0) {
-            n += r;
-            t[n] = 0;
-            if (strstr(t, "\r\n\r\n") || strstr(t, "\n\n")) break; /* 头部完整 */
-        } else if (r == 0) {
-            ESP_LOGE(TAG, "TTS: 连接被关闭 — HTTP 头未到 (n=%d)", n);
-            close(sock);
-            return false;
-        } else {
-            if (s_stop_req) {
-                close(sock);
-                return false;
-            } /* 用户打断 */
-            if (xTaskGetTickCount() >= hdr_deadline) {
-                ESP_LOGE(TAG, "TTS: 头部 10s 超时 (errno %d) — 网络不可达", errno);
-                close(sock);
-                return false;
-            }
-            /* SO_RCVTIMEO 超时 — 继续轮询 */
-        }
-    }
-    char *bd = strstr(t, "\r\n\r\n");
-    if (!bd) bd = strstr(t, "\n\n");
-    if (!bd) {
-        ESP_LOGE(TAG, "TTS: 无 HTTP 头分隔符 (n=%d)", n);
-        close(sock);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "TTS: 下载失败 %s%s (总 %dKB)",
+                 esp_err_to_name(err), aborted ? " [abort]" : "",
+                 (int)(ctx.dl_bytes / 1024));
         return false;
     }
-    if (!strstr(t, " 200 ")) {
-        ESP_LOGE(TAG, "TTS HTTP 非200: %.12s", t);
-        close(sock);
-        return false;
-    }
-    bd += (bd[0] == '\r') ? 4 : 2; /* skip past header boundary */
-    int leftover = n - (bd - t);
-
-    TickType_t t_start = xTaskGetTickCount();
-    uint32_t dl_bytes = leftover > 0 ? leftover : 0; /* 速率诊断 */
-    uint32_t dl_last = 0;
-    TickType_t dl_last_t = t_start;
-
-    /* chunked 解码 — 边收边解边入环, 流式开播 */
-    chunk_parser_t cp;
-    cp_reset(&cp, args->gen);
-    if (leftover > 0) {
-        if (!cp_feed(&cp, args->slot, (uint8_t *)bd, leftover)) {
-            ESP_LOGW(TAG, "TTS: 槽满放弃 (头部残留) — 本句结束");
-            close(sock);
-            *out_slot_full = true;
-            return false;
-        }
-        if (s_playback_task) xTaskNotifyGive(s_playback_task);
-    }
-
-    static uint8_t buf[4096];
-    /* 无数据 8s 看门狗 — 服务端挂死 (不回应也不关连接) 时本任务必须退出,
-     * 否则链式播放卡死在预冲等待 (recv 超时循环本身不会退出) */
-    TickType_t last_data_t = xTaskGetTickCount();
-    while (cp.st != CH_DONE) {
-        n = recv(sock, buf, sizeof(buf), 0);
-        if (n < 0) {
-            /* SO_RCVTIMEO 超时 — 轮询停止标志后继续等 */
-            if (s_stop_req) break;
-            if (xTaskGetTickCount() - last_data_t > pdMS_TO_TICKS(8000)) {
-                ESP_LOGW(TAG, "TTS: 下载 8s 无数据 — 放弃 (errno %d)", errno);
-                break;
-            }
-            continue;
-        }
-        if (n == 0) {
-            ESP_LOGW(TAG, "TTS: 流式下载提前断开 (总 %dKB, %dms)",
-                     (int)(dl_bytes / 1024),
-                     (int)((xTaskGetTickCount() - t_start) * portTICK_PERIOD_MS));
-            break; /* 连接关闭 */
-        }
-        last_data_t = xTaskGetTickCount();
-        dl_bytes += n;
-        if (!cp_feed(&cp, args->slot, buf, n)) {
-            ESP_LOGW(TAG, "TTS: 槽满放弃 (总 %dKB) — 本句结束",
-                     (int)(dl_bytes / 1024));
-            close(sock);
-            *out_slot_full = true;
-            return false;
-        }
-        /* 每 5s 打印下载速率 — 卡顿时可区分: 服务端合成慢 vs 设备网络慢 */
-        if (xTaskGetTickCount() - dl_last_t >= pdMS_TO_TICKS(5000)) {
-            uint32_t dt_ms = (xTaskGetTickCount() - dl_last_t) * portTICK_PERIOD_MS;
-            ESP_LOGI(TAG, "DL rate: %d KB/s (总 %dKB)",
-                     (int)((dl_bytes - dl_last) * 1000 / (dt_ms * 1024)),
-                     (int)(dl_bytes / 1024));
-            dl_last = dl_bytes;
-            dl_last_t = xTaskGetTickCount();
-        }
-        if (s_playback_task) xTaskNotifyGive(s_playback_task);
-    }
-
-    ESP_LOGI(TAG, "Download done (%dms)%s",
-             (int)((xTaskGetTickCount() - t_start) * portTICK_PERIOD_MS),
-             s_stop_req ? " [stopped]" : "");
-    close(sock);
+    ESP_LOGI(TAG, "Download done (%dms)",
+             (int)((xTaskGetTickCount() - ctx.t_start) * portTICK_PERIOD_MS));
     return true;
 }
 
@@ -516,7 +407,7 @@ static void download_task(void *pv)
     tts_args_t *args = (tts_args_t *)pv;
     if (s_dl_active >= 0) s_dl_active++;
     if (!args || !args->text) {
-        dl_exit(args, -1);
+        dl_exit(args);
         return;
     }
     s_slot_busy[args->slot] = true; /* 占用槽 — dl_spawn 据此防双写 */
@@ -536,7 +427,7 @@ static void download_task(void *pv)
     }
     if (!ok && !slot_full && !s_stop_req)
         ESP_LOGE(TAG, "TTS: 下载重试均失败 — 本句放弃");
-    dl_exit(args, -1);
+    dl_exit(args);
 }
 
 /* 起一次下载: 重置槽计数器 + 生成 dl 任务. 成功返回 true.
