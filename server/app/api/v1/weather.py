@@ -7,7 +7,8 @@ Response format matches ESP32 cJSON parsing in main.c.
 from fastapi import APIRouter, Query, Request, Depends
 from app.api.deps import get_current_device
 from app.models import Device
-from app.services.weather_service import get_current_weather, get_forecast, get_ip_location
+from app.services.weather_service import get_current_weather, get_forecast
+from app.services.network_location_service import get_ip_location
 from app.services.tool_service import cache_device_location
 
 router = APIRouter()

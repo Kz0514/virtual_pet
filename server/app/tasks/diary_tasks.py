@@ -154,7 +154,8 @@ async def _generate_for_device(engine, device_id: str, target_date: date) -> Non
     # ── 4.5 素材: 当天天气 (服务器 IP 定位; 预报无 target_date → 实时近似) ──
     weather_text = ""
     try:
-        from app.services.weather_service import get_current_weather, get_forecast, get_ip_location
+        from app.services.weather_service import get_current_weather, get_forecast
+        from app.services.network_location_service import get_ip_location
         loc = await get_ip_location()
         lat, lon = loc.get("lat") or None, loc.get("lng") or None
         fc = await get_forecast(lat=lat, lon=lon, days=3)

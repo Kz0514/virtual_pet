@@ -12,7 +12,6 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 WEATHER_URL = "https://apis.map.qq.com/ws/weather/v1/"
-IP_URL     = "https://apis.map.qq.com/ws/location/v1/ip"
 GEO_URL    = "https://apis.map.qq.com/ws/geocoder/v1/"
 
 # 默认坐标: 北京
@@ -33,27 +32,6 @@ async def _get(endpoint: str, **params) -> dict:
     except Exception as e:
         logger.error(f"Tencent API error: {e}")
         return {"status": -1, "message": str(e)}
-
-
-async def get_ip_location(client_ip: str = None) -> dict:
-    """IP-based geolocation → adcode + lat/lng. Called by ESP32 on first boot."""
-    params = {}
-    if client_ip:
-        params["ip"] = client_ip
-    data = await _get(IP_URL, **params)
-    if data.get("status") == 0:
-        result = data.get("result", {})
-        ad_info = result.get("ad_info", {})
-        loc = result.get("location", {})
-        adcode = ad_info.get("adcode", 110101)
-        return {
-            "city":     ad_info.get("city", "北京"),
-            "adcode":   str(adcode),
-            "province": ad_info.get("province", ""),
-            "lat":      float(loc.get("lat", 0)),
-            "lng":      float(loc.get("lng", 0)),
-        }
-    return {"city": "北京", "adcode": "110101", "province": "北京", "lat": 0, "lng": 0}
 
 
 def _parse_weather(data: dict) -> dict:
