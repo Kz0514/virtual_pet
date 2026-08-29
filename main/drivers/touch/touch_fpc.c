@@ -568,7 +568,7 @@ esp_err_t touch_fpc_init(void)
     };
     if (esp_timer_create(&targs, &s_probe_timer) != ESP_OK)
         ESP_LOGE(TAG, "创建探针 esp_timer 失败");
-    if (xTaskCreate(probe_task_fn, "touch_prb", 3072, NULL, 6, &s_probe_task)
+    if (xTaskCreate(probe_task_fn, "touch_prb", 4096, NULL, 6, &s_probe_task)
         != pdPASS)
         ESP_LOGE(TAG, "创建探针任务失败");
 

@@ -255,11 +255,12 @@ esp_err_t power_manager_init(void)
     esp_err_t pret = esp_pm_register_skip_light_sleep_callback(pm_sleep_probe_cb);
     if (pret != ESP_OK)
         ESP_LOGE(TAG, "轻睡探针注册失败: %s", esp_err_to_name(pret));
-    /* : boot 复位原因 — 映射: 1=电源上电 2=软件复位 3=看门狗
-     * 4=深度睡眠唤醒 5=安全 6=core0 崩溃 7=core1 崩溃 8=light sleep
-     * 唤醒 9=CPU 错误 10=外部复位 11=UART 下载 12=RTC 看门狗
-     * 13=brownout 检测 */
-    ESP_LOGI(TAG, "复位原因: %d (1=上电 2=软复位 6/7=崩溃 12=RTC看门狗 13=brownout)",
+    /* : boot 复位原因 — esp_reset_reason_t (esp_system.h, v5.5.4):
+     * 0=未知 1=上电 2=外部复位 3=软复位 4=panic 5=中断看门狗
+     * 6=任务看门狗 7=其他看门狗 8=深睡唤醒 9=brownout 10=SDIO
+     * 11=USB 复位 (串口 DTR/RTS 触发, 监听器/烧录工具反复开闭端口最常见)
+     * 12=JTAG 13=efuse 14=电压跌落 15=CPU 锁死 */
+    ESP_LOGI(TAG, "复位原因: %d (1=上电 2=外部 3=软复位 4=panic 5=中断WDT 6=任务WDT 7=其他WDT 8=深睡 9=brownout 10=SDIO 11=USB 12=JTAG 13=efuse 14=电压跌落 15=锁死)",
              (int)esp_reset_reason());
     save_reset_reason(); /* 落盘 /data/reset_reason.txt — 拷数据时带走 */
     ESP_LOGI(TAG, "轻睡眠策略就绪 (亮屏禁睡, 息屏开睡, 240MHz 恒频)");
