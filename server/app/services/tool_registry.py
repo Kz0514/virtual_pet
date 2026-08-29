@@ -1,5 +1,6 @@
 """
-Tool registry & execution engine (⑥-7 从 tool_service 拆出, 纯搬移).
+Tool registry & execution engine (⑥-7 从 tool_service 拆出, 纯搬移; ⑥-8 状态
+缓存迁 device_state_cache, 异步总线迁 future_bus — 以共享实例导入保持行为不变).
 Protocol: model outputs /tools.name(key=val,...) → server executes → feeds back.
 
 格式:
@@ -11,16 +12,12 @@ API Key 来自 api.json → config.Settings
 """
 import re, json, time, uuid, asyncio, logging
 
+from app.services.device_state_cache import (
+    _sensor_cache, _sensor_ts, _device_location, _resolve_location,
+)
+from app.services.future_bus import _memory_futures, create_memory_future
+
 logger = logging.getLogger("tools")
-
-# ── Per-device sensor cache ──
-_sensor_cache: dict[str, dict] = {}
-_sensor_ts: dict[str, float] = {}
-SENSOR_TTL = 30
-
-# ── Per-device location cache ──
-_device_location: dict[str, dict] = {}
-# {device_id: {lat, lng, adcode, city, province, source, updated_at}}
 
 # ── Tool protocol ──
 TOOL_PATTERN = re.compile(r"/tools\.([a-z_]+)(?:\(([^)]*)\))?")
@@ -36,81 +33,6 @@ def _register(name: str, description: str):
         TOOLS[name] = {"name": name, "description": description, "handler": fn}
         return fn
     return wrapper
-
-
-# ═══════════════ Location Cache Helpers ═══════════════
-
-def cache_device_location(device_id: str, location: dict):
-    """Cache device location. Higher precision overwrites lower."""
-    if not device_id or not location:
-        return
-    lat = location.get("lat", 0)
-    lng = location.get("lng", 0)
-    if not lat and not lng:
-        return
-    prev = _device_location.get(device_id, {})
-    prev_source = prev.get("source", "")
-    new_source = location.get("source", location.get("_source", "unknown"))
-    # network > ip — don't let ip overwrite network
-    if prev_source == "network" and new_source == "ip":
-        return
-    _device_location[device_id] = {
-        "lat":        lat,
-        "lng":        lng,
-        "adcode":     location.get("adcode", prev.get("adcode", "")),
-        "city":       location.get("city", prev.get("city", "")),
-        "province":   location.get("province", prev.get("province", "")),
-        "source":     new_source,
-        "accuracy":   location.get("accuracy", 0),
-        "updated_at": time.time(),
-    }
-    logger.info(f"Location cached [{device_id[:8]}]: lat={lat} lng={lng} src={new_source}")
-
-
-def get_device_location(device_id: str) -> dict | None:
-    """Get cached device location, or None if never set."""
-    return _device_location.get(device_id)
-
-
-def _resolve_location(device_id: str, params: dict | None) -> tuple[float | None, float | None, str]:
-    """
-    Resolve lat/lng: LLM-provided > device cache > None.
-    Returns (lat, lng, source_str).
-    source_str: "user" | "device" | None
-    """
-    p = params or {}
-    user_lat = p.get("lat")
-    user_lng = p.get("lng")
-    if user_lat and user_lng:
-        try:
-            return float(user_lat), float(user_lng), "user"
-        except (ValueError, TypeError):
-            pass
-    loc = _device_location.get(device_id)
-    if loc and loc.get("lat") and loc.get("lng"):
-        return loc["lat"], loc["lng"], f"device({loc.get('source','unknown')})"
-    return None, None, None
-
-
-# ═══════════════ Memory Future Helpers (tool_history 双向请求) ═══════════════
-# 按 req_id 键控 — 与 scan future (按 device_id) 不同, 同设备并发工具请求互不覆盖
-
-_memory_futures: dict[str, asyncio.Future] = {}
-
-
-def create_memory_future(req_id: str) -> asyncio.Future:
-    """Create a Future for tool_history to await."""
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-    _memory_futures[req_id] = future
-    return future
-
-
-def resolve_memory_future(req_id: str, result: dict):
-    """Called by WS handler when ESP32 sends memory_data."""
-    future = _memory_futures.pop(req_id, None)
-    if future and not future.done():
-        future.set_result(result)
 
 
 # ═══════════════ Tool Handlers ═══════════════
@@ -412,16 +334,3 @@ async def execute_tools(calls: list[dict], device_id: str) -> dict[str, str]:
     tasks = [run_one(c) for c in calls]
     results_list = await asyncio.gather(*tasks)
     return dict(results_list)
-
-
-# ═══════════════ Sensor Cache (from ESP32) ═══════════════
-
-def cache_sensor(device_id: str, data: dict):
-    """Store latest sensor data from ESP32."""
-    _sensor_cache[device_id] = data
-    _sensor_ts[device_id] = time.time()
-
-
-def get_cached_sensor(device_id: str) -> dict | None:
-    """Get sensor data if available."""
-    return _sensor_cache.get(device_id)
