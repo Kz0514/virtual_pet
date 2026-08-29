@@ -311,15 +311,3 @@ async def compact_memory(content: str, pet_name: str | None = None, owner_name: 
 
 # ── Backward-compatible simple chat ──
 
-async def chat(
-    user_text: str,
-    system_prompt: str | None = None,
-    history: list[dict] | None = None,
-    max_tokens: int = 150,
-    temperature: float = 0.9,
-) -> str:
-    """Simple chat without tools (backward compat)."""
-    reply, _, _ = await chat_with_tools(user_text, system_prompt, history, "", "")
-    return reply
-
-

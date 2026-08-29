@@ -135,9 +135,9 @@ run_ssh(ssh, "docker builder prune -f", "Clean build cache")
 print("\n=== Testing LLM service ===")
 stdin, stdout, stderr = ssh.exec_command(
     f"cd {REMOTE_DIR} && docker compose exec -T app python -c "
-    "\"from app.services.llm_service import chat; "
+    "\"from app.services.llm_service import chat_with_tools; "
     "import asyncio; "
-    "print('LLM Reply:', asyncio.run(chat('你好')))\""
+    "print('LLM Reply:', asyncio.run(chat_with_tools('你好', None, None, '', ''))[0])\""
 )
 for line in stdout:
     print(f"  {line.rstrip()}")
