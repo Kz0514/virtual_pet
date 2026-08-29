@@ -13,8 +13,6 @@ celery_app = Celery(
     backend=settings.redis_url,
     include=[
         "app.tasks.diary_tasks",
-        "app.tasks.habit_tasks",
-        "app.tasks.cleanup_tasks",
     ],
 )
 
@@ -28,14 +26,6 @@ celery_app.conf.update(
         "generate-daily-diaries": {
             "task": "app.tasks.diary_tasks.generate_daily_diaries",
             "schedule": 3600.0,  # Every hour, check if any device needs diary generation
-        },
-        "analyze-user-habits": {
-            "task": "app.tasks.habit_tasks.analyze_user_habits",
-            "schedule": 86400.0,  # Daily at midnight
-        },
-        "cleanup-expired-sessions": {
-            "task": "app.tasks.cleanup_tasks.cleanup_expired_sessions",
-            "schedule": 3600.0,
         },
     },
 )
