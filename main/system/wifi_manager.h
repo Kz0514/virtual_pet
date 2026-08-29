@@ -43,6 +43,12 @@ void wifi_manager_resume(void);
  * 亮屏后不恢复: 亮屏期持有 screen 禁睡锁, 该回调仅息屏期才有意义。 */
 void wifi_manager_detach_light_sleep_skip(void);
 
+/** ws 连接尝试失败通知 (仅"连接从未成功"的失败 — 已连后断开由组件自动
+ * 重连, 不通知)。连续 WS_FAIL_THRESHOLD 次 → 控制任务 DNS 自检: 通过 =
+ * 服务器异常 (不动, ws 继续自动重试); 失败 = 数据面死 (僵尸链路) →
+ * 强制断开重连。无定时器无周期探活 — 仅在真实连接异常时自愈。 */
+void wifi_manager_note_ws_fail(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -27,6 +27,8 @@
 #include "cJSON.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "lwip/netdb.h"      /* getaddrinfo — 链路自愈 DNS 自检 */
+#include "server_config.h"   /* SERVER_HOST — DNS 自检目标 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -55,6 +57,13 @@ static const char *TAG = "wifi";
 /* 连接超时 */
 #define WIFI_CONNECT_TIMEOUT_MS 30000
 #define WIFI_RETRY_MAX 3
+
+/* 链路自愈 (僵尸链路): ws 连续失败 → DNS 自检 → 数据面死才强制重连。
+ * 无定时器/无周期探活 — 仅在真实连接异常时动手。 */
+#define WS_FAIL_THRESHOLD 3                /* 连续失败次数 (ws 每 10s 重试 ≈30s) */
+#define HEAL_COOLDOWN_MS (10 * 60 * 1000)  /* 强制重连冷却 — 链路未恢复时不反复断网 */
+static int s_ws_fail_cnt = 0;
+static uint32_t s_last_heal_tick = 0;
 
 /* ── 状态 ── */
 static wifi_state_t s_state = WIFI_DISCONNECTED;
@@ -652,8 +661,42 @@ static void wifi_ctrl_task(void *pv)
             int n = do_scan(s_scan_cache, SCAN_CACHE_MAX);
             ESP_LOGI(TAG, "重试前扫描: %d 个 AP", n);
             esp_wifi_connect();
+        } else if (cmd == 4) {
+            /* 链路自愈: DNS 自检区分"服务器挂"(DNS 活 → 不动, ws 自动
+             * 重试会恢复) 与"数据面死"(DNS 死 → 僵尸链路, 关联还在但
+             * 数据面全死, 只能主动踢掉重连 — DISCONNECTED 事件自动走
+             * 同网络重连路径)。getaddrinfo 阻塞 2-5s, 放控制任务。 */
+            struct addrinfo hints = {0}, *res = NULL;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            int rc = getaddrinfo(SERVER_HOST, NULL, &hints, &res);
+            if (rc == 0) {
+                freeaddrinfo(res);
+                ESP_LOGI(TAG, "DNS 自检通过 — 网络正常, 等待 ws 自动重试");
+            } else {
+                ESP_LOGW(TAG, "DNS 自检失败 (%d) — 数据面死, 强制重连 WiFi", rc);
+                esp_wifi_disconnect();
+            }
         }
     }
+}
+
+/* ws 连接尝试失败通知 (任意上下文可调): 连续达阈值 → 转控制任务 DNS
+ * 自检。已连后断开不算 (组件自动重连), 未连上状态忽略 (wifi 层自己在管) */
+void wifi_manager_note_ws_fail(void)
+{
+    if (s_state != WIFI_CONNECTED) return;
+    if (++s_ws_fail_cnt < WS_FAIL_THRESHOLD) return;
+    s_ws_fail_cnt = 0;
+    uint32_t now = xTaskGetTickCount();
+    if ((int32_t)(now - s_last_heal_tick) < pdMS_TO_TICKS(HEAL_COOLDOWN_MS)) {
+        ESP_LOGW(TAG, "ws 连续失败达阈值, 冷却期内 — 跳过自检");
+        return;
+    }
+    s_last_heal_tick = now;
+    ESP_LOGW(TAG, "ws 连续 %d 次连接失败 — DNS 自检数据面…", WS_FAIL_THRESHOLD);
+    s_ctrl_cmd = 4;
+    xTaskNotifyGive(s_ctrl_task);
 }
 
 static void connect_timeout_cb(void *arg)
@@ -743,6 +786,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             save_wifi_list();
         }
         s_state = WIFI_CONNECTED;
+        s_ws_fail_cnt = 0; /* 新链路建立 — 失败计数归零 */
     }
 }
 

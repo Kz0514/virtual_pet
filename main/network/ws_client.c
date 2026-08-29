@@ -6,6 +6,7 @@
 #include "server_config.h"
 #include "tts_client.h"
 #include "memory_store.h"
+#include "wifi_manager.h" /* wifi_manager_note_ws_fail — 链路自愈信号 */
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -93,7 +94,8 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                  (unsigned)uxTaskGetStackHighWaterMark(NULL));
         s_connected = true;
         break;
-    case WEBSOCKET_EVENT_DISCONNECTED:
+    case WEBSOCKET_EVENT_DISCONNECTED: {
+        bool was_connected = s_connected;
         ESP_LOGW(TAG, "WS 断开");
         s_connected = false;
         /* WS 音频流模式: 断连 = 不会有更多音频也不会有 audio_end —
@@ -105,7 +107,13 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             s_rx_buf = NULL;
         } /* 丢弃半截消息 */
         s_rx_len = s_rx_total = 0;
+        /* 链路自愈信号: 连接从未成功 = 一次尝试失败 (组件每 10s 重试)。
+         * 已连后断开不算 — 组件自动重连会自己恢复; 连续 3 次失败 →
+         * wifi_manager DNS 自检 → 数据面死 (僵尸链路) 才强制重连 */
+        if (!was_connected)
+            wifi_manager_note_ws_fail();
         break;
+    }
     case WEBSOCKET_EVENT_DATA: {
         /* ── 二进制帧 = WS 音频流 PCM ──
          * 逐片直接入环, 绝不分片重组: PCM 是字节流, 环按序消费, 分片
