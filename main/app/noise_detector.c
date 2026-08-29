@@ -4,6 +4,7 @@
 #include "asr_client.h"
 #include "tts_client.h"
 #include "session_mgr.h"
+#include "lvgl.h" /* lv_anim_count_running — 动画活跃判定 */
 #include "esp_log.h"
 #include "esp_pm.h"
 #include "freertos/FreeRTOS.h"
@@ -49,6 +50,7 @@ static esp_pm_lock_handle_t s_noise_lock = NULL;
 
 /* ── CSV 文件路径 ── */
 #define NOISE_CSV_PATH "/cfg/noise.csv"
+#define CSV_FLUSH_INTERVAL_S 30 /* 写盘节流: 30s 落盘一次, 防擦除风暴 */
 
 static uint32_t now_sec(void)
 {
@@ -190,8 +192,10 @@ void noise_detector_get_context_str(char *buf, int bufsize)
 /* ── CSV 写盘 (主循环调用, 单线程安全) ── */
 void noise_detector_write_csv(void)
 {
-    /* TTS 播放期间跳过 — flash 写会冻结双核造成音频卡顿, 下个节拍再写 */
+    /* TTS 播放 / 动画活跃期间跳过 — flash 写会禁用 cache 冻结双核,
+     * 动画素材读取 (SPIFFS) 排队 → 卡帧; 下个节拍再写 */
     if (tts_client_is_playing()) return;
+    if (lv_anim_count_running() > 0) return;
     static uint8_t s_last_written[NOISE_WIN_COUNT];
     bool any = false;
 
@@ -202,6 +206,14 @@ void noise_detector_write_csv(void)
         }
     }
     if (!any) return;
+
+    /* 写盘节流: 30s 落盘一次 — 原每 2s open/close (→ LittleFS flush →
+     * flash 擦除) 与同 flash 的 FATFS 操作互踩 (0x101 → 重试风暴 →
+     * TASK_WDT); 行带时间戳, 粒度变粗但诊断语义不变 */
+    static uint32_t s_last_flush = 0;
+    uint32_t now = now_sec();
+    if (now < s_last_flush + CSV_FLUSH_INTERVAL_S) return;
+    s_last_flush = now;
 
     /* CSV 会跨开机增长 — 超 256KB 重开 (丢弃旧数据) */
     struct stat st;
@@ -214,7 +226,6 @@ void noise_detector_write_csv(void)
         return;
     }
 
-    uint32_t now = now_sec();
     char line[64];
     bool wr_err = false;
     for (int i = 0; i < NOISE_WIN_COUNT; i++) {

@@ -9,6 +9,7 @@ idf_component_register(
         "system/time_manager.c"
         "system/sensor_logger.c"
         "system/memory_store.c"
+        "system/flash_writer_lock.c"
         # Drivers - Display (lvgl_port provided by esp_lvgl_port component)
         "drivers/display/st7789.c"
         # Drivers - Touch
@@ -104,6 +105,7 @@ idf_component_register(
         esp_psram
         spi_flash
         nvs_flash
+        lwip
         esp_wifi
         esp_http_server
         esp_http_client
@@ -118,4 +120,12 @@ idf_component_register(
         esp_littlefs
         esp_tinyusb
         usb
+)
+
+# 全局 flash 写互斥 (flash_writer_lock.c): 拦截 esp_flash API,
+# 统一互斥 + 擦除拆片读优先让位 — 所有 FS 底层都调这三个符号
+target_link_options(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=esp_flash_read"
+    "-Wl,--wrap=esp_flash_write"
+    "-Wl,--wrap=esp_flash_erase_region"
 )

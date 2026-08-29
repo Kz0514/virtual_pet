@@ -69,6 +69,7 @@
 #include "home_interaction.h"
 #include "sensor_logger.h"
 #include "memory_store.h"
+#include "flash_writer_lock.h"
 #include "time_manager.h"
 #include "diary_mgr.h"
 #include "life_log.h"
@@ -286,6 +287,10 @@ static void power_seg_tick(const bq27220_data_t *bat)
 void app_main(void)
 {
     ESP_LOGI(TAG, "════════ Virtualpet启动 ════════");
+
+    /* 0z. flash 写互斥锁最先初始化 — 之后所有 esp_flash API (NVS/LittleFS/
+     * FATFS/SPIFFS 底层) 统一互斥, 擦除持锁跨 yield (0x101 风暴根治) */
+    flash_writer_lock_init();
 
     /* 0a. OTA 回滚确认 — 若是 OTA 升级后的首次启动, 立即确认固件有效,
      * 否则 bootloader 3 秒后 (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y)

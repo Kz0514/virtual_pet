@@ -17,6 +17,7 @@
 #include "sensor_logger.h"
 #include "usb_storage.h"
 #include "tts_client.h"
+#include "lvgl.h" /* lv_anim_count_running — 动画活跃判定 */
 #include "esp_log.h"
 #include "esp_littlefs.h"
 #include "wear_levelling.h"
@@ -107,24 +108,38 @@ esp_err_t sensor_logger_init(void)
     return ESP_OK;
 }
 
+/* 写盘节流: 30s 落盘一次 — 原每 2s 一次 open/close (→ LittleFS flush →
+ * flash 擦除) 与同 flash 的 FATFS 操作在擦除 yield 窗口互踩
+ * (0x101 → 重试风暴 → TASK_WDT); 数据先攒内存, 断电最多丢 30s
+ * (内部诊断数据可接受) */
+#define LOG_FLUSH_INTERVAL_S 30
+static sensor_snapshot_t s_pending[3];
+static int s_pending_count = 0;
+static uint32_t s_last_flush = 0;
+
 esp_err_t sensor_logger_append(const sensor_snapshot_t *s)
 {
     if (!s_ready || !s) return ESP_FAIL;
-    /* TTS 播放期间跳过 — flash 写会禁用 cache 冻结双核 100-400ms,
-     * 流式播放的浅缓冲会把它暴露成音频卡顿; 下个 2s 节拍再写 */
+    /* TTS 播放 / 动画活跃期间跳过 — flash 写会禁用 cache 冻结双核
+     * 100-400ms, 流式播放的浅缓冲会暴露成音频卡顿, 动画素材读取
+     * (SPIFFS) 会排队卡帧; 下个 2s 节拍再写 */
     if (tts_client_is_playing()) return ESP_FAIL;
+    if (lv_anim_count_running() > 0) return ESP_FAIL;
 
-    /* Read existing entries */
-    sensor_snapshot_t entries[4];
-    int count = sensor_logger_get_recent(entries, 3);
-    if (count >= 3) {
-        entries[0] = entries[1];
-        entries[1] = entries[2];
-        entries[2] = *s;
-    } else {
-        entries[count] = *s;
-        count++;
+    /* 内存滚动槽 (最近 3 条); 首次用文件历史播种, 之后纯内存滚动 */
+    if (s_pending_count == 0) {
+        s_pending_count = sensor_logger_get_recent(s_pending, 3);
     }
+    if (s_pending_count < 3) {
+        s_pending[s_pending_count++] = *s;
+    } else {
+        s_pending[0] = s_pending[1];
+        s_pending[1] = s_pending[2];
+        s_pending[2] = *s;
+    }
+
+    if (s->timestamp < s_last_flush + LOG_FLUSH_INTERVAL_S) return ESP_OK;
+    s_last_flush = s->timestamp;
 
     /* Rewrite file (retry once on fd contention) */
     int fd = open(LOG_FILE, O_CREAT | O_TRUNC | O_WRONLY);
@@ -138,11 +153,11 @@ esp_err_t sensor_logger_append(const sensor_snapshot_t *s)
     }
     char line[96];
     bool wr_err = false;
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < s_pending_count; i++) {
         int n = snprintf(line, sizeof(line), "%lu,%.1f,%u,%.0f,%d,%u\n",
-                         (unsigned long)entries[i].timestamp, entries[i].temperature,
-                         entries[i].humidity, entries[i].ambient_lux,
-                         entries[i].battery_mv, entries[i].battery_pct);
+                         (unsigned long)s_pending[i].timestamp, s_pending[i].temperature,
+                         s_pending[i].humidity, s_pending[i].ambient_lux,
+                         s_pending[i].battery_mv, s_pending[i].battery_pct);
         if (n > 0 && write(fd, line, (size_t)n) < 0) wr_err = true;
     }
     if (wr_err) ESP_LOGW(TAG, "写入 %s 失败 — FAT 异常或 flash 写错误", LOG_FILE);
