@@ -6,6 +6,7 @@ idf_component_register(
         "system/gpio_utils.c"
         "system/wifi_manager.c"
         "system/power_manager.c"
+        "system/power_diag.c"
         "system/time_manager.c"
         "system/sensor_logger.c"
         "system/memory_store.c"

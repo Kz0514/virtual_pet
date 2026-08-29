@@ -19,6 +19,7 @@
  * - 深度睡眠预留: 唤醒=重启, 需处理会话/记忆/重连, 后续版本实现
  */
 #include "power_manager.h"
+#include "power_diag.h" /* power_diag_note_wake_source — W 行唤醒记账 */
 #include "st7789.h" /* : 息屏面板进 SLPIN (内部 ~119Hz 扫描耗电) */
 #include "es8311_drv.h"
 #include "esp_log.h"
@@ -438,10 +439,8 @@ void power_manager_note_interaction(void)
         s_screen_on = true;
         s_screen_dim = false;
         s_off_fade_done = false;
-        /* power_seg.csv W 行: 任一唤醒翻转点 (探针 src=1 已前置标记)。
-         * ⑤-1 power_diag 迁出时, 此临时 extern 随记账函数一起迁走 */
-        extern void power_seg_note_wake_source(uint8_t src);
-        power_seg_note_wake_source(s_wake_src);
+        /* power_seg.csv W 行: 任一唤醒翻转点 (探针 src=1 已前置标记) */
+        power_diag_note_wake_source(s_wake_src);
         s_wake_src = 0;
         /* WiFi 保持连接态浅睡 (息屏不再 stop) — 唤醒零重连延迟:
          * 语音回执/消息推送不再等 3-5s WiFi 重连 + WS 重挂 */
