@@ -50,9 +50,30 @@ extern volatile uint32_t xDiagSleepErr;    /* : esp_light_sleep_start 最后错�
 extern volatile uint32_t xDiagSleepErrCnt; /* : 错误累计计数 */
 
 /* /data/power_log.csv — 2s 一条追加 (state: 0=亮 1=变暗 2=息屏), >64KB 重开。
- * fd 路径零分配 — newlib fopen 分配 FILE+锁 (内部 RAM), 耗尽直接 abort */
+ * fd 路径零分配 — newlib fopen 分配 FILE+锁 (内部 RAM), 耗尽直接 abort。
+ * 超限重开: 不 remove (FAT 释放链更新丢失会累积孤儿簇 → U盘卷可用空间
+ * 持续缩水; chkdsk 曾一次找回 37 条孤儿链 320KB), 改 O_TRUNC 原地截断
+ * 复用簇链 — 簇始终被文件引用, FAT 更新丢失最坏只是长度回退, 不产生
+ * 不可达簇。无状态实现: 每次写入前查文件当前大小, 超限即截断 — 重启
+ * 丢失任何内存标志也不影响 (教训: 内存标志版被重启打断后 550KB 不再截断) */
+static void power_diag_roll(const char *path, int64_t limit)
+{
+    int fd = open(path, O_CREAT | O_APPEND | O_WRONLY);
+    if (fd < 0)
+        return;
+    if (lseek(fd, 0, SEEK_END) > limit) {
+        close(fd);
+        int t = open(path, O_TRUNC | O_WRONLY);
+        if (t >= 0)
+            close(t);
+    } else {
+        close(fd);
+    }
+}
+
 void power_diag_log_append(const bq27220_data_t *bat, int state)
 {
+    power_diag_roll("/data/power_log.csv", 64 * 1024);
     int fd = open("/data/power_log.csv", O_CREAT | O_APPEND | O_WRONLY);
     if (fd < 0)
         return;
@@ -105,8 +126,7 @@ void power_diag_log_append(const bq27220_data_t *bat, int state)
         write(fd, line, (size_t)ln);
     off_t sz = lseek(fd, 0, SEEK_END);
     close(fd);
-    if (sz > 64 * 1024)
-        remove("/data/power_log.csv");
+    (void)sz; /* 重开由 power_diag_roll 在写入前无状态检查完成 */
 }
 
 /* ── 分段功耗/唤醒统计: /data/power_seg.csv (256KB 环形 ≈25h 全量保留,
@@ -131,6 +151,7 @@ static uint8_t s_bat_last_soc = 0;
 
 static void power_diag_seg_write_row(const char *buf, int len)
 {
+    power_diag_roll("/data/power_seg.csv", 256 * 1024);
     int fd = open("/data/power_seg.csv", O_CREAT | O_APPEND | O_WRONLY);
     if (fd < 0)
         return;
@@ -142,8 +163,7 @@ static void power_diag_seg_write_row(const char *buf, int len)
         write(fd, buf, (size_t)len);
     off_t sz = lseek(fd, 0, SEEK_END);
     close(fd);
-    if (sz > 256 * 1024)
-        remove("/data/power_seg.csv");
+    (void)sz; /* 重开由 power_diag_roll 在写入前无状态检查完成 */
 }
 
 /* 唤醒翻转点调用: 记录 W 行 (主要靠二次分析来源)。
