@@ -1,6 +1,7 @@
 """Alembic migrations environment configuration."""
 
 import asyncio
+import os
 from logging.config import fileConfig
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
@@ -12,6 +13,11 @@ from app.models import *  # noqa: F401,F403 — Ensure all models are imported
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+# DATABASE_URL 环境变量优先 (生产 docker-compose 已注入), 回退 alembic.ini
+# (本地开发) — ⑥-1
+if os.environ.get("DATABASE_URL"):
+    config.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
 
 target_metadata = Base.metadata
 

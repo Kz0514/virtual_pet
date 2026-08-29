@@ -2,6 +2,7 @@
 FastAPI application entry point.
 Creates the app, registers middleware and routers, sets up lifespan events.
 """
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -13,24 +14,25 @@ from app.api.ws.router import router as ws_router
 
 settings = get_settings()
 
+# 单用户部署: 老库不兼容, 首次部署前直接重建数据库 (drop 后由 upgrade head
+# 建全量结构)。alembic 同步 API 放 executor, 不阻塞启动事件循环;
+# 迁移失败 = 表结构不对 = 中止启动 (不静默, 后续请求全会崩)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ALEMBIC_INI = os.path.join(BASE_DIR, "alembic.ini")
+
+
+def _run_migrations() -> None:
+    from alembic import command
+    from alembic.config import Config
+    command.upgrade(Config(ALEMBIC_INI), "head")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup / shutdown events."""
     import logging
-    from sqlalchemy import text
-    from app.core.database import engine, Base
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # create_all 只建新表不补旧表列 — 幂等补齐老库缺失列 (如 pets.owner_name)
-        try:
-            await conn.execute(
-                text("ALTER TABLE pets ADD COLUMN owner_name VARCHAR(32) DEFAULT '主人'")
-            )
-            logging.getLogger("startup").warning("迁移: pets.owner_name 列已新增")
-        except Exception as e:  # 已存在 (Duplicate column) 或其它
-            if "Duplicate column" not in str(e) and "already exists" not in str(e):
-                logging.getLogger("startup").error(f"迁移检查异常: {e}")
+    logging.getLogger("startup").info("alembic upgrade head…")
+    await asyncio.get_running_loop().run_in_executor(None, _run_migrations)
     yield
 
 
