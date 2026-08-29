@@ -22,7 +22,7 @@ SENSOR_TTL = 30
 _device_location: dict[str, dict] = {}
 # {device_id: {lat, lng, adcode, city, province, source, updated_at}}
 
-# ── Async scan futures (for tool_network_location) ──
+# ── Async scan futures (WS scan_wifi 协议防御链 — 固件可能响应 scan_result) ──
 _scan_futures: dict[str, asyncio.Future] = {}
 
 # ── Tool protocol ──
@@ -98,7 +98,7 @@ def _resolve_location(device_id: str, params: dict | None) -> tuple[float | None
 # ═══════════════ Scan Future Helpers (async tools) ═══════════════
 
 def create_scan_future(device_id: str) -> asyncio.Future:
-    """Create a Future for tool_network_location to await."""
+    """Create a Future for the WS scan_wifi flow to await."""
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     _scan_futures[device_id] = future
@@ -376,54 +376,9 @@ async def tool_static_map(device_id: str, params: dict | None = None) -> str:
     return json.dumps({"status": "ok", "url": url, "_source": source}, ensure_ascii=False)
 
 
-# 未启用: 腾讯智能硬件定位 API 需额外申请权限
-async def tool_network_location(device_id: str, params: dict | None = None) -> str:
-    """Async tool: tells ESP32 to scan WiFi via WS, waits for result, calls Tencent API."""
-    # 1. Check if device is connected via WS
-    from app.api.ws.router import send_to_device, is_device_connected
-    if not is_device_connected(device_id):
-        return json.dumps({
-            "status": "error",
-            "_hint": "设备不在线，无法触发WiFi扫描。请先让设备连接。",
-        }, ensure_ascii=False)
-
-    # 2. Create future + send scan command
-    future = create_scan_future(device_id)
-    await send_to_device(device_id, {"type": "scan_wifi"})
-    logger.info(f"Sent scan_wifi to device {device_id[:8]}")
-
-    # 3. Wait for ESP32 response (timeout 15s, WiFi scan + send can take ~5s)
-    try:
-        scan_result = await asyncio.wait_for(future, timeout=15.0)
-    except asyncio.TimeoutError:
-        _scan_futures.pop(device_id, None)
-        logger.warning(f"Scan timeout for {device_id[:8]}")
-        return json.dumps({
-            "status": "error",
-            "_hint": "设备扫描超时(15秒)，请稍后重试",
-        }, ensure_ascii=False)
-
-    # 4. Call Tencent network location API
-    from app.services.network_location_service import locate
-    result = await locate(
-        device_id=device_id,
-        wifiinfo=scan_result.get("wifiinfo", []),
-    )
-
-    # 5. Cache more precise location
-    if result.get("status") == "ok" and result.get("lat") and result.get("lng"):
-        loc = {
-            "lat": result["lat"], "lng": result["lng"],
-            "accuracy": result.get("accuracy", 0),
-            "source": "network",
-            "city": result.get("ad_info", {}).get("city", ""),
-            "province": result.get("ad_info", {}).get("province", ""),
-            "adcode": result.get("ad_info", {}).get("adcode", ""),
-        }
-        cache_device_location(device_id, loc)
-        result["_cached"] = True
-
-    return json.dumps(result, ensure_ascii=False)
+# 未启用: 腾讯智能硬件定位 API 需额外申请权限 — 原 tool_network_location
+# 已删 (⑥-5); scan_wifi 请求端随之无调用方, 但 ws/router scan_result
+# 接收端 + resolve_scan_future 保留为协议防御 (固件可能响应)
 
 
 # ═══════════════ Engine ═══════════════
