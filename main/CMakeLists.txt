@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "lvgl_mem.c"
         # System
+        "system/boot_init.c"
         "system/gpio_utils.c"
         "system/wifi_manager.c"
         "system/power_manager.c"
