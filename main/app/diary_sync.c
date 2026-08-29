@@ -39,8 +39,10 @@ static const char *TAG = "diary_sync";
 #define LIST_CAP (64 * 1024)       /* 列表 JSON 上限 (31 篇 × ~700B) */
 #define HTML_CAP (192 * 1024)      /* 单篇 HTML 上限 (含涂鸦 b64) */
 #define DIARY_DIR "/data/diary"
-#define MAX_FILES 30
-#define MAX_TOTAL_BYTES (512 * 1024)
+#define MAX_FILES 20
+#define MAX_TOTAL_BYTES (128 * 1024) /* 1.0.283 预算重定: 单篇 ~2.3KB × 20 ≈ 46KB,
+                                      * 128KB 上限覆盖涂鸦大篇; 原 512KB 与
+                                      * life/power 预算叠加超 724KB 分区 */
 
 static TaskHandle_t s_task = NULL;
 static bool s_busy = false; /* 任务执行中 (tick 不再触发) */

@@ -18,6 +18,9 @@
 #include "power_manager.h"
 #include "time_manager.h"
 #include "touch_fpc.h"
+#include "sensor_logger.h" /* sensor_logger_data_mounted — FAT 可用性守卫 */
+#include "usb_storage.h"   /* usb_storage_get_drive — f_getfree 盘号 */
+#include "ff.h"            /* f_getfree — 满盘防御 */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -49,13 +52,17 @@ extern volatile char xDiagWinName[16];
 extern volatile uint32_t xDiagSleepErr;    /* : esp_light_sleep_start 最后错误码 */
 extern volatile uint32_t xDiagSleepErrCnt; /* : 错误累计计数 */
 
-/* /data/power_log.csv — 2s 一条追加 (state: 0=亮 1=变暗 2=息屏), >64KB 重开。
+/* /data/power_log.csv — 2s 一条追加 (state: 0=亮 1=变暗 2=息屏), >48KB 重开。
  * fd 路径零分配 — newlib fopen 分配 FILE+锁 (内部 RAM), 耗尽直接 abort。
  * 超限重开: 不 remove (FAT 释放链更新丢失会累积孤儿簇 → U盘卷可用空间
  * 持续缩水; chkdsk 曾一次找回 37 条孤儿链 320KB), 改 O_TRUNC 原地截断
  * 复用簇链 — 簇始终被文件引用, FAT 更新丢失最坏只是长度回退, 不产生
  * 不可达簇。无状态实现: 每次写入前查文件当前大小, 超限即截断 — 重启
- * 丢失任何内存标志也不影响 (教训: 内存标志版被重启打断后 550KB 不再截断) */
+ * 丢失任何内存标志也不影响 (教训: 内存标志版被重启打断后 550KB 不再截断)。
+ * 注意: 裸 O_TRUNC 在 ESP-IDF FAT VFS 是 no-op (fat_mode_conv 只有
+ * O_CREAT|O_TRUNC 才 FA_CREATE_ALWAYS; 裸 O_TRUNC 落 else 只读打开不截断) —
+ * 必须带 O_CREAT。1.0.283 实崩: 截断从未生效, power_log 一路涨到 577KB
+ * 写满 724KB 分区 (采集 24h 钓出) */
 static void power_diag_roll(const char *path, int64_t limit)
 {
     int fd = open(path, O_CREAT | O_APPEND | O_WRONLY);
@@ -63,7 +70,7 @@ static void power_diag_roll(const char *path, int64_t limit)
         return;
     if (lseek(fd, 0, SEEK_END) > limit) {
         close(fd);
-        int t = open(path, O_TRUNC | O_WRONLY);
+        int t = open(path, O_CREAT | O_TRUNC | O_WRONLY);
         if (t >= 0)
             close(t);
     } else {
@@ -71,9 +78,28 @@ static void power_diag_roll(const char *path, int64_t limit)
     }
 }
 
+/* 满盘防御: 可用空间 < 32KB → 停写诊断日志 (诊断可弃, 用户数据/功能优先;
+ * 预算重定后 48+192+256(life)+128(diary) = 624KB < 724KB 分区, 此检查兜底
+ * 预算误差)。仅数据模式 (FAT 挂载) 调用 — U盘模式下卷已 f_mount(NULL)
+ * 分离, f_getfree 走进已释放内存 → LoadProhibited 崩溃 */
+static bool power_diag_disk_low(void)
+{
+    if (!sensor_logger_data_mounted())
+        return true;
+    FATFS *fs = NULL;
+    DWORD fre_clu = 0;
+    char dpath[3] = {(char)('0' + usb_storage_get_drive()), ':', 0};
+    if (f_getfree(dpath, &fre_clu, &fs) != FR_OK || !fs)
+        return true; /* 卷异常 → 停写诊断 */
+    uint64_t free_bytes = (uint64_t)fre_clu * fs->csize * fs->ssize;
+    return free_bytes < (32u * 1024u);
+}
+
 void power_diag_log_append(const bq27220_data_t *bat, int state)
 {
-    power_diag_roll("/data/power_log.csv", 64 * 1024);
+    if (power_diag_disk_low())
+        return;
+    power_diag_roll("/data/power_log.csv", 48 * 1024);
     int fd = open("/data/power_log.csv", O_CREAT | O_APPEND | O_WRONLY);
     if (fd < 0)
         return;
@@ -129,8 +155,8 @@ void power_diag_log_append(const bq27220_data_t *bat, int state)
     (void)sz; /* 重开由 power_diag_roll 在写入前无状态检查完成 */
 }
 
-/* ── 分段功耗/唤醒统计: /data/power_seg.csv (256KB 环形 ≈25h 全量保留,
- * 补 power_log.csv 64KB 只留 ~10min 的验收盲区)。两型行:
+/* ── 分段功耗/唤醒统计: /data/power_seg.csv (192KB 环形 ≈46h 全量保留,
+ * 补 power_log.csv 48KB 只留 ~23min 的验收盲区)。两型行:
  *   S 行: 每 60s 聚合 = 段内平均电流/电压/SOC + 亮屏时长 + 唤醒次数
  *   W 行: 每次亮屏翻转瞬间 = 时刻 (unix+uptime) + 来源 + 当时电量
  * 来源 src: 1=探针 2 连击 (假唤醒嫌疑), 0=其他 (左键/摇动/操作)。
@@ -151,7 +177,9 @@ static uint8_t s_bat_last_soc = 0;
 
 static void power_diag_seg_write_row(const char *buf, int len)
 {
-    power_diag_roll("/data/power_seg.csv", 256 * 1024);
+    if (power_diag_disk_low())
+        return;
+    power_diag_roll("/data/power_seg.csv", 192 * 1024);
     int fd = open("/data/power_seg.csv", O_CREAT | O_APPEND | O_WRONLY);
     if (fd < 0)
         return;

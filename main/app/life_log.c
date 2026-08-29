@@ -35,7 +35,11 @@ static const char *TAG = "life_log";
 #define LIFE_DIR "/data/life"
 #define LIFE_FILE "/data/life/log.txt"
 #define LIFE_OLD_FILE "/data/life/log.old"
-#define LIFE_MAX_BYTES (512 * 1024)
+/* 128KB 滚动一档 (log.txt + log.old 峰值 256KB) — 1.0.283 预算重定:
+ * 全分区 724KB, 原 512KB 单文件占 71% 且与 diary/power 预算叠加超支,
+ * 满盘曾致 power_log 停更; 用户数据优先级: diary 128 + life 256 +
+ * power 48+192 = 624KB < 724KB 留余量 */
+#define LIFE_MAX_BYTES (128 * 1024)
 #define LIFE_QUEUE_LEN 16
 #define LIFE_LINE_MAX 256
 
