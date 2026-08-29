@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成 U盘磁盘图标 (pet.ico) → main/app/usb_icon.h (C 字节数组, 无 PIL 依赖)
+"""生成 U盘磁盘图标 (pet.ico) → main/drivers/storage/usb_icon.h (C 字节数组, 无 PIL 依赖; ②-3 随 usb_storage 归位)
 
 内置默认图标替换: 把想用的图标 (支持 .ico) 存成 tools/pet.ico,
 再运行 python tools/gen_icon.py — 直接逐字节嵌入, 不绘制。
@@ -20,7 +20,7 @@ BLUSH     = (255, 175, 185)
 MOUTH     = (255, 150, 160)
 
 SIZES = (16, 32, 48)
-OUT_H = "main/app/usb_icon.h"
+OUT_H = "main/drivers/storage/usb_icon.h"
 IMAGE_OVERRIDE = "tools/pet.ico"   # 存在时逐字节嵌入, 覆盖绘制
 
 
