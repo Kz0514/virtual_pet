@@ -8,6 +8,11 @@
     "api_key": "sk-你的DashScope-Key",
     "base_url": "https://dashscope.aliyuncs.com/api/v1"
   },
+  "dashscope_doodle": {
+    "enabled": false,
+    "api_key": "sk-你的DashScope-Key",
+    "base_url": "https://dashscope.aliyuncs.com/api/v1"
+  },
   "tencent": {
     "api_key": "你的腾讯地图Key"
   }

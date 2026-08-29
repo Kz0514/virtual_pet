@@ -9,7 +9,7 @@ Virtualpet拥有包括语音对话在内的多种互动方式，比如摇晃检�
 
 Virtualpet支持OTA功能，固件升级便捷。将来会持续更新可用动画及完善优化更多功能
 
-Virtualpet预计包含日记功能，当单日的互动次数较多时，就可以收到一篇来自宠物的日记，有小概率包含可爱的涂鸦或简笔画。
+Virtualpet包含日记功能，当单日的互动次数较多时，就会收到一篇来自宠物的日记，有小概率包含可爱的涂鸦或简笔画。
 
 本项目基于esp32-s3开发，相关硬件及外壳设计已在立创开源平台开源。[硬件开源链接](https://oshwhub.com/c1364/project_ndjrtbhi?jlc_vid=QVUIBVZTTwcKBgZeFldZBFFSQwJbVQcFRgddAgFVTwAxVlNeQVRcUlJVQ1hZVzsOAxUeFF5JWBEPFBcWGBMaSQ4KFE8NCAlJ)
 
@@ -20,7 +20,7 @@ Virtualpet预计包含日记功能，当单日的互动次数较多时，就可�
 
 当前已经集成的API:
 
-LLM,ASR,TTS,IP定位，天气查询，地点、周边查询，地图(暂未使用)，地址解析和逆地址解析(用于测算两点距离)，智能硬件定位(即根据WIFI/蓝牙信标的精准定位方式，项目里有相关代码，但我的KEY无权限，未实测)
+LLM,ASR,TTS,IP定位，天气查询，地点、周边查询，静态地图，地址解析和逆地址解析(用于测算两点距离)
 
 由于开发时间较短，框架尚不完善，将会持续更新，预计1.1.0版本完成整个框架
 
@@ -30,21 +30,21 @@ LLM,ASR,TTS,IP定位，天气查询，地点、周边查询，地图(暂未使�
 [LVGL](https://github.com/lvgl/lvgl)
 [FastAPI](https://github.com/fastapi/fastapi)
 
-## 项目结构(V1.0.0)
+## 项目结构(当前)
 
 ```
 Virtualpet/
 ├── main/                  # ESP32 固件源码
-│   ├── ai/                # AI 模块（TTS、唤醒词、Prompt）
-│   ├── app/               # 应用层（宠物引擎、动画管理、传感器融合）
-│   ├── drivers/           # 硬件驱动（屏幕、触摸、音频、传感器）
-│   ├── network/           # 网络（WiFi、WebSocket、OTA）
-│   ├── system/            # 系统（电源、时间、GPIO）
-│   └── ui/                # UI（屏幕、控件、字体）
+│   ├── ai/                # AI 模块（ASR 转写、TTS 播放、会话管理）
+│   ├── app/               # 应用层（宠物引擎、交互手势、日记、消息分发）
+│   ├── drivers/           # 硬件驱动（屏幕、触摸、音频、传感器、存储）
+│   ├── network/           # 网络（WebSocket、REST、OTA、资源下载）
+│   ├── system/            # 系统（电源、配置、日志、启动序列、WiFi）
+│   └── ui/                # UI（屏幕、控件、字体、动画引擎）
 ├── server/                # 服务器端（FastAPI 后端）
 │   ├── app/api/           # REST + WebSocket API
-│   ├── app/services/      # 业务逻辑（LLM、TTS、天气、日记）
-│   ├── app/core/          # 基础设施（数据库、Redis、安全）
+│   ├── app/services/      # 业务逻辑（LLM、TTS、工具执行、天气、日记）
+│   ├── app/core/          # 基础设施（PostgreSQL、Redis、安全）
 │   └── app/models/        # 数据模型
 ├── assets/                # 动画资源
 ├── tools/                 # 工具脚本
