@@ -1,11 +1,11 @@
 /**
  * @file sim_spiffs.c
- * @brief 路径重定向层: 把设备路径 (/spiffs/, /data/) 映射到项目本地目录
+ * @brief 路径重定向层: 把设备路径 (/assets/, /data/) 映射到项目本地目录
  *
  * 链接选项: -Wl,--wrap=fopen --wrap=open --wrap=stat64i32 --wrap=opendir
  *
  * 新 UI 代码的文件 IO 已全走 POSIX fd (open/read/close), fopen 只留历史兼容:
- *   - /spiffs/xxx → ../spiffs/xxx   (实机 SPIFFS 镜像源目录, 与固件资源 100% 一致)
+ *   - /assets/xxx → ../assets_fs/xxx   (实机资源镜像源目录, 与固件资源 100% 一致)
  *   - /data/xxx   → ../simdata/xxx  (日记等数据, 首次访问自动建 simdata/diary)
  *
  * 注意 (MinGW 坑): stat() 在 sys/stat.h 被 __MINGW_ASM_CALL(stat64i32) 编译期
@@ -33,7 +33,7 @@ extern DIR *__real_opendir(const char *path);
 #define SIM_SPIFFS_LOCAL "../simulator/spiffs"   /* 模拟器专属资源 (动画包等) */
 #endif
 #ifndef SIM_SPIFFS_DIR
-#define SIM_SPIFFS_DIR "../spiffs"               /* 实机资源 (字体 zh.bin 回落) */
+#define SIM_SPIFFS_DIR "../assets_fs"            /* 实机资源 (字体 zh.bin 回落) */
 #endif
 #ifndef SIM_DATA_DIR
 #define SIM_DATA_DIR "../simdata"
@@ -44,7 +44,7 @@ static const char *translate_path(const char *path, char *out, size_t out_sz) {
     if (!path) return NULL;
 
     /* 环境变量 SIM_ZH_FONT: 覆盖 zh.bin 字体路径 (用于字体测试) */
-    if (strncmp(path, "/spiffs/", 8) == 0) {
+    if (strncmp(path, "/assets/", 8) == 0) {
         if (strcmp(path + 8, "zh.bin") == 0) {
             const char *override = getenv("SIM_ZH_FONT");
             if (override && override[0] != '\0') return override;

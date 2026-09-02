@@ -11,8 +11,8 @@ from app.models import Device
 logger = logging.getLogger("assets_api")
 router = APIRouter()
 
-# Directory on server where asset files live (same as spiffs/ source)
-ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "spiffs")
+# Directory on server where asset files live (same as assets_fs/ source)
+ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "assets_fs")
 
 
 @router.get("/list")

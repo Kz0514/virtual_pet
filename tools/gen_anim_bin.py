@@ -44,7 +44,7 @@ import sys
 
 SRC_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "anim_bin")
 OUT_DEFAULT = [
-    os.path.join(os.path.dirname(__file__), "..", "spiffs", "anims.bin"),
+    os.path.join(os.path.dirname(__file__), "..", "assets_fs", "anims.bin"),
     os.path.join(os.path.dirname(__file__), "..", "simulator", "spiffs", "anims.bin"),
 ]
 FRAME_SIZE = 240 * 240 * 2

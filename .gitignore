@@ -61,8 +61,8 @@ build/
 
 # ESP-IDF specific build outputs
 *.bin
-# SPIFFS 动画帧资源例外 — 上传仓库，克隆即可烧录
-!spiffs/*.bin
+# 动画帧资源例外 — 上传仓库，克隆即可烧录
+!assets_fs/*.bin
 # 模拟器独立资源 (动画包 anims.bin) — 与实机资源分离, 克隆即可运行模拟器
 !simulator/spiffs/*.bin
 # 本机便利脚本 (硬编码 IDF/COM 路径) — 不入库

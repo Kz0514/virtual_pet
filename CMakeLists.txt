@@ -11,5 +11,5 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/version.txt" PROJECT_VER_STR)
 string(STRIP "${PROJECT_VER_STR}" PROJECT_VER_STR)
 project(Virtualpet VERSION ${PROJECT_VER_STR})
 
-# LittleFS 动画资源镜像 (spiffs/ → assets 分区)
-littlefs_create_partition_image(assets spiffs FLASH_IN_PROJECT)
+# LittleFS 动画资源镜像 (assets_fs/ → assets 分区)
+littlefs_create_partition_image(assets assets_fs FLASH_IN_PROJECT)
