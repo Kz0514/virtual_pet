@@ -271,10 +271,9 @@ int main(int argc, char *argv[]) {
     /* 保存主页 screen 对象 (SDL 默认屏; 设置页关闭后 screen_load_full 切回) */
     s_home_scr = lv_screen_active();
 
-    printf("[sim] 初始化 pet_avatar...\n");
-    if (pet_avatar_init() != 0) {
-        printf("[sim] WARNING: pet_avatar 初始化失败 (动画文件缺失?), 继续运行\n");
-    }
+    /* pet_avatar 已由 home_screen_init() 统一初始化 (与真机同链)。
+     * 此处二次 init 会再建一个 frame timer → 双 timer 共抢进度状态机
+     * → 动画 ~2 倍速 + 循环错乱 (1.0.2xx 模拟器动画加速根因) */
 
     printf("[sim] 初始化 status_bar...\n");
     status_bar_init();
