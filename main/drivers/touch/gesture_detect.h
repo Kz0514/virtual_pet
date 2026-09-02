@@ -19,6 +19,7 @@ typedef enum {
     GESTURE_OPEN_MENU,        /* 屏幕开启且菜单关闭时，双击左侧键打开菜单 */
     GESTURE_CLOSE_MENU,       /* 菜单打开时，双击左侧键关闭菜单 */
     GESTURE_VOICE_TRIGGER,    /* 长按左侧键：手动触发语音对话 */
+    GESTURE_FORCE_REBOOT,     /* 长按左侧键 ≥10s：强制重启 (逃生通道) */
     GESTURE_MUTE_TOGGLE,      /* 三击左侧键切换静音 */
     GESTURE_SINGLE_TAP,       /* 菜单模式下单击确认（非菜单模式不产生; 菜单模式下零延迟发射） */
     GESTURE_SWIPE_LEFT,       /* 顶部滑块左滑 */

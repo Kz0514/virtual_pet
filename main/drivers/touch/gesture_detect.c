@@ -30,6 +30,7 @@ typedef struct {
     uint32_t last_release_us;      /* 上次释放的时间 */
     uint32_t last_tap_us;          /* 最近一次点击释放的时间 */
     int tap_count;                 /* 当前序列中的连续点击次数 */
+    bool reboot_fired;             /* 本次长按是否已发强制重启 (按住期只发一次) */
     float swipe_start_pos;         /* 滑动起始位置 */
     float swipe_current_pos;       /* 滑动当前位置 */
     /* 状态镜像 (只读, 唯一写入方见注释):
@@ -54,6 +55,9 @@ static gesture_ctx_t s_gctx = {
 
 #define TAP_TIMEOUT_US 300000       /* 点击间隔超时 300ms */
 #define LONG_PRESS_US 3000000       /* 长按阈值 3s */
+#define FORCE_REBOOT_US 10000000    /* 长按 ≥10s 强制重启 (逃生通道:
+                                        触摸状态异常时的硬退出, 3s 语音已发
+                                        过, 10s 是叠加动作, 持按期间只发一次) */
 #define SWIPE_THRESHOLD 0.3f        /* 触发滑动的位移阈值 (raw 质心位移) */
 #define DOUBLE_TAP_WINDOW_US 500000 /* 双击窗口 500ms */
 #define TRIPLE_TAP_WINDOW_US 600000 /* 三击窗口 600ms */
@@ -118,6 +122,7 @@ void gesture_process(void)
             s_gctx.state = GS_PRESS_PENDING;
             s_gctx.press_start_us = now_us;
             s_gctx.tap_count = 0;
+            s_gctx.reboot_fired = false; /* 新一轮按下重新武装 10s 重启 */
         }
         break;
 
@@ -203,6 +208,11 @@ void gesture_process(void)
     case GS_LONG_PRESS:
         if (!left_pressed) {
             s_gctx.state = GS_IDLE;
+        } else if (!s_gctx.reboot_fired &&
+                   (now_us - s_gctx.press_start_us) > FORCE_REBOOT_US) {
+            /* 长按连续 ≥10s — 强制重启 (3s 上电语音属长按语义超集) */
+            s_gctx.reboot_fired = true;
+            emit_event(GESTURE_FORCE_REBOOT);
         }
         break;
 
@@ -370,6 +380,7 @@ void gesture_reset_taps(void)
 {
     s_gctx.state = GS_IDLE;
     s_gctx.tap_count = 0;
+    s_gctx.reboot_fired = false;
     s_gctx.press_start_us = 0;
     s_gctx.last_tap_us = 0;
     s_gctx.last_release_us = 0;

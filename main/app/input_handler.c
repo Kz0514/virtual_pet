@@ -29,7 +29,11 @@
 #include "tap_detector.h"
 #include "shake_detector.h"
 #include "power_manager.h"
+#include "tm6604.h"     /* 重启前马达提示 */
 #include "esp_log.h"
+#include "esp_system.h" /* esp_restart — 长按 10s 逃生 */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lvgl.h"
 
 static const char *TAG = "input";
@@ -110,6 +114,15 @@ static void on_gesture_event(gesture_event_t ev)
     switch (ev) {
     case GESTURE_WAKE_SCREEN:
         power_manager_note_interaction();
+        break;
+
+    case GESTURE_FORCE_REBOOT:
+        /* 左键长按连续 ≥10s — 强制重启 (逃生通道, 不依赖页面状态)。
+         * 马达提示 120ms 后重启 — 不落任何状态 (触摸异常时最可靠的恢复) */
+        ESP_LOGW(TAG, "左键长按 10s — 强制重启!");
+        tm6604_vibrate(90, 120);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
         break;
 
     case GESTURE_OPEN_MENU:
