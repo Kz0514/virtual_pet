@@ -9,7 +9,7 @@
 模拟器资源与实机**分离** (动画包在模拟器目录, 字体共用回落):
 
 - `/spiffs/xxx` → **优先 `simulator/spiffs/xxx`** (模拟器专属资源, 如动画包
-  `anims.bin`), **缺失回落 `../spiffs/xxx`** (实机资源, 如字体 `zh.bin`)
+  `anims.bin`), **缺失回落 `../assets_fs/xxx`** (实机资源, 如字体 `zh.bin`)
 - `/data/xxx`   → `../simdata/xxx` (日记等, 首次访问自动建 `simdata/diary/`)
 
 > 动画已是单文件包架构 `anims.bin` (固件 SPIFFS 文件数 90→2, open 毫秒级;
@@ -42,7 +42,7 @@ cd simulator
 ./build/lvgl_simulator.exe
 ```
 
-> 必须在 `simulator/` 目录下运行 (路径翻译用相对路径 `../spiffs/` `../simdata/`)。
+> 必须在 `simulator/` 目录下运行 (路径翻译用相对路径 `../assets_fs/` `../simdata/`)。
 > 退出方式: Q, 或主页时 ESC (设置/日记页内 ESC 是"返回", 不会退出)。
 
 ## 键盘快捷键 (需窗口在前台)

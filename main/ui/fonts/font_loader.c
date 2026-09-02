@@ -1,4 +1,4 @@
-/** @file font_loader.c @brief SPIFFS→SPIRAM→lv_binfont_create_from_buffer */
+/** @file font_loader.c @brief LittleFS→SPIRAM→lv_binfont_create_from_buffer */
 #include "font_loader.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -56,7 +56,7 @@ void font_loader_init(void)
         return;
     }
     close(fd);
-    ESP_LOGI(TAG, "从 SPIFFS 加载 zh.bin (%ld bytes)", (long)fsize);
+    ESP_LOGI(TAG, "从 LittleFS 加载 zh.bin (%ld bytes)", (long)fsize);
 
     /* 暂停 TWDT, 在 CPU1 解析 (避免阻塞 CPU0 IDLE) */
     esp_task_wdt_deinit();

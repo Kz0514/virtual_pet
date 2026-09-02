@@ -1,6 +1,6 @@
 /**
  * 指着自己动画清单 — 命名规范: 所有符号以文件夹名 "zhizheziji_" 为前缀
- * 帧文件: /spiffs/zhizheziji_00.bin .. zhizheziji_04.bin
+ * 帧文件: /assets_fs/zhizheziji_00.bin .. zhizheziji_04.bin
  *
  * 每个动画文件夹各有一个 manifest.h，通过前缀避免符号冲突。
  */

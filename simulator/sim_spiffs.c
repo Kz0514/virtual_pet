@@ -50,7 +50,7 @@ static const char *translate_path(const char *path, char *out, size_t out_sz) {
             if (override && override[0] != '\0') return override;
         }
         /* 模拟器资源独立: simulator/spiffs/ 优先 (动画包 anims.bin 等),
-         * 缺失回落实机资源 ../spiffs/ (zh.bin 字体共用, 不复制 2.7MB) */
+         * 缺失回落实机资源 ../assets_fs/ (zh.bin 字体共用, 不复制 2.7MB) */
         snprintf(out, out_sz, SIM_SPIFFS_LOCAL "/%s", path + 8);
         struct stat st;
         if (__real_stat64i32(out, &st) == 0) return out;

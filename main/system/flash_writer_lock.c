@@ -2,7 +2,7 @@
  * @file flash_writer_lock.c
  * @brief 全局 flash 写互斥 + 读优先让位 — 链接器 --wrap 拦截 esp_flash API
  *
- * 背景: 各文件系统 (FATFS wl / LittleFS / NVS / SPIFFS) 各自加锁互不相干,
+ * 背景: 各文件系统 (FATFS wl / LittleFS / NVS) 各自加锁互不相干,
  * 擦除 (esp_flash_erase_region) 内部 yield 窗口释放 esp_flash 锁期间,
  * 另一任务调 esp_flash API 撞硬件 busy (ESP_ERR_INVALID_STATE 0x101)
  * → 上层重试风暴 → TASK_WDT。本模块用 --wrap 把三个 esp_flash API
@@ -10,7 +10,7 @@
  * 擦除持锁跨 yield → 窗口内其他访问在锁上排队等待, 0x101 不可能出现。
  *
  * 读优先: 擦除拆 4KB 片 (esp_flash_erase_region 最小粒度), 片间检查
- * 读等待者 → 放锁 1 tick 让读插队 (动画素材/SPIFFS 读取优先于写),
+ * 读等待者 → 放锁 1 tick 让读插队 (动画素材读取优先于写),
  * 每片最多让位 1 次 + 每次擦除调用预算上限, 防高优先级读者持续
  * 插队饿死擦除。
  *

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成动画包 spiffs/anims.bin / simulator/spiffs/anims.bin (SPIFFS 单文件 + 帧表).
+"""生成动画包 assets_fs/anims.bin / simulator/spiffs/anims.bin (单文件包 + 帧表).
 
 背景: SPIFFS 的 open() 线性扫全分区元数据, 文件数 90+ 时 open 实测
 0.3-1.5s (冻结整个 LVGL)。open 只与文件数相关, 与文件大小无关 —
@@ -32,7 +32,7 @@ idle(zhanli) 与全部非 idle 动画都在包里; spiffs/ 里其余文件
 
 用法:
   gen_anim_bin.py [--codec rle|webp] [--out PATH] [--verify]
-  默认同时输出 spiffs/anims.bin 与 simulator/spiffs/anims.bin。
+  默认同时输出 assets_fs/anims.bin 与 simulator/spiffs/anims.bin。
   --out 只写指定文件 (如探针用 anims_webp.bin)。
   --verify 读回生成的包按对应 codec 解码全部帧, 与素材逐字节比对。
 """

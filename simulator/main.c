@@ -261,7 +261,7 @@ int main(int argc, char *argv[]) {
     lv_sdl_mouse_create();
     lv_sdl_keyboard_create();
 
-    /* 4. 初始化字体 (从 spiffs/zh.bin 加载) */
+    /* 4. 初始化字体 (从 zh.bin 加载, 经 sim_spiffs.c 路径重定向) */
     font_loader_init();
     font_debug_check("启动");
 

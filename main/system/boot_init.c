@@ -3,7 +3,7 @@
  * @brief 启动初始化序列 (⑤-3 从 main.c 原样搬移, 零逻辑改动)
  *
  * app_main 前的全部初始化编排: flash 写锁 → OTA 回滚确认 → LCD/背光复位 →
- * NVS/重启探针 → SPIFFS → I2C/LVGL → 音频 → 存储挂载 → Touch/传感器 →
+ * NVS/重启探针 → LittleFS → I2C/LVGL → 音频 → 存储挂载 → Touch/传感器 →
  * UI 组装 → power_manager → WiFi → NTP。日志标签保留 "main" (与现状一致,
  * 主循环仍在 main.c)。主循环本体留在 main.c app_main。
  *
@@ -91,7 +91,7 @@ void boot_init(void)
     ESP_LOGI(TAG, "════════ Virtualpet启动 ════════");
 
     /* 0z. flash 写互斥锁最先初始化 — 之后所有 esp_flash API (NVS/LittleFS/
-     * FATFS/SPIFFS 底层) 统一互斥, 擦除持锁跨 yield (0x101 风暴根治) */
+     * FATFS/LittleFS 底层) 统一互斥, 擦除持锁跨 yield (0x101 风暴根治) */
     flash_writer_lock_init();
 
     /* 0a. OTA 回滚确认 — 若是 OTA 升级后的首次启动, 立即确认固件有效,

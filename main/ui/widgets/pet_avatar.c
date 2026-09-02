@@ -73,7 +73,7 @@ static frame_t s_dynamic[MAX_ANIM];
 static pet_anim_t s_loaded_anim = PET_ANIM_IDLE;
 /* s_dynamic_count 声明见下方共享状态块 (volatile, 跨核) */
 
-/* ══════ anims.bin 动画包 (SPIFFS 单文件 + 帧表) ══════
+/* ══════ anims.bin 动画包 (LittleFS 单文件 + 帧表) ══════
  * 单文件 + 帧表使 open 毫秒级; 播放 = lseek+read 块读 + 锁外解压, fd 常开。
  * 头部 {magic,version,total} + total×{anim_id,off,size_flags} + 帧数据平铺
  * (off 相对数据区起点); 帧数由文件决定, 与枚举数解耦 (缺素材如 SAD 不出条目);
@@ -162,7 +162,7 @@ static volatile int s_pending_anim = -1;
 static uint32_t s_pending_at = 0; /* 请求时间戳 (play_fast 置 0 标记立即执行) */
 static uint8_t s_play_loops = 3;  /* 动画总播放轮数 */
 
-/* ══════ SPIFFS ══════ */
+/* ══════ LittleFS ══════ */
 
 /* ── 帧解码器 (纯 C 无平台依赖, 模拟器共享同一文件) ── */
 
@@ -225,7 +225,7 @@ static uint8_t *s_scratch_comp;
 static uint8_t *s_scratch_argb;
 
 /* 从包读一帧 — lseek+read 块读压缩数据到暂存, 锁外解码 (flash 读冻结窗口
- * 外 cache 恢复, 解码不冻结)。read 失败自动重开 fd 一次 (SPIFFS 写盘 GC
+ * 外 cache 恢复, 解码不冻结)。read 失败自动重开 fd 一次 (LittleFS 写盘 GC
  * 后 fd 失效兜底)。scratch_static: 后台路径用常驻缓冲 (零分配);
  * 同步路径 (LVGL 定时器/init) malloc-per-call 用后 free — 两路隔离防
  * 跨核踩踏 (同步路径持锁读帧时后台任务可能在读同一暂存). */

@@ -122,7 +122,7 @@ esp_err_t sensor_logger_append(const sensor_snapshot_t *s)
     if (!s_ready || !s) return ESP_FAIL;
     /* TTS 播放 / 动画活跃期间跳过 — flash 写会禁用 cache 冻结双核
      * 100-400ms, 流式播放的浅缓冲会暴露成音频卡顿, 动画素材读取
-     * (SPIFFS) 会排队卡帧; 下个 2s 节拍再写 */
+     * (LittleFS) 会排队卡帧; 下个 2s 节拍再写 */
     if (tts_client_is_playing()) return ESP_FAIL;
     if (lv_anim_count_running() > 0) return ESP_FAIL;
 

@@ -163,7 +163,7 @@ endif()
 # ═══════════════════════════════════════════════════════════════════════════
 # 路径重定向包装 (sim_spiffs.c 实现):
 #   fopen  → /spiffs/ 重定向 (历史遗留, 新代码已全走 fd)
-#   open   → /spiffs/ → ../spiffs/, /data/ → ../simdata/
+#   open   → /assets/ → ../assets_fs/, /data/ → ../simdata/
 #   stat64i32 → MinGW 坑: stat() 在头文件被 __MINGW_ASM_CALL 重定向到
 #              stat64i32 符号, --wrap=stat 拦截不到, 必须 wrap stat64i32
 #   opendir → 同上路径翻译 (readdir/closedir 走真实符号即可)

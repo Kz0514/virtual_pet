@@ -1,6 +1,6 @@
 /**
  * 坐着动画清单 — 命名规范: 所有符号以文件夹名 "zuozhe_" 为前缀
- * 帧文件: /spiffs/zuozhe_00.bin .. zuozhe_15.bin
+ * 帧文件: /assets_fs/zuozhe_00.bin .. zuozhe_15.bin
  *
  * 每个动画文件夹各有一个 manifest.h，通过前缀避免符号冲突。
  */
