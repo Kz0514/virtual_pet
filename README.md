@@ -48,7 +48,7 @@ Virtualpet/
 │   └── app/models/        # 数据模型
 ├── assets/                # 动画资源
 ├── tools/                 # 工具脚本
-└── spiffs/                # SPIFFS 文件系统数据
+└── assets_fs/              # LittleFS 资源 (anims.bin/zh.bin)
 ```
 
 
