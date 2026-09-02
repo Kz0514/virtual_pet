@@ -7,6 +7,10 @@
 set(littlefs_py_venv "${CMAKE_CURRENT_BINARY_DIR}/littlefs_py_venv")
 set(littlefs_py_requirements "${CMAKE_CURRENT_LIST_DIR}/image-building-requirements.txt")
 
+set_directory_properties(PROPERTIES
+    ADDITIONAL_CLEAN_FILES "${littlefs_py_venv}"
+)
+
 function(littlefs_create_partition_image partition base_dir)
 	set(options FLASH_IN_PROJECT)
 	set(multi DEPENDS)
@@ -44,7 +48,7 @@ function(littlefs_create_partition_image partition base_dir)
 		# contents of the base dir changing.
 
 		add_custom_target(littlefs_${partition}_bin ALL
-			COMMAND ${littlefs_py} create ${base_dir_full_path} -v --image=${image_file} --fs-size=${size} --name-max=${CONFIG_LITTLEFS_OBJ_NAME_LEN} --block-size=4096
+			COMMAND ${littlefs_py} create ${base_dir_full_path} ${image_file} -v --fs-size=${size} --name-max=${CONFIG_LITTLEFS_OBJ_NAME_LEN} --block-size=4096
 			DEPENDS ${arg_DEPENDS} ${littlefs_py_venv}
 			)
 
@@ -54,20 +58,36 @@ function(littlefs_create_partition_image partition base_dir)
 
 		set(IDF_VER_NO_V "${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}")
 
-		if(${IDF_VER_NO_V} VERSION_LESS 4.3)
+		if(${IDF_VER_NO_V} VERSION_LESS 5.0)
 			message(WARNING "Unsupported/unmaintained/deprecated ESP-IDF version ${IDF_VER}")
 		endif()
 
-		idf_component_get_property(main_args esptool_py FLASH_ARGS)
-		idf_component_get_property(sub_args esptool_py FLASH_SUB_ARGS)
-		esptool_py_flash_target(${partition}-flash "${main_args}" "${sub_args}")
-		esptool_py_flash_target_image(${partition}-flash "${partition}" "${offset}" "${image_file}")
+		# Flash plaintext unless the partition is marked encrypted.
+		# esp_partition_register_target is IDF 6.1+; older IDF uses esptool_py (SPIFFS-style).
+		if(COMMAND esp_partition_register_target)
+			set(esp_partition_register_target_optional_args DEPENDS littlefs_${partition}_bin)
+			if(arg_FLASH_IN_PROJECT)
+				list(APPEND esp_partition_register_target_optional_args FLASH_IN_PROJECT)
+			endif()
+			esp_partition_register_target(${partition} "${image_file}" ${esp_partition_register_target_optional_args})
+		else()
+			idf_component_get_property(main_args esptool_py FLASH_ARGS)
+			idf_component_get_property(sub_args esptool_py FLASH_SUB_ARGS)
 
-		add_dependencies(${partition}-flash littlefs_${partition}_bin)
+			esptool_py_partition_needs_encryption(needs_encryption ${partition})
+			set(flash_target_args)
+			if(NOT needs_encryption)
+				list(APPEND flash_target_args ALWAYS_PLAINTEXT)
+			endif()
 
-		if(arg_FLASH_IN_PROJECT)
-			esptool_py_flash_target_image(flash "${partition}" "${offset}" "${image_file}")
-			add_dependencies(flash littlefs_${partition}_bin)
+			esptool_py_flash_target(${partition}-flash "${main_args}" "${sub_args}" ${flash_target_args})
+			esptool_py_flash_to_partition(${partition}-flash "${partition}" "${image_file}")
+			add_dependencies(${partition}-flash littlefs_${partition}_bin)
+
+			if(arg_FLASH_IN_PROJECT)
+				esptool_py_flash_to_partition(flash "${partition}" "${image_file}")
+				add_dependencies(flash littlefs_${partition}_bin)
+			endif()
 		endif()
 
 	else()

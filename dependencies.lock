@@ -4,7 +4,7 @@ dependencies:
     source:
       path: C:\Users\c1364\Documents\esp-idf\Virtualpet\components\esp_littlefs
       type: local
-    version: 1.9.0
+    version: 1.22.3
   esp_websocket_client:
     dependencies: []
     source:
@@ -32,7 +32,7 @@ dependencies:
       type: service
     version: 0.6.0
   espressif/esp-dl:
-    component_hash: 0d5dd7fadd04854a82e1404f871e16980002a46dfe9796e52626d3c8d6566ad2
+    component_hash: f67408f364f2faa1178a5f0eb2f0fcdf504b68902fa4f3bcd6fa9f797e1ed623
     dependencies:
     - name: espressif/dl_fft
       registry_url: https://components.espressif.com
@@ -58,7 +58,7 @@ dependencies:
     - esp32s2
     - esp32s3
     - esp32s31
-    version: 3.3.9
+    version: 3.3.10
   espressif/esp-dsp:
     component_hash: 12e44db246517a627bc0fe2b255b8335410c0215c98bfba2df5a8e3edea839ef
     dependencies:
@@ -158,6 +158,6 @@ direct_dependencies:
 - espressif/tinyusb
 - idf
 - lvgl/lvgl
-manifest_hash: 32da4b98c8a4b8a30e305b0c5acb7fe2228c551322e0185c97ed3c7d708730e2
+manifest_hash: eed639969206431ce28e1eab31dd3a147b6f6c30c05533543e3496071e243be5
 target: esp32s3
 version: 2.0.0

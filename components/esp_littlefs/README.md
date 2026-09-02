@@ -8,12 +8,14 @@ because SPIFFS was too slow, and FAT was too fragile.
 
 # How to Use
 
+## ESP-IDF
+
 There are two ways to add this component to your project
 
 1. As a ESP-IDF managed component: In your project directory run
 
 ```
-idf.py add-dependency joltwallet/littlefs==1.9.0
+idf.py add-dependency joltwallet/littlefs==1.22.3
 ```
 
 2. As a submodule: In your project, add this as a submodule to your `components/` directory.
@@ -25,8 +27,70 @@ git submodule update --init --recursive
 
 The library can be configured via `idf.py menuconfig` under `Component config->LittleFS`.
 
-### Example
+#### Example
 User @wreyford has kindly provided a [demo repo](https://github.com/wreyford/demo_esp_littlefs) showing the use of `esp_littlefs`. A modified copy exists in the `example/` directory.
+
+## PlatformIO
+Add to the following line to your project's `platformio.ini` file:
+
+```
+lib_deps = https://github.com/joltwallet/esp_littlefs.git
+```
+
+Example `platformio.ini` file:
+
+```
+[env]
+platform = espressif32
+framework = espidf
+monitor_speed = 115200
+
+[common]
+lib_deps = https://github.com/joltwallet/esp_littlefs.git
+
+[env:nodemcu-32s]
+board = nodemcu-32s
+board_build.filesystem = littlefs
+board_build.partitions = min_littlefs.csv
+lib_deps = ${common.lib_deps}
+```
+
+Example `min_littlefs.cvs` flash partition layout:
+```
+# Name,   Type, SubType,  Offset,  Size, Flags
+nvs,      data, nvs,      0x9000,  0x5000,
+otadata,  data, ota,      0xe000,  0x2000,
+app0,     app,  ota_0,    0x10000, 0x1E0000,
+app1,     app,  ota_1,    0x1F0000,0x1E0000,
+littlefs, data, littlefs,   0x3D0000,0x20000,
+coredump, data, coredump, 0x3F0000,0x10000,
+```
+
+[Currently, it is required](https://github.com/platformio/platform-espressif32/issues/479) to modify `CMakeList.txt`. Add the following 2 lines to the your project's `CMakeList.txt`:
+
+```
+get_filename_component(configName "${CMAKE_BINARY_DIR}" NAME)
+list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_SOURCE_DIR}/.pio/libdeps/${configName}/esp_littlefs")
+```
+
+Example `CMakeList.txt`:
+
+```
+cmake_minimum_required(VERSION 3.16.0)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+get_filename_component(configName "${CMAKE_BINARY_DIR}" NAME)
+list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_SOURCE_DIR}/.pio/libdeps/${configName}/esp_littlefs")
+
+project(my_project_name_here)
+```
+
+To configure LittleFS from PlatformIO, run the following command:
+
+```console
+$ pio run -t menuconfig
+```
+An entry `Component config->LittleFS` should be available for configuration. If not, check your `CMakeList.txt` configuration.
 
 
 # Documentation
@@ -39,15 +103,18 @@ Also see the comments in `include/esp_littlefs.h`
 Slight differences between this configuration and SPIFFS's configuration is in the `esp_vfs_littlefs_conf_t`:
 
 1. `max_files` field doesn't exist since we removed the file limit, thanks to @X-Ryl669
-2. `partition_label` is not allowed to be `NULL`. You must specify the partition name from your partition table. This is because there isn't a define `littlefs` partition subtype in `esp-idf`. The subtype doesn't matter.
+2. `grow_on_mount` will expand an existing filesystem to fill the partition. Defaults to `false`.
+    * LittleFS filesystems can only grow, they cannot shrink.
 
 ### Filesystem Image Creation
 
 At compile time, a filesystem image can be created and flashed to the device by adding the following to your project's `CMakeLists.txt` file:
 
 ```
-littlefs_create_partition_image(partition_name path_to_folder_containing_files)
+littlefs_create_partition_image(partition_name path_to_folder_containing_files FLASH_IN_PROJECT)
 ```
+
+If `FLASH_IN_PROJECT` is not specified, the image will still be generated, but you will have to flash it manually using `esptool.py`, `parttool.py`, or a custom build system target.
 
 For example, if your partition table looks like:
 
@@ -59,12 +126,22 @@ factory,  app,  factory,  0x10000, 1M,
 graphics,  data, spiffs,         ,  0xF0000, 
 ```
 
-and your project has a folder called `device_graphics`, your call should be:
+change it to: 
 
 ```
-littlefs_create_partition_image(graphics device_graphics)
+# Name,   Type, SubType,  Offset,  Size, Flags
+nvs,      data, nvs,      0x9000,  0x6000,
+phy_init, data, phy,      0xf000,  0x1000,
+factory,  app,  factory,  0x10000, 1M,
+graphics,  data, littlefs,         ,  0xF0000, 
 ```
 
+
+and your project has a folder called `device_graphics/`, your call should be:
+
+```
+littlefs_create_partition_image(graphics device_graphics FLASH_IN_PROJECT)
+```
 
 
 # Performance
@@ -143,7 +220,13 @@ LittleFS (cache=4096):             27,709 us
 
 * A freshly formatted LittleFS will have 2 blocks in use, making it seem like 8KB are in use.
 
+* The esp32 has [flash concurrency constraints](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/spi_flash/spi_flash_concurrency.html#concurrency-constraints-for-flash-on-spi1).
+  When using UART (either for data transfer or generic logging) at the same time, you *MUST* enable the following option in KConfig:
+  `menuconfig > Component config > Driver config > UART > UART ISR in IRAM`.
+
 # Running Unit Tests
+
+## ESP-IDF v5.x
 
 To flash the unit-tester app and the unit-tests, clone or symbolicly link this
 component to `$IDF_PATH/tools/unit-test-app/components/littlefs`. Make sure the
@@ -176,10 +259,23 @@ The unit tester can then be flashed via the command:
 idf.py -T littlefs -p YOUR_PORT_HERE encrypted-flash monitor
 ```
 
+## ESP-IDF v6.0+
+
+ESP-IDF v6.0 removed the legacy `unit-test-app`. Instead, use the standalone test app in `test_apps/`:
+
+```
+cd test_apps
+idf.py set-target esp32  # Or your target
+idf.py build
+idf.py -p YOUR_PORT_HERE flash monitor
+```
+
+Once running, press Enter to see the test menu. You can run all tests by typing `*` or run specific tests by name or number.
+
 # Breaking Changes
 
 * July 22, 2020 - Changed attribute type for file timestamp from `0` to `0x74` ('t' ascii value).
-* May 3, 2023 - All logging tags have been changed to a unified `esp_littlfs`.
+* May 3, 2023 - All logging tags have been changed to a unified `esp_littlefs`.
 
 # Acknowledgement
 

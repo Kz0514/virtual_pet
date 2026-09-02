@@ -1,5 +1,12 @@
 menu "LittleFS"
 
+    config LITTLEFS_SDMMC_SUPPORT
+        bool "SDMMC support (requires ESP-IDF v5+)"
+        default n
+        help
+            Toggle SD card support
+            This requires IDF v5+ as older ESP-IDF do not support SD card erase.
+
     config LITTLEFS_MAX_PARTITIONS
         int "Maximum Number of Partitions"
         default 3
@@ -208,4 +215,68 @@ menu "LittleFS"
             bool "Write LittleFS 2.0 (no forward-looking erase-state CRCs)"
 
     endchoice
+
+    choice LITTLEFS_MALLOC_STRATEGY
+        prompt "Buffer allocation strategy"
+        default LITTLEFS_MALLOC_STRATEGY_DEFAULT
+        help
+            Maps lfs_malloc to ESP-IDF capabilities-based memory allocator or
+            disables dynamic allocation in favour of user-provided static buffers.
+
+        config LITTLEFS_MALLOC_STRATEGY_DISABLE
+            bool "Static buffers only"
+            help
+                Disallow dynamic allocation, static buffers must be provided by the calling application.
+
+        config LITTLEFS_MALLOC_STRATEGY_DEFAULT
+            bool "Default heap selection"
+            help
+                Uses an automatic allocation strategy. On systems with heap in SPIRAM, if
+                the allocation size does not exceed SPIRAM_MALLOC_ALWAYSINTERNAL then internal
+                heap allocation if preferred, otherwise allocation will be attempted from SPIRAM
+                heap.
+
+        config LITTLEFS_MALLOC_STRATEGY_INTERNAL
+            bool "Internal heap"
+            help
+                Uses ESP-IDF heap_caps_malloc to allocate from internal heap.
+
+        config LITTLEFS_MALLOC_STRATEGY_SPIRAM
+            bool "SPIRAM heap"
+            depends on SPIRAM_USE_MALLOC || SPIRAM_USE_CAPS_ALLOC
+            help
+                Uses ESP-IDF heap_caps_malloc to allocate from SPIRAM heap.
+                Allocation fails if SPIRAM is exhausted; internal heap is not used.
+
+        config LITTLEFS_MALLOC_STRATEGY_SPIRAM_PREFER
+            bool "SPIRAM heap, fall back to default heap"
+            help
+                Uses ESP-IDF heap_caps_malloc_prefer to allocate from SPIRAM heap,
+                falling back to the default heap (typically internal RAM) if the
+                SPIRAM allocation fails. Choose this when you want SPIRAM to be
+                used opportunistically without hard-failing under SPIRAM pressure.
+
+    endchoice
+
+    config LITTLEFS_ASSERTS
+        bool "Enable asserts"
+        default "y"
+        help
+            Selects whether littlefs performs runtime assert checks.
+
+    config LITTLEFS_MMAP_PARTITION
+        bool "Memory map LITTLEFS partitions"
+        default "n"
+        help
+            Use esp_partition_mmap to map the partitions to memory, which can provide a significant
+            performance boost in some cases. Make sure the chip you're using has enough available address
+            space to map the partition (for the ESP32 there is 4MB available).
+
+    config LITTLEFS_WDT_RESET
+        bool "Reset task watchdog during flash operations"
+        default "n"
+        help
+            Enable calling esp_task_wdt_reset() during flash read/write/erase operations
+            to prevent task watchdog timeouts during long-running filesystem operations.
+
 endmenu

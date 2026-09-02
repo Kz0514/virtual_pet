@@ -7,4 +7,4 @@ dependencies:
   espressif/esp_websocket_client: "^1.0"
   espressif/esp_codec_dev: "^1.6.2"
   espressif/esp-sr: "^2.4.6"
-  espressif/esp_littlefs: "^1.9.0"
+  espressif/esp_littlefs: "^1.22.3"
