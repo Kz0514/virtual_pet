@@ -175,3 +175,6 @@ CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
 # 1.0.265: WS send 独立 tx_lock — 播放期大音频帧 recv 持 client->lock 等 payload,
 # 敲击事件 send (同锁) 撞锁丢事件 (实测 "Could not lock within 100 timeout" 刷屏)
 CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
+
+# 触摸扫描定时器回调 (Tmr Svc) 吃栈: 含 CH0 特判诊断打印, 默认 2048 会爆栈 (2026-09-02 实测)
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=3072
