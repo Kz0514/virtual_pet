@@ -12,8 +12,8 @@
 #   nvskey    16KB    加密密钥
 #   config    512KB   设备内部存储 (LittleFS, /cfg): wifi.json / memory.txt / pet.json / CSV (880K→512K)
 #   data      1MB    用户可见存储 (FatFS, /data): 日记 HTML / 交互日志 — USB 直读展示
-#   assets    26MB    动画包 anims.bin / 音效 / 字体 / ESP-SR模型 (SPIFFS)
-#   (动画 78 帧打包为单文件 anims.bin — SPIFFS open 只与文件数相关,
+#   assets    26MB    动画包 anims.bin / 音效 / 字体 / ESP-SR模型 (LittleFS)
+#   (动画 78 帧打包为单文件 anims.bin — open 只与文件数相关,
 #    文件数 90→1 后 open 毫秒级, fd 常开 + lseek/read 播放, 无 mmap 分区)
 
 # Name,      Type,    SubType,    Offset,      Size,        Flags
@@ -25,4 +25,4 @@ ota_1,       app,     ota_1,      0x220000,    0x200000,
 nvskey,      data,    nvs_keys,   0x420000,    0x4000,
 config,      data,    littlefs,   0x424000,    0x80000,
 data,        data,    fat,        0x4A4000,    0x100000,
-assets,      data,    spiffs,     0x5A4000,    0x1A5C000,
+assets,      data,    littlefs,   0x5A4000,    0x1A5C000,
