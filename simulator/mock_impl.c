@@ -43,6 +43,10 @@ void shake_detector_suppress(bool on) { (void)on; }
 /* ── 设置页"息屏时长"回调 (main.c 真机的实时生效钩子) ── */
 void main_screen_set_off_timeout_s(uint32_t off_s) { (void)off_s; }
 
+/* ── 电源管理 (UI 交互/息屏钩子, 模拟器无功耗语义) ── */
+void power_manager_note_interaction(void) {}
+void power_manager_set_off_timeout_s(uint32_t off_s) { (void)off_s; }
+
 /* ── 设置页"重启设备"→ 模拟器退出 ── */
 void esp_restart(void) {
     printf("[sim] esp_restart() — 模拟器退出\n");
@@ -77,6 +81,8 @@ uint32_t config_get_u32(const char *key, uint32_t def) {
     }
     return def;
 }
+
+const char *config_get_str(const char *key, const char *def) { (void)key; return def; }
 
 void config_set_u32(const char *key, uint32_t val) {
     for (int i = 0; i < s_cfg_count; i++) {

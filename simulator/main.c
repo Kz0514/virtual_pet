@@ -16,7 +16,7 @@
 #include "ui/screens/home_screen.h"
 #include "ui/screens/settings_screen.h"
 #include "ui/screens/diary_screen.h"
-#include "ui/screens/screen_switch.h"
+#include "ui/common/screen_switch.h"
 #include "ui/widgets/pet_avatar.h"
 #include "ui/widgets/status_bar.h"
 #include "ui/widgets/chat_bubble.h"
@@ -42,15 +42,8 @@ static void sim_data_timer_cb(lv_timer_t *t) {
     sim_hum  = 58.7f - (s_tick % 5) * 0.2f;
     sim_lux  = 320.0f + (s_tick % 20) * 15.0f;
 
-    home_screen_set_data(
-        sim_temp, sim_hum, sim_lux,
-        3800, 85,             /* 电池电压/百分比 */
-        32.5f,                /* 电池温度 */
-        -120,                 /* 放电电流 mA */
-        680, 800,             /* 剩余/满容量 mAh */
-        true, "192.168.1.100" /* WiFi */
-    );
-
+    /* 传感器/电量数据链路已移交固件 sensor 上报路径 (home_screen_set_data
+     * 已被移除), 模拟器暂不经此灌数据 — 数据接回见重构后的 home 数据接口 */
     status_bar_set_wifi(true, -45);
     status_bar_set_battery(85, 3800);
 
@@ -120,7 +113,7 @@ static void key_shortcut_timer_cb(lv_timer_t *t) {
         printf("[sim] 按键 S: %s\n",
                settings_screen_is_active() ? "关闭设置页" : "打开设置页");
         if (settings_screen_is_active()) {
-            settings_screen_input(SETTINGS_EV_BACK);
+            settings_screen_input(MENU_EV_BACK);
         } else if (!diary_screen_is_active()) {
             settings_screen_set_close_cb(sim_settings_close_cb);
             settings_screen_init();
@@ -144,11 +137,11 @@ static void key_shortcut_timer_cb(lv_timer_t *t) {
 
     if ((up && !s_key_prev[12]) || (down && !s_key_prev[13]) ||
         (enter && !s_key_prev[14]) || (esc && !s_key_prev[15])) {
-        settings_event_t ev;
-        if (esc)              ev = SETTINGS_EV_BACK;
-        else if (up)          ev = SETTINGS_EV_UP;
-        else if (down)        ev = SETTINGS_EV_DOWN;
-        else                  ev = SETTINGS_EV_CONFIRM;
+        menu_event_t ev;
+        if (esc)              ev = MENU_EV_BACK;
+        else if (up)          ev = MENU_EV_UP;
+        else if (down)        ev = MENU_EV_DOWN;
+        else                  ev = MENU_EV_CONFIRM;
 
         if (diary_screen_is_active()) {
             printf("[sim] 按键 %s → 日记页\n", esc ? "ESC" : up ? "UP" : down ? "DOWN" : "ENTER");
@@ -274,7 +267,7 @@ int main(int argc, char *argv[]) {
 
     /* 5. 创建所有 UI 组件 */
     printf("[sim] 创建 home_screen...\n");
-    home_screen_create();
+    home_screen_init();
     /* 保存主页 screen 对象 (SDL 默认屏; 设置页关闭后 screen_load_full 切回) */
     s_home_scr = lv_screen_active();
 

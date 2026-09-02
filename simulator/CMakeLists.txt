@@ -36,7 +36,7 @@ set(UI_SRCS
     ${UI_ROOT}/ui/screens/settings_screen.c
     ${UI_ROOT}/ui/screens/diary_screen.c
     ${UI_ROOT}/ui/screens/ota_screen.c
-    ${UI_ROOT}/ui/screens/screen_switch.c
+    ${UI_ROOT}/ui/common/screen_switch.c
     # Widgets
     ${UI_ROOT}/ui/widgets/pet_avatar.c
     ${UI_ROOT}/ui/widgets/status_bar.c
@@ -136,12 +136,14 @@ target_include_directories(lvgl_simulator PRIVATE
     ${UI_ROOT}
     ${UI_ROOT}/ui/fonts
     ${UI_ROOT}/ui/screens
+    ${UI_ROOT}/ui/common
     ${UI_ROOT}/ui/widgets
     # UI 代码依赖的固件头 (settings_screen 的 config_mgr/time_manager/
     # usb_storage/ota_client; 均 PC 干净, 无需 mock 副本)
     ${UI_ROOT}/app
     ${UI_ROOT}/system
     ${UI_ROOT}/network
+    ${UI_ROOT}/drivers/storage
     # SDL2
     ${SDL2_INCLUDE_DIRS}
 )
