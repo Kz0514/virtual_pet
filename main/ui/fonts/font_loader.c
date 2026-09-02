@@ -30,7 +30,7 @@ static void load_task(void *arg)
 
 void font_loader_init(void)
 {
-    int fd = open("/spiffs/zh.bin", O_RDONLY);
+    int fd = open("/assets/zh.bin", O_RDONLY);
     if (fd < 0) {
         ESP_LOGW(TAG, "zh.bin 不存在, 中文字体未加载");
         return;

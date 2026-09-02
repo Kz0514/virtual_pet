@@ -118,7 +118,6 @@ idf_component_register(
         libwebp
         esp_lvgl_port
         fatfs
-        spiffs
         esp_littlefs
         esp_tinyusb
         usb

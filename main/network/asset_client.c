@@ -8,7 +8,6 @@
 #include "api_client.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
-#include "esp_spiffs.h"
 #include "mbedtls/sha256.h"
 #include "cJSON.h"
 #include <string.h>
@@ -61,7 +60,7 @@ static bool download_asset(const char *filename, int expected_size)
     char url[384], path[128];
     snprintf(url, sizeof(url), "http://%s:%d/api/v1/assets/download/%s",
              SERVER_HOST, SERVER_PORT, filename);
-    snprintf(path, sizeof(path), "/spiffs/%s", filename);
+    snprintf(path, sizeof(path), "/assets/%s", filename);
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -174,7 +173,7 @@ void asset_update_task(void *pvParameter)
         if (!name || !srv_sha) continue;
 
         char path[128];
-        snprintf(path, sizeof(path), "/spiffs/%s", name);
+        snprintf(path, sizeof(path), "/assets/%s", name);
         checked++;
 
         /* Check local file */

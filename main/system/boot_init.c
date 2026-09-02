@@ -23,7 +23,7 @@
 #include "esp_ota_ops.h"
 #include "nvs_flash.h"
 #include "nvs.h"
-#include "esp_spiffs.h"
+#include "esp_littlefs.h"
 #include "esp_heap_caps.h"
 #include "esp_check.h"
 #include "esp_lvgl_port.h"
@@ -170,20 +170,19 @@ void boot_init(void)
     config_get_str(CFG_KEY_PET_NAME, "萝莉丝");
     config_get_str(CFG_KEY_OWNER_NAME, "主人");
 
-    /* 2. SPIFFS (animation assets) */
-    esp_vfs_spiffs_conf_t spiffs_cfg = {
-        .base_path = "/spiffs",
+    /* 2. LittleFS (animation assets) */
+    esp_vfs_littlefs_conf_t lfs_cfg = {
+        .base_path = "/assets",
         .partition_label = "assets",
-        .max_files = 8,
         .format_if_mount_failed = true,
     };
-    ret = esp_vfs_spiffs_register(&spiffs_cfg);
+    ret = esp_vfs_littlefs_register(&lfs_cfg);
     if (ret == ESP_OK) {
         size_t total = 0, used = 0;
-        esp_spiffs_info("assets", &total, &used);
-        ESP_LOGI(TAG, "SPIFFS: %d/%d KB used", (int)(used / 1024), (int)(total / 1024));
+        esp_littlefs_info("assets", &total, &used);
+        ESP_LOGI(TAG, "assets: %d/%d KB used", (int)(used / 1024), (int)(total / 1024));
     } else {
-        ESP_LOGW(TAG, "SPIFFS mount failed (will retry format)");
+        ESP_LOGW(TAG, "assets mount failed (will retry format)");
     }
 
     /* 3. I2C */

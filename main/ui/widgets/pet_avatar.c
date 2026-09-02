@@ -8,7 +8,6 @@
  */
 #include "pet_avatar.h"
 #include "esp_log.h"
-#include "esp_spiffs.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "lvgl.h"
@@ -90,7 +89,7 @@ static uint8_t s_pack_count[PET_ANIM_COUNT]; /* 每动画帧数 */
 static bool pack_ensure_open(void)
 {
     if (s_pack_fd >= 0) return true;
-    s_pack_fd = open("/spiffs/anims.bin", O_RDONLY);
+    s_pack_fd = open("/assets/anims.bin", O_RDONLY);
     if (s_pack_fd < 0) return false;
     uint8_t hdr[12];
     if (read(s_pack_fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) goto fail;
