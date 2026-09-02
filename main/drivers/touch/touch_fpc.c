@@ -59,6 +59,7 @@ typedef struct {
     int filtered[TOUCH_CH_COUNT];
     uint32_t touch_start_tick[TOUCH_CH_COUNT];
     uint32_t release_until[TOUCH_CH_COUNT]; /* 释放保活截止 (tick) — 滑动断续桥接 */
+    int32_t prev_d[TOUCH_CH_COUNT];       /* 上帧 delta — CH0 起跳斜率判据 */
     float smooth_left;
     float smooth_top_pos;
     float smooth_right_pos;
@@ -80,7 +81,21 @@ static bool s_calibrated = false; /* 首次校准后开启防手指污染守卫 
                                         jit 只反映环境噪声, 真实按压尖峰不得抬阈
                                         (无钳制单次按压即把通道阈值抬入数秒死区) */
 #define THR_CLAMP 360                /* 阈值整体封顶: jit 稳态 ≤ JIT_MAX_DEV → thr ≤ 360 */
-#define RELEASE_HYSTERESIS 2         /* 滞回: 释放阈值 = 按下阈值 / 2 */
+#define RELEASE_HYSTERESIS 2         /* 滞回: 释放阈值 = 按下阈值 / 2 (仅滑条) */
+
+/* ── 功能键 (CH0) 特判 ──
+ * 大焊盘近场/悬停信号实测可达 300~724 计数, 通用判定 (d>thr + 滞回)
+ * 会把它当"按住"锁死整段会话 (基线冻结 → d 永不跌回释放线)。CH0 改用
+ * 独立两段式:
+ *  - 按下: d≥CH0_PRESS_MIN 且 帧间跃升≥CH0_PRESS_SLEW — 真实按压在几十
+ *    ms 内完成, 悬停/温漂是缓慢爬升, 永远凑不齐起跳斜率;
+ *  - 保持/释放: 水平线 CH0_RELEASE_MIN — 悬停/park 峰值 ~724 之下即视为
+ *    松手, 不再被滞回 (thr/2) 拖死。300~750 区间的"持续轻按"物理上与
+ *    悬停不可区分, 判为快速点击 (接收边)。
+ * 息屏探针 (d>thr 独立复判) 不受此改动影响。 */
+#define CH0_PRESS_MIN 300            /* 按下最小 delta (同 TOUCH_MIN_TOP) */
+#define CH0_PRESS_SLEW 100           /* 按下起跳斜率/帧 (20ms 帧) */
+#define CH0_RELEASE_MIN 750          /* 保持线: 低于即释放 (悬停/park 之上) */
 #define RELEASE_KEEP_MS 60           /* 释放保活: 刚释放 60ms 内仍计 touched —
                                         桥接滑动腾空间隙/压力波动 (按 tick,
                                         50Hz=3帧 / 20Hz 空闲档同样生效)。
@@ -233,6 +248,7 @@ static void touch_scan_once(bool sleep_path)
 
         /* ESP32-S3: 触摸时 raw 值上升 (delta = raw - ref > 0) */
         int32_t d = (int32_t)s_ts.raw[i] - s_ts.ref[i];
+        int32_t d_prev = s_ts.prev_d[i]; /* 上帧 delta — CH0 起跳斜率判据 */
 
         /* 漂移跟踪 (按通道门控): 只有本通道空闲才追, 手指按住左键不会
          * 冻结其他通道基线。限速吸收: 环境 DC 偏移 (近场/供电/温湿度)
@@ -269,9 +285,25 @@ static void touch_scan_once(bool sleep_path)
         s_ts.thr[i] = thr;
 
         bool was = s_ts.touched[i];
-        bool active = (d > thr) || (was && d > thr / RELEASE_HYSTERESIS); /* 滞回释放 */
+        bool active;
+        if (i == 0) {
+            /* 功能键特判 (见 CH0_* 常量注释): 按下须快速起跳, 悬停/漂移
+             * 慢爬不凑齐; 保持须在悬停层顶线上方, 低于即松免死锁 */
+            if (was)
+                active = (d >= CH0_RELEASE_MIN);
+            else
+                active = (d >= CH0_PRESS_MIN) && (d - d_prev >= CH0_PRESS_SLEW);
+        } else {
+            active = (d > thr) || (was && d > thr / RELEASE_HYSTERESIS); /* 滞回释放 */
+        }
         if (sleep_path)
             active = false; /* 息屏期不落盘判定 — 基线恒追速 (见函数头注释) */
+
+        /* 功能键状态翻转诊断: raw/ref/d/阈值留证 (息屏探针不落盘, 不打印) */
+        if (i == 0 && !sleep_path && (active != was))
+            ESP_LOGI(TAG, "CH0 %s: d=%ld raw=%lu ref=%ld thr=%ld",
+                     active ? "按下" : "释放", (long)d,
+                     (unsigned long)s_ts.raw[i], (long)s_ts.ref[i], (long)thr);
 
         if (active) {
             s_ts.touched[i] = true;
@@ -308,6 +340,7 @@ static void touch_scan_once(bool sleep_path)
                 act_ch = (int8_t)i;
             }
         }
+        s_ts.prev_d[i] = d; /* 帧末记录 — CH0 起跳斜率 (保活 continue 帧跳过, 滑条无碍) */
     }
     if (sleep_path) {
         if (act_ch >= 0 && act_ch == s_act_ch) {
@@ -330,6 +363,7 @@ static void touch_scan_once(bool sleep_path)
             s_ts.touch_start_tick[i] = 0;
             s_ts.d_sm[i] = 0;
             s_ts.jit[i] = 0;
+            s_ts.prev_d[i] = 0; /* 快照后 delta 归零 — 起跳斜率须从零起算 */
         }
         s_immune_until = now + pdMS_TO_TICKS(2000);
         touch_note_activity();
