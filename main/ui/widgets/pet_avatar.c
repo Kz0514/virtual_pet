@@ -436,13 +436,23 @@ static void anim_load_task(void *arg)
          * 不构成音频卡顿 ══ */
         if (stage >= 0 && stage < PET_ANIM_COUNT && !stage_ready) {
             if (load_one_frame_off((pet_anim_t)stage, 0, &s_load_buf, true)) {
+                bool staged = false;
                 portENTER_CRITICAL(&s_load_mux);
                 if (s_stage_anim == stage && !s_stage_ready) {
                     s_stage_ready = true;      /* 首帧备好, 等定时器切换 */
+                    /* fast 请求 (s_pending_at==0) 才抢占唤醒 — play 保持
+                     * 帧边界礼貌切换 (play 请求会在下一帧尾自然消费) */
+                    staged = (s_pending_at == 0) &&
+                             (s_pending_anim == stage || s_pending_anim == -1);
                 } else {
                     unload_frames(&s_load_buf, 1); /* 请求被覆盖/已消费 */
                 }
                 portEXIT_CRITICAL(&s_load_mux);
+                /* 备帧就绪即抢占: lv_timer_ready 使帧定时器下一轮立即到期,
+                 * 切换不再等当前帧尾 (~65ms vs ≤800ms)。跨线程写 last_run:
+                 * u32 原子赋值, 与 handler 竞态窗口 µs 级 — 偶发一拍提前
+                 * (该帧少显示一拍), 视觉无感; 仅备帧完成瞬间发生一次 */
+                if (staged && s_frame_timer) lv_timer_ready(s_frame_timer);
             } else {
                 /* 读失败 — 放弃备帧 (保持当前动画, 不阻塞 UI) */
                 portENTER_CRITICAL(&s_load_mux);
@@ -630,8 +640,20 @@ void pet_avatar_play_fast(pet_anim_t anim)
 {
     if (anim < PET_ANIM_COUNT) {
         s_pending_anim = anim;
-        s_pending_at = 0; /* 时间戳0 → 最小延迟检查立即通过 */
+        s_pending_at = 0; /* 时间戳0 → loader 备帧完成即抢占 (见 anim_load_task) */
         request_stage_if_needed(anim);
+        /* 已就绪即抢占: 缓存命中 / 目标即当前 / 回 idle / 备帧已就绪 —
+         * switch 必然成功, lv_timer_ready 使帧定时器下一轮立即到期, 请求
+         * 即刻消费; 备帧中不抢 (do_play 失败会重置帧计时拉长一拍), 由
+         * loader 备帧完成时唤醒 */
+        bool now = false;
+        portENTER_CRITICAL(&s_load_mux);
+        now = (anim == s_loaded_anim) ||
+              (anim == s_cached_anim && s_dynamic_count > 0) ||
+              (s_stage_anim == anim && s_stage_ready) ||
+              (anim == PET_ANIM_IDLE);
+        portEXIT_CRITICAL(&s_load_mux);
+        if (now && s_frame_timer) lv_timer_ready(s_frame_timer);
     }
 }
 
