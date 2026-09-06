@@ -7,14 +7,12 @@
 #   nvs       24KB    WiFi凭据 / 设备Token / 系统设置
 #   otadata   8KB     OTA状态
 #   phy_init  4KB     射频校准
-#   ota_0     2MB     当前固件 (1.0.227+: 1.5M→2M, 给 libwebp 等预留空间)
+#   ota_0     2MB     当前固件
 #   ota_1     2MB     OTA更新槽位
 #   nvskey    16KB    加密密钥
 #   config    512KB   设备内部存储 (LittleFS, /cfg): wifi.json / memory.txt / pet.json / CSV (880K→512K)
 #   data      1MB    用户可见存储 (FatFS, /data): 日记 HTML / 交互日志 — USB 直读展示
 #   assets    26MB    动画包 anims.bin / 音效 / 字体 / ESP-SR模型 (LittleFS)
-#   (动画 78 帧打包为单文件 anims.bin — open 只与文件数相关,
-#    文件数 90→1 后 open 毫秒级, fd 常开 + lseek/read 播放, 无 mmap 分区)
 
 # Name,      Type,    SubType,    Offset,      Size,        Flags
 nvs,         data,    nvs,        0x9000,      0x6000,
