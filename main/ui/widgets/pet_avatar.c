@@ -594,12 +594,34 @@ static void do_play(pet_anim_t anim)
     lv_timer_set_period(s_frame_timer, dur);
 }
 
-/* 线程安全入口: 只记录请求 */
+/* 请求即备帧: 目标非 idle 且不在当前动画/缓存池时, 立刻通知后台任务读
+ * 首帧 — 备帧的 ~35ms 与当前帧剩余显示时间重叠, 切换最坏延迟从 "2次
+ * 帧尾" 降为 "1次帧尾" (备帧就绪后由 loader 唤醒抢占, 见 anim_load_task)。
+ * 不动 idle (常驻零延迟) / 缓存命中 (fire 时 switch 直接成功, 备帧只会
+ * 白读 + 残留 stage 导致意外重播); 重复请求同动画不重启备帧。
+ * 竞态闭环: 备帧被更新的请求覆盖 → loader 锁内校验 (s_stage_anim==stage)
+ * 失败自动丢弃; fire 消费条件 (pending==stage||pending==-1) 防错切 */
+static void request_stage_if_needed(pet_anim_t anim)
+{
+    if (anim >= PET_ANIM_COUNT || anim == PET_ANIM_IDLE) return;
+    portENTER_CRITICAL(&s_load_mux);
+    if (anim != s_loaded_anim && anim != s_cached_anim && s_stage_anim != anim) {
+        if (s_stage_ready) { /* 覆盖已就绪的旧备帧 — 丢弃 (与 switch_to_anim 同策略) */
+            unload_frames(&s_load_buf, 1);
+            s_stage_ready = false;
+        }
+        s_stage_anim = anim;
+    }
+    portEXIT_CRITICAL(&s_load_mux);
+}
+
+/* 线程安全入口: 只记录请求 (帧定时器消费) */
 void pet_avatar_play(pet_anim_t anim)
 {
     if (anim < PET_ANIM_COUNT) {
         s_pending_anim = anim;
         s_pending_at = xTaskGetTickCount();
+        request_stage_if_needed(anim);
     }
 }
 
@@ -608,6 +630,7 @@ void pet_avatar_play_fast(pet_anim_t anim)
     if (anim < PET_ANIM_COUNT) {
         s_pending_anim = anim;
         s_pending_at = 0; /* 时间戳0 → 最小延迟检查立即通过 */
+        request_stage_if_needed(anim);
     }
 }
 
