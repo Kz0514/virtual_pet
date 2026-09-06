@@ -25,8 +25,7 @@ static const char *TAG = "avatar";
 #define FH 240
 #define FRAME_SIZE (FW * FH * 2)
 #define IDLE_FRAMES 5
-#define MAX_ANIM 20
-#define PLAY_FRAMES 6 /* 播放期续载帧数上限 — PSRAM 撞顶防护 */
+#define MAX_ANIM 20 /* 曾限载 6 帧 (PLAY_FRAMES) 防 PSRAM 撞顶 — 已改为载满当前动画 */
 #define PLAY_LOOPS 3 /* 播放循环次数后回到 idle */
 
 /* anims.bin 打包格式 — magic 校验失败即整体拒绝 (优雅降级: 宠物不显示,
@@ -454,11 +453,13 @@ static void anim_load_task(void *arg)
         }
 
         /* ══ 阶段 2: 正常续载 — 备帧期间暂停 (s_load_buf 被备帧独占);
-         * 播放期 (TTS) 限载 6 帧防 PSRAM 撞顶 (分配失败 → SPI DMA 描述符
-         * 被踩 → flush polling 死循环 → 任务看门狗重启), 播完后再补满;
-         * 每帧 40ms 延时摊开, 不抢音频时序 ══ */
+         * 播放期 (TTS) 也把当前动画载满 (load_limit = s_bg_total), 不再截断
+         * 到 6 帧 (曾限载防 PSRAM 撞顶: 分配失败 → SPI DMA 描述符被踩 →
+         * flush polling 死循环 → 任务看门狗重启; 现在每帧解码完才分配,
+         * 载满即停, 峰值 = 池上限不变); 40ms 节拍摊开, 满帧 (eating 19)
+         * 载入窗口 ~1.4s, 若真机试听卡音退回帧数上限 12 ══ */
         bool tts_playing = tts_client_is_playing();
-        int load_limit = tts_playing ? PLAY_FRAMES : MAX_ANIM;
+        int load_limit = tts_playing ? s_bg_total : MAX_ANIM;
         if (idx < s_bg_total && idx < load_limit && s_stage_anim < 0) {
             bool discard = false;
             /* 锁外 flash 读 + 解码 (malloc 也在锁外, 不挡 LVGL) */
