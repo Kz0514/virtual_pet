@@ -302,7 +302,7 @@ class App:
         info.pack(side=tk.BOTTOM, fill=tk.X)
         ttk.Label(info, text="默认fps:").pack(side=tk.LEFT)
         self.var_fps = tk.IntVar(value=8)
-        ttk.Spinbox(info, from_=1, to=60, width=4, textvariable=self.var_fps,
+        ttk.Spinbox(info, from_=1, to=60, width=6, textvariable=self.var_fps,
                     command=self._fps_changed).pack(side=tk.LEFT)
 
         # 中: 大图 + 帧条
@@ -313,9 +313,19 @@ class App:
         self.canvas.pack(side=tk.TOP)
         self.var_state = tk.StringVar(value="未打开包")
         ttk.Label(mid, textvariable=self.var_state).pack(side=tk.TOP, pady=(2, 0))
-        self.thumb_canvas = tk.Canvas(mid, height=THUMB + 26, bg="#333",
-                                      highlightthickness=0)
-        self.thumb_canvas.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        # 帧轴: 缩略图 + 编号 + 循环组括弧; 横向滚动条 + 滚轮
+        thumb_frame = ttk.Frame(mid)
+        thumb_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        self.thumb_canvas = tk.Canvas(thumb_frame, height=THUMB + 64,
+                                      bg="#1e1e1e", highlightthickness=0)
+        hsb = ttk.Scrollbar(thumb_frame, orient=tk.HORIZONTAL,
+                            command=self.thumb_canvas.xview)
+        self.thumb_canvas.configure(xscrollcommand=hsb.set)
+        self.thumb_canvas.pack(side=tk.TOP, fill=tk.X)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self.thumb_canvas.bind(
+            "<MouseWheel>",
+            lambda e: self.thumb_canvas.xview_scroll(int(-e.delta / 120) * 3, "units"))
 
         # 右: 帧序表
         right = ttk.Frame(paned, padding=(6, 4))
@@ -332,13 +342,11 @@ class App:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind("<Double-1>", self._tree_edit)
-        ttk.Label(right, wraplength=320, justify="left",
-                  text="双击帧行编辑: 时长ms (0=默认fps) / 回跳 (该帧播完跳回 N 步) / 额外 (保留位)").pack(
-                  side=tk.BOTTOM, pady=(4, 0), anchor="w")
 
         status = ttk.Frame(self.root, padding=(6, 2))
         status.pack(side=tk.BOTTOM, fill=tk.X)
-        self.var_status = tk.StringVar(value="就绪 — 打开 anims.bin 开始")
+        self.var_status = tk.StringVar(
+            value="就绪 — 打开 anims.bin | 双击表格行改数值 | 帧轴右键设循环组")
         ttk.Label(status, textvariable=self.var_status).pack(side=tk.LEFT)
 
     # ── 打开包 ──
@@ -429,6 +437,7 @@ class App:
         # 引用挂 canvas 属性: 覆盖旧图 → 旧 PhotoImage 释放 (防播放内存泄漏)
         self.canvas._photo = self._photo(img, FW * SCALE)
         self.canvas.create_image(0, 0, image=self.canvas._photo, anchor=tk.NW)
+        self._highlight_thumb(idx)
 
     def _redraw_thumbs(self):
         c = self.thumb_canvas
@@ -437,22 +446,71 @@ class App:
         if not a:
             return
         photos = []          # 本次重绘的引用集中持有, 覆盖旧列表即释放
-        x = 4
+        step = THUMB + 8
         for idx in range(a.count):
+            x = 4 + idx * step
             tag = f"t{idx}"
             img = self._anim_img(a, idx, decode=False)
             if img is None:
-                c.create_rectangle(x, 2, x + THUMB, 2 + THUMB, fill="#555")
+                c.create_rectangle(x, 2, x + THUMB, 2 + THUMB,
+                                   fill="#3a3a3a", outline="#555", tags=(tag,))
             else:
                 ph = self._photo(img, THUMB)
                 photos.append(ph)
                 c.create_image(x, 2, image=ph, anchor=tk.NW, tags=(tag,))
-            c.create_text(x + THUMB // 2, THUMB + 8, text=str(idx),
-                          fill="#ccc", font=("Helvetica", 8))
+                c.create_rectangle(x, 2, x + THUMB, 2 + THUMB,
+                                   outline="#555", tags=(tag,))
+            c.create_text(x + THUMB // 2, THUMB + 10, text=str(idx),
+                          fill="#aaa", font=("Helvetica", 8), tags=(tag,))
             c.tag_bind(tag, "<Button-1>", lambda e, k=idx: self._thumb_click(k))
-            x += THUMB + 8
+            c.tag_bind(tag, "<Button-3>", lambda e, k=idx: self._thumb_menu(e, k))
+        self._draw_loops(c, a, step)
         c._photos = photos
-        c.configure(scrollregion=(0, 0, x, THUMB + 26))
+        c.configure(scrollregion=(0, 0, 4 + a.count * step, THUMB + 62))
+        if getattr(self, "_hl_idx", None) is not None:
+            self._highlight_thumb(self._hl_idx)   # 重绘会清掉高亮 — 恢复
+
+    def _draw_loops(self, c, a, step):
+        """循环组括弧: 每个 loop_back>0 的帧, 在帧轴下方画 [起点→触发帧]
+        括弧 + ↺回跳步数; 重叠区间按贪心分层错开."""
+        spans = []
+        for i, f in enumerate(a.frames):
+            if f[1] > 0 and i - f[1] >= 0:
+                spans.append((i - f[1], i, f[1]))
+        if not spans:
+            return
+        spans.sort(key=lambda t: (t[0], -t[1]))
+        colors = ("#e8a33d", "#5aa7e8", "#7dc95a", "#c96ac9")
+        ends = []                        # 每层最近一个括弧的结束帧
+        for s, e, lb in spans:
+            lv = 0
+            while lv < len(ends) and ends[lv] >= s:
+                lv += 1
+            if lv == len(ends):
+                ends.append(e)
+            else:
+                ends[lv] = e
+            col = colors[lv % len(colors)]
+            y = THUMB + 24 + lv * 12
+            x1 = 4 + s * step + THUMB // 2
+            x2 = 4 + e * step + THUMB // 2
+            c.create_line(x1, y, x2, y, fill=col, width=2)
+            c.create_line(x1, y - 4, x1, y + 4, fill=col, width=2)
+            c.create_line(x2, y - 4, x2, y + 4, fill=col, width=2)
+            c.create_text((x1 + x2) // 2, y + 8, text=f"↺{lb}",
+                          fill=col, font=("Helvetica", 7))
+
+    def _highlight_thumb(self, idx):
+        """当前预览/播放帧的黄色边框."""
+        self._hl_idx = idx
+        c = self.thumb_canvas
+        c.delete("hl")
+        a = self.selected
+        if not a or idx >= a.count:
+            return
+        x = 4 + idx * (THUMB + 8)
+        c.create_rectangle(x - 2, 0, x + THUMB + 2, THUMB + 4,
+                           outline="#ffd23d", width=2, tags=("hl",))
 
     def _thumb_click(self, idx):
         self.stop()
@@ -502,23 +560,25 @@ class App:
             self.var_loops.set(v)
         self.play_loops = v
 
-    # ── 帧序编辑 (双击) ──
+    # ── 帧序编辑 ──
     def _tree_edit(self, evt):
         item = self.tree.identify_row(evt.y)
         col = self.tree.identify_column(evt.x)
         if not item or col not in ("#2", "#3", "#4"):
             return
+        self._edit_frame_field(int(item) - 1, {"#2": 0, "#3": 1, "#4": 2}[col])
+
+    def _edit_frame_field(self, idx, key):
+        """弹窗编辑第 idx 帧的字段 (0=时长, 1=回跳, 2=额外)."""
         a = self.selected
-        if not a:
+        if not a or idx >= len(a.frames):
             return
-        i = int(item) - 1
-        key = {"#2": 0, "#3": 1, "#4": 2}[col]
         labels = ["时长ms (0=默认fps)", "loop_back 回跳步数", "loop_extra 额外"]
         win = tk.Toplevel(self.root)
-        win.title(f"编辑 {a.name} 第{i}帧 — {labels[key]}")
+        win.title(f"编辑 {a.name} 第{idx}帧 — {labels[key]}")
         win.resizable(False, False)
         ttk.Label(win, text=labels[key] + ":").pack(padx=10, pady=(8, 0))
-        var = tk.IntVar(value=a.frames[i][key])
+        var = tk.IntVar(value=a.frames[idx][key])
         rng = (0, 65535) if key == 0 else (0, 255)
         ttk.Spinbox(win, from_=rng[0], to=rng[1], width=8,
                     textvariable=var).pack(padx=10, pady=4)
@@ -531,16 +591,78 @@ class App:
             except ValueError:
                 return
             v = max(min(v, rng[1]), rng[0])
-            tup = list(a.frames[i])
+            tup = list(a.frames[idx])
             tup[key] = v
-            a.frames[i] = tuple(tup)
-            self.tree.set(item, col, self._dur_text(v, a) if key == 0 else v)
+            a.frames[idx] = tuple(tup)
+            self._sync_tree_row(idx)
+            if key == 1:
+                self._redraw_thumbs()   # 循环括弧变了 → 重画帧轴
             if self.after_id:
-                self.play()          # 播放中 → 按新时长继续
+                self.play()             # 播放中 → 按新(时)长继续
             win.destroy()
 
         ttk.Button(btns, text="确定", command=ok).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.LEFT)
+
+    def _sync_tree_row(self, idx):
+        a = self.selected
+        if not a or not self.tree.exists(str(idx + 1)):
+            return
+        dur, lb, le = a.frames[idx]
+        self.tree.set(str(idx + 1), "dur", self._dur_text(dur, a))
+        self.tree.set(str(idx + 1), "lb", lb)
+        self.tree.set(str(idx + 1), "le", le)
+
+    # ── 循环组 (帧轴右键) ──
+    def _thumb_menu(self, evt, idx):
+        a = self.selected
+        if not a:
+            return
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="时长…", command=lambda: self._edit_frame_field(idx, 0))
+        m.add_command(label="设子循环跳回点…",
+                      command=lambda: self._pick_loop_target(idx))
+        if a.frames[idx][1] > 0:
+            m.add_command(label="清除本帧循环", command=lambda: self._set_loop(idx, 0))
+        m.tk_popup(evt.x_root, evt.y_root)
+
+    def _pick_loop_target(self, idx):
+        """选"播完第 idx 帧后跳回哪一帧" → loop_back = idx − 目标."""
+        a = self.selected
+        if idx == 0:
+            messagebox.showinfo("提示", "第0帧之前无帧可回跳")
+            return
+        cur_lb = a.frames[idx][1]
+        win = tk.Toplevel(self.root)
+        win.title(f"{a.name}: 第{idx}帧子循环")
+        win.resizable(False, False)
+        ttk.Label(win, text="本帧播完, 跳回第帧:").pack(padx=10, pady=(8, 0))
+        var = tk.IntVar(value=(idx - cur_lb) if cur_lb else max(0, idx - 1))
+        ttk.Spinbox(win, from_=0, to=idx - 1, width=6,
+                    textvariable=var).pack(padx=10, pady=4)
+        ttk.Label(win, text=f"(loop_back = {idx} − 目标帧)",
+                  foreground="#888").pack(padx=10)
+        btns = ttk.Frame(win)
+        btns.pack(pady=6)
+
+        def ok():
+            try:
+                t = int(var.get())
+            except ValueError:
+                return
+            t = max(0, min(t, idx - 1))
+            self._set_loop(idx, idx - t)
+            win.destroy()
+
+        ttk.Button(btns, text="确定", command=ok).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.LEFT)
+
+    def _set_loop(self, idx, lb):
+        a = self.selected
+        d, _, le = a.frames[idx]
+        a.frames[idx] = (d, lb, le)
+        self._sync_tree_row(idx)
+        self._redraw_thumbs()
 
     # ── 播放 ──
     def play(self):
