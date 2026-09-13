@@ -6,7 +6,7 @@
 把全部动画帧 (含 idle) 合并为 1 个文件, open 降到毫秒级;
 固件侧 fd 常开 + lseek/read 纯块读播放。
 
-素材源: assets/anim_bin/ 下的 RGB565 帧 bin (115200B/帧)。
+导入素材: assets/anim_bin/ 下的 RGB565 帧 bin (115200B/帧)。
 idle(zhanli) 与全部非 idle 动画都在包里; spiffs/ 里其余文件
 (zh.bin 等) 原样保留。
 
@@ -25,8 +25,24 @@ idle(zhanli) 与全部非 idle 动画都在包里; spiffs/ 里其余文件
   WebP 帧: Pillow 无损编码 (RGB565→RGB888→WebP, 往返 RGB888→RGB565
            逐位精确, 解码回比可全帧逐字节校验)
 
-固件侧 (pet_avatar.c) 校验 magic/version 后按 total_frames 读帧表建
-每动画索引 — 与枚举数 (PET_ANIM_COUNT) 解耦, 缺素材的枚举不出条目。
+文件格式 v3 (2026-09-13, 帧序表内嵌 — 数据驱动):
+  [头部] {u32 magic="ANI2", u32 version=3, u32 total_frames, u32 seq_len}
+         + total_frames × {u32 anim_id, u32 off, u32 size_flags} (同 v2)
+         + 帧序段 seq_len bytes (播放节奏, 见下)
+         + 帧数据平铺 (off 相对数据区起点 = 16 + 12×total + seq_len)
+  帧序段 (固件 pet_avatar.c 按此布局解析):
+    u8  play_loops            (整组循环轮数, 无子循环动画用)
+    u8  pad[3]
+    u32 anim_count
+    anim_count × {u16 anim_id, u8 count, u8 fps, u8 pad}
+    anim_count × count × {u16 duration_ms, u8 loop_back, u8 pad}
+  duration_ms=0 → 用默认 fps (1000/fps) — 与固件语义一致。
+  JSON 源: assets/anim_meta.json (帧序表唯一数据源, exe 编辑器也读写它);
+  JSON 缺失 → 退回 v2 打包 (兼容旧流程)。
+
+固件侧 (pet_avatar.c) 校验 magic 后按 version 分流: v2 老路径 / v3 读帧序段
+覆盖内部表。老固件 (version 校验=2) 读 v3 包 → 头部无效整体拒绝 → 宠物
+不显示, 系统照常 (既有优雅降级)。
 双解码器 (RLE + WebP) 都实现, 由每帧 codec flag 分发; 实机探针计时后
 定夺最终 codec (定夺 = 改 --codec 重跑, 容器/固件零改动)。
 
@@ -38,6 +54,7 @@ idle(zhanli) 与全部非 idle 动画都在包里; spiffs/ 里其余文件
 """
 import argparse
 import io
+import json
 import os
 import struct
 import sys
@@ -51,13 +68,18 @@ FRAME_SIZE = 240 * 240 * 2
 
 PACK_MAGIC = 0x32494E41  # "ANI2" — v1 是 "ANIM", 必须不同 (老固件读新包走 magic 失败)
 PACK_VERSION = 2
+PACK_VERSION_SEQ = 3    # v3: 头 16B + 帧序段 (JSON 驱动, 见文件头注释)
 FLAG_RAW = 0x80000000
 CODEC_RLE = 0
 CODEC_WEBP = 1
 
+SEQ_META_PATH = os.path.join(os.path.dirname(__file__), "..", "assets",
+                             "anim_meta.json")
+
 # (anim_id, prefix, frame_count) — anim_id 与 pet_avatar.h 枚举值一致:
 # IDLE=0 HAPPY=1 SAD=2(复用zhanli, 无素材) EXCITED=3 SLEEPY=4 EATING=5
 # SURPRISED=6 BLUSH=7 PATHEAD=8 SCRATCH=9 POINTSELF=10
+# JSON (assets/anim_meta.json) 存在时替代本表并为 v3 提供帧序段; 缺失 → 本表 + v2。
 ANIMS = [
     (0, "zhanli", 5),
     (1, "happy", 6),
@@ -70,6 +92,45 @@ ANIMS = [
     (9, "scratch", 2),
     (10, "pointself", 5),
 ]
+
+
+def load_meta():
+    """读 assets/anim_meta.json → (meta | None). meta 含 play_loops + anims[].
+    帧序表唯一数据源 (exe 编辑器同步读写); 缺失 = 旧 v2 流程."""
+    if not os.path.exists(SEQ_META_PATH):
+        return None
+    with open(SEQ_META_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_seq_blob(meta):
+    """帧序段 (v3): u8 play_loops + pad3 + u32 anim_count +
+    anim_count × {u16 anim_id, u8 count, u8 fps, u8 pad} +
+    anim_count × count × {u16 duration_ms, u8 loop_back, u8 pad}.
+    布局与固件 pet_avatar.c 解析一一对应, 修改必须两侧同步."""
+    out = bytearray()
+    out += struct.pack("<B", int(meta["play_loops"]))
+    out += b"\x00\x00\x00"
+    anims = meta.get("anims", [])
+    out += struct.pack("<I", len(anims))
+    for a in anims:
+        frames = a.get("frames", [])
+        if len(frames) != a["count"]:
+            raise SystemExit(f"meta {a.get('name')}: frames {len(frames)} "
+                             f"!= count {a['count']}")
+        out += struct.pack("<HBB", a["id"], a["count"], a["fps"])
+        out += b"\x00"
+        for fr in frames:
+            out += struct.pack("<HBB", int(fr.get("dur", 0)),
+                                int(fr.get("loop_back", 0)), 0)
+    return bytes(out)
+
+
+def anim_list(meta):
+    """返回 [(anim_id, prefix, count)] — JSON 优先, 缺失回退内置表."""
+    if meta:
+        return [(a["id"], a["prefix"], a["count"]) for a in meta.get("anims", [])]
+    return ANIMS
 
 
 def rle_encode(data):
@@ -166,10 +227,11 @@ def decode_frame(blob, size_flags, out_len):
     return None, False
 
 
-def build_pack(codec):
-    """返回 (pack_bytes, meta). meta = [(anim_id, prefix, idx_in_anim, blob, flags)]. """
+def build_pack(codec, meta=None):
+    """返回 (pack_bytes, pack_meta). pack_meta = [(anim_id, prefix, idx_in_anim, blob, flags)].
+    meta (JSON) 给定 → v3 内嵌帧序段; None → v2 (老流程兼容)."""
     frames = []  # (anim_id, prefix, idx_in_anim, data)
-    for anim_id, prefix, count in ANIMS:
+    for anim_id, prefix, count in anim_list(meta):
         for i in range(count):
             p = os.path.join(SRC_DIR, f"{prefix}_{i:02d}.bin")
             with open(p, "rb") as f:
@@ -191,27 +253,79 @@ def build_pack(codec):
         entries[i] = (anim_id, off, flags)
         off += len(blobs[i])
 
+    seq_blob = build_seq_blob(meta) if meta else b""
+    version = PACK_VERSION_SEQ if meta else PACK_VERSION
+    hdr_fmt = "<IIII" if meta else "<III"
+
     out = bytearray()
-    out += struct.pack("<III", PACK_MAGIC, PACK_VERSION, len(entries))
+    out += struct.pack(hdr_fmt, PACK_MAGIC, version, len(entries), len(seq_blob))
     for anim_id, eoff, flags in entries:
         out += struct.pack("<III", anim_id, eoff, flags)
+    out += seq_blob
     out += b"".join(blobs)
 
-    meta = [(a, p, idx, blobs[gi], entries[gi][2])
-            for gi, (a, p, idx, _) in enumerate(frames)]
-    return bytes(out), meta
+    pack_meta = [(a, p, idx, blobs[gi], entries[gi][2])
+                 for gi, (a, p, idx, _) in enumerate(frames)]
+    return bytes(out), pack_meta
 
 
-def verify_pack(pack, meta, codec_name):
+def unpack_seq_blob(pack, version):
+    """从包内解析帧序段 → {play_loops, anims:[{id,count,fps,frames:[(dur,loop_back)]}]}.
+    逐字段结构校验 — 固件与脚本对同一布局解析, 不一致即 FAIL."""
+    if version == PACK_VERSION:
+        return None, 0, None
+    magic, ver, total, seq_len = struct.unpack_from("<IIII", pack, 0)
+    if magic != PACK_MAGIC or ver != PACK_VERSION_SEQ:
+        print(f"ERROR: 头部无效 magic={magic:08x} version={ver}")
+        return None, 0, None
+    head = 16 + 12 * total
+    seq = pack[head:head + seq_len]
+    need = 8
+    if len(seq) < need:
+        print(f"ERROR: 帧序段过短 {len(seq)}B < {need}B")
+        return None, seq_len, None
+    play_loops = seq[0]
+    anim_count = struct.unpack_from("<I", seq, 4)[0]
+    pos = 8
+    meta = {"play_loops": play_loops, "anims": []}
+    for _ in range(anim_count):
+        if pos + 5 > len(seq):
+            print(f"ERROR: 帧序段截断 (条目标头 @{pos})")
+            return None, seq_len, None
+        anim_id, count, fps = struct.unpack_from("<HBB", seq, pos)
+        pos += 5
+        frames = []
+        for _ in range(count):
+            if pos + 4 > len(seq):
+                print(f"ERROR: 帧序段截断 (帧 {anim_id} @{pos})")
+                return None, seq_len, None
+            dur, lb = struct.unpack_from("<HB", seq, pos)
+            frames.append((dur, lb))
+            pos += 4
+        meta["anims"].append({"id": anim_id, "count": count, "fps": fps,
+                              "frames": frames})
+    if pos != len(seq):
+        print(f"ERROR: 帧序段长度不符 {pos} != {len(seq)}")
+        return None, seq_len, None
+    return meta, seq_len, seq
+
+
+def verify_pack(pack, pack_meta, codec_name):
     """读回解码全部帧, 与素材逐字节比对 (两 codec 的往返都必须无损)."""
     magic, version, total = struct.unpack_from("<III", pack, 0)
-    if magic != PACK_MAGIC or version != PACK_VERSION:
+    if magic != PACK_MAGIC or version not in (PACK_VERSION, PACK_VERSION_SEQ):
         print(f"ERROR: 头部无效 magic={magic:08x} version={version}")
         return False
-    data_start = 12 + 12 * total
+    seq_meta, seq_len, _ = unpack_seq_blob(pack, version)
+    if version == PACK_VERSION_SEQ and seq_meta is None:
+        return False
+    table_start = 16 if version == PACK_VERSION_SEQ else 12  # v3 头 16B
+    data_start = table_start + 12 * total
+    if version == PACK_VERSION_SEQ:
+        data_start += seq_len
     bad = 0
-    for i, (anim_id, prefix, idx, _, flags) in enumerate(meta):
-        off = struct.unpack_from("<I", pack, 12 + i * 12 + 4)[0]
+    for i, (anim_id, prefix, idx, _, flags) in enumerate(pack_meta):
+        off = struct.unpack_from("<I", pack, table_start + i * 12 + 4)[0]
         p = os.path.join(SRC_DIR, f"{prefix}_{idx:02d}.bin")
         with open(p, "rb") as f:
             expect = f.read()
@@ -224,11 +338,15 @@ def verify_pack(pack, meta, codec_name):
         print(f"verify {codec_name}: {bad}/{total} 帧不一致!")
         return False
     print(f"verify {codec_name}: {total}/{total} 帧逐字节一致 [OK]")
+    if version == PACK_VERSION_SEQ:
+        print(f"verify seq: play_loops={seq_meta['play_loops']} "
+              f"{len(seq_meta['anims'])} 动画, "
+              f"帧序段 {seq_len}B [OK]")
     return True
 
 
 def main():
-    ap = argparse.ArgumentParser(description="生成动画包 (v2: RLE/WebP 双 codec)")
+    ap = argparse.ArgumentParser(description="生成动画包 (v2: RLE/WebP 双 codec; v3: JSON 帧序内嵌)")
     ap.add_argument("--codec", choices=["rle", "webp"], default="rle",
                     help="压缩方式 (默认 rle)")
     ap.add_argument("--out", help="只输出到指定文件 (默认双端 spiffs/ + simulator/spiffs/)")
@@ -236,18 +354,24 @@ def main():
     args = ap.parse_args()
 
     codec = CODEC_RLE if args.codec == "rle" else CODEC_WEBP
-    pack, meta = build_pack(codec)
-    total_data = len(pack) - (12 + 12 * len(meta))
-    raw_total = FRAME_SIZE * len(meta)
-    print(f"动画数: {len(ANIMS)}  帧数: {len(meta)}  codec={args.codec}  "
-          f"数据: {total_data} bytes ({total_data/1048576:.2f} MB, "
-          f"{total_data/raw_total*100:.1f}% 原始)")
-    n_raw = sum(1 for (_, _, _, _, flags) in meta if flags & FLAG_RAW)
+    meta = load_meta()
+    pack, pack_meta = build_pack(codec, meta)
+    version = PACK_VERSION_SEQ if meta else PACK_VERSION
+    head = 16 + 12 * len(pack_meta) if meta else 12 + 12 * len(pack_meta)
+    total_data = len(pack) - head
+    raw_total = FRAME_SIZE * len(pack_meta)
+    fmt = f"动画数: {len(ANIMS)}  帧数: {len(pack_meta)}  v{version}"
+    if meta:
+        fmt += " (JSON 帧序)"
+    fmt += f"  codec={args.codec}  数据: {total_data} bytes " \
+           f"({total_data/1048576:.2f} MB, {total_data/raw_total*100:.1f}% 原始)"
+    print(fmt)
+    n_raw = sum(1 for (_, _, _, _, flags) in pack_meta if flags & FLAG_RAW)
     if n_raw:
-        print(f"  RAW 回退帧: {n_raw}/{len(meta)}")
+        print(f"  RAW 回退帧: {n_raw}/{len(pack_meta)}")
 
     if args.verify:
-        if not verify_pack(pack, meta, args.codec):
+        if not verify_pack(pack, pack_meta, args.codec):
             sys.exit(1)
 
     outs = [args.out] if args.out else OUT_DEFAULT

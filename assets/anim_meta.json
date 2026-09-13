@@ -1,0 +1,79 @@
+{
+  "_comment": "帧序表唯一数据源 (v3)。固件帧序表内嵌进 anims.bin 由此文件生成; exe 编辑器读写本文件。迁移自 pet_avatar.c build_seq (2026-09-13)。",
+  "play_loops": 3,
+  "anims": [
+    {
+      "id": 0, "name": "IDLE", "prefix": "zhanli", "count": 5, "fps": 8,
+      "frames": [
+        {"dur": 300}, {"dur": 300}, {"dur": 800}, {"dur": 800}, {"dur": 300}
+      ]
+    },
+    {
+      "id": 1, "name": "HAPPY", "prefix": "happy", "count": 6, "fps": 8,
+      "frames": [
+        {"dur": 300}, {"dur": 300}, {"dur": 300}, {"dur": 300},
+        {"dur": 300}, {"dur": 300}
+      ]
+    },
+    {
+      "id": 3, "name": "EXCITED", "prefix": "talk", "count": 10, "fps": 10,
+      "frames": [
+        {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200},
+        {"dur": 200, "loop_back": 1},
+        {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200}
+      ]
+    },
+    {
+      "id": 4, "name": "SLEEPY", "prefix": "sleep", "count": 13, "fps": 6,
+      "frames": [
+        {"dur": 500}, {"dur": 500}, {"dur": 500}, {"dur": 500}, {"dur": 500},
+        {"dur": 500, "loop_back": 1},
+        {"dur": 500}, {"dur": 500}, {"dur": 500}, {"dur": 500},
+        {"dur": 500}, {"dur": 500}, {"dur": 500}
+      ]
+    },
+    {
+      "id": 5, "name": "EATING", "prefix": "eating", "count": 19, "fps": 10,
+      "frames": [
+        {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200},
+        {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200},
+        {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200},
+        {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200}
+      ]
+    },
+    {
+      "id": 6, "name": "SURPRISED", "prefix": "squat", "count": 2, "fps": 8,
+      "frames": [
+        {"dur": 1500}, {"dur": 300}
+      ]
+    },
+    {
+      "id": 7, "name": "BLUSH", "prefix": "blush", "count": 14, "fps": 10,
+      "frames": [
+        {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200},
+        {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200},
+        {"dur": 200}, {"dur": 200}, {"dur": 200}, {"dur": 200}
+      ]
+    },
+    {
+      "id": 8, "name": "PATHEAD", "prefix": "pathead", "count": 7, "fps": 10,
+      "frames": [
+        {"dur": 300}, {"dur": 300}, {"dur": 300}, {"dur": 300}, {"dur": 300},
+        {"dur": 300},
+        {"dur": 300, "loop_back": 3}
+      ]
+    },
+    {
+      "id": 9, "name": "SCRATCH", "prefix": "scratch", "count": 2, "fps": 8,
+      "frames": [
+        {"dur": 1500}, {"dur": 300}
+      ]
+    },
+    {
+      "id": 10, "name": "POINTSELF", "prefix": "pointself", "count": 5, "fps": 8,
+      "frames": [
+        {"dur": 300}, {"dur": 300}, {"dur": 300}, {"dur": 300}, {"dur": 300}
+      ]
+    }
+  ]
+}
