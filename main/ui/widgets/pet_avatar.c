@@ -33,8 +33,8 @@ static const char *TAG = "avatar";
  * size_flags: bit31=原始 RGB565 未压缩; bits30-28=codec (0=RLE,
  * 1=WebP 无损); 低 28 位 = 帧数据字节数 */
 #define PACK_MAGIC_V2    0x32494E41u /* "ANI2" */
-#define PACK_VERSION     2
-#define PACK_VERSION_V3  3          /* v3: 头 16B + 帧序段内嵌 (2026-09-13 数据驱动) */
+#define PACK_VERSION_V3  3          /* v3: 头 16B + 帧序段内嵌 (2026-09-13 数据驱动);
+                                     * 2026-09-13 起只认 v3, 不做 v2 兼容 */
 #define PACK_SEQ_MAX     1536       /* 帧序段上限 — 静态缓冲 (现 390B) */
 #define PACK_MAX_FRAMES  256
 #define PACK_FLAG_RAW    0x80000000u
@@ -82,7 +82,7 @@ static pet_anim_t s_loaded_anim = PET_ANIM_IDLE;
 static int s_pack_fd = -1;
 static uint32_t s_pack_data_off;             /* 数据区绝对文件偏移 (头部之后) */
 static uint16_t s_pack_total;                /* 帧表条目数 */
-static int s_pack_version;                   /* 包版本 (v2/v3, pack_ensure_open 后有效) */
+static int s_pack_version;                   /* 包版本 (恒 v3, pack_ensure_open 后有效) */
 /* 帧表 (静态 .bss, 不占运行期堆): 12B/条目 × PACK_MAX_FRAMES */
 static uint8_t s_pack_tab[PACK_MAX_FRAMES * 12];
 static uint8_t s_pack_first[PET_ANIM_COUNT]; /* 每动画首帧在帧表的序号 */
@@ -108,29 +108,26 @@ static bool pack_ensure_open(void)
         goto fail;
     }
     uint32_t seq_len = 0;
-    if (version == PACK_VERSION_V3) {
-        /* v3: 头 16B — 继续读 seq_len */
-        if (read(s_pack_fd, hdr + 12, 4) != 4) goto fail;
-        memcpy(&seq_len, hdr + 12, 4);
-        if (seq_len == 0 || seq_len > PACK_SEQ_MAX) {
-            ESP_LOGE(TAG, "anims.bin 帧序段长度无效 (%u)", seq_len);
-            goto fail;
-        }
-    } else if (version != PACK_VERSION) {
-        ESP_LOGE(TAG, "anims.bin 版本不支持 (v%u)", version);
+    if (version != PACK_VERSION_V3) {
+        /* 只认 v3 (2026-09-13 起不做 v2 兼容). v2 帧序硬编码回退已移除 */
+        ESP_LOGE(TAG, "anims.bin 版本不支持 (v%u, 需 v3)", version);
+        goto fail;
+    }
+    /* v3: 头 16B — 继续读 seq_len */
+    if (read(s_pack_fd, hdr + 12, 4) != 4) goto fail;
+    memcpy(&seq_len, hdr + 12, 4);
+    if (seq_len == 0 || seq_len > PACK_SEQ_MAX) {
+        ESP_LOGE(TAG, "anims.bin 帧序段长度无效 (%u)", seq_len);
         goto fail;
     }
     /* 一次性读全帧表 (防 12B 小读); v3 帧表后跟帧序段 — 流式读取已对齐 */
     size_t tab_bytes = (size_t)total * 12;
     if (read(s_pack_fd, s_pack_tab, tab_bytes) != (ssize_t)tab_bytes) goto fail;
-    if (version == PACK_VERSION_V3) {
-        if (read(s_pack_fd, s_seq_blob, seq_len) != (ssize_t)seq_len) goto fail;
-        s_seq_len = (uint16_t)seq_len;
-    }
+    if (read(s_pack_fd, s_seq_blob, seq_len) != (ssize_t)seq_len) goto fail;
+    s_seq_len = (uint16_t)seq_len;
     off_t file_end = lseek(s_pack_fd, 0, SEEK_END);
     if (file_end < 0) goto fail;
-    s_pack_data_off = (uint32_t)((version == PACK_VERSION_V3 ? 16 : 12) +
-                                 tab_bytes + seq_len);
+    s_pack_data_off = (uint32_t)(16 + tab_bytes + seq_len);
     s_pack_total = (uint16_t)total;
     s_pack_version = (int)version;
     if (file_end < (off_t)(s_pack_data_off + 4)) goto fail;
@@ -632,14 +629,7 @@ static void seq_apply(void)
     }
 }
 
-static void build_seq(avatar_frame_t *dst, int count, uint16_t dur, uint8_t fps)
-{
-    for (int i = 0; i < count; i++)
-        dst[i] = (avatar_frame_t){i, dur, 0, 0};
-}
-
-/* v2 硬编码帧序槽 (内容与 assets/anim_meta.json 一致, 变更须同步 —
- * 仅 v2 包回退路径使用) */
+/* 帧序槽 (v3 帧序段解析后写入, seq_apply 覆盖; SAD 复用 idle 槽) */
 static avatar_frame_t s_seq_idle[5];
 static avatar_frame_t s_seq_happy[6];
 static avatar_frame_t s_seq_talk[10];
@@ -859,60 +849,21 @@ esp_err_t pet_avatar_init(void)
     s_seq_slots[PET_ANIM_SCRATCH] = s_seq_scratch;
     s_seq_slots[PET_ANIM_POINTSELF] = s_seq_pointself;
 
-    /* 打开动画包并读偏移表 — 之后播放零 open. 帧序来源由包版本决定:
-     * v3 = 内嵌帧序段 (数据驱动, pet_avatar_set_sequence 运行时也可覆盖);
-     * v2 = 本地硬编码 (回退路径, 内容须与 assets/anim_meta.json 同步) */
+    /* 打开动画包并读偏移表 — 之后播放零 open. 帧序来自包内嵌帧序段
+     * (数据驱动; pet_avatar_set_sequence 运行时也可覆盖) */
     if (!pack_ensure_open()) {
         ESP_LOGE(TAG, "anims.bin 打开失败 — 动画不可用");
         return ESP_FAIL;
     }
 
-    if (s_pack_version == PACK_VERSION_V3) {
-        seq_apply();
-        /* 常驻池动画: idle/SAD 不经过装载路径 (SAD 复用 idle 帧序+素材) */
-        s_anims[PET_ANIM_IDLE].pool = s_idle;
-        s_anims[PET_ANIM_SAD].frames = s_seq_idle;
-        s_anims[PET_ANIM_SAD].pool = s_idle;
-        s_anims[PET_ANIM_SAD].count = s_anims[PET_ANIM_IDLE].count;
-        s_anims[PET_ANIM_SAD].default_fps = s_anims[PET_ANIM_IDLE].default_fps;
-        s_anims[PET_ANIM_SAD].loop = 1;
-    } else {
-        /* ── v2 硬编码帧序 (回退路径, 内容须与 anim_meta.json 同步) ── */
-        build_seq(s_seq_idle, 5, 300, 8);
-        s_seq_idle[2].duration_ms = 800;
-        s_seq_idle[3].duration_ms = 800;
-        build_seq(s_seq_happy, 6, 300, 8);
-        build_seq(s_seq_talk, 10, 200, 10);
-        /* baoxiongshuohua: 帧4起点, 帧5回跳1步 → 4-5子循环 */
-        s_seq_talk[5].loop_back = 1;
-        build_seq(s_seq_sleep, 13, 500, 6);
-        /* shuijiao: 帧4起点, 帧5回跳1步 → 4-5子循环 */
-        s_seq_sleep[5].loop_back = 1;
-        build_seq(s_seq_eating, 19, 200, 10);
-        /* dunzhe: 帧0=1500ms, 帧1=300ms */
-        build_seq(s_seq_squat, 2, 300, 8);
-        s_seq_squat[0].duration_ms = 1500;
-        build_seq(s_seq_blush, 14, 200, 10);
-        /* motou: 300ms每帧, 帧3子循环起点, 帧6回跳3步 → 3-6子循环 */
-        build_seq(s_seq_pathead, 7, 300, 10);
-        s_seq_pathead[6].loop_back = 3;
-        /* naotou: 帧0=1500ms, 帧1=300ms */
-        build_seq(s_seq_scratch, 2, 300, 8);
-        s_seq_scratch[0].duration_ms = 1500;
-        build_seq(s_seq_pointself, 5, 300, 8);
-
-        s_anims[PET_ANIM_IDLE] = (anim_seq_t){s_seq_idle, s_idle, 5, 1, 8};
-        s_anims[PET_ANIM_HAPPY] = (anim_seq_t){s_seq_happy, NULL, 6, 1, 8};
-        s_anims[PET_ANIM_SAD] = (anim_seq_t){s_seq_idle, s_idle, 5, 1, 8};
-        s_anims[PET_ANIM_EXCITED] = (anim_seq_t){s_seq_talk, NULL, 10, 1, 10};
-        s_anims[PET_ANIM_SLEEPY] = (anim_seq_t){s_seq_sleep, NULL, 13, 1, 6};
-        s_anims[PET_ANIM_EATING] = (anim_seq_t){s_seq_eating, NULL, 19, 1, 10};
-        s_anims[PET_ANIM_SURPRISED] = (anim_seq_t){s_seq_squat, NULL, 2, 1, 8};
-        s_anims[PET_ANIM_BLUSH] = (anim_seq_t){s_seq_blush, NULL, 14, 1, 10};
-        s_anims[PET_ANIM_PATHEAD] = (anim_seq_t){s_seq_pathead, NULL, 7, 1, 10};
-        s_anims[PET_ANIM_SCRATCH] = (anim_seq_t){s_seq_scratch, NULL, 2, 1, 8};
-        s_anims[PET_ANIM_POINTSELF] = (anim_seq_t){s_seq_pointself, NULL, 5, 1, 8};
-    }
+    seq_apply();
+    /* 常驻池动画: idle/SAD 不经过装载路径 (SAD 复用 idle 帧序+素材) */
+    s_anims[PET_ANIM_IDLE].pool = s_idle;
+    s_anims[PET_ANIM_SAD].frames = s_seq_idle;
+    s_anims[PET_ANIM_SAD].pool = s_idle;
+    s_anims[PET_ANIM_SAD].count = s_anims[PET_ANIM_IDLE].count;
+    s_anims[PET_ANIM_SAD].default_fps = s_anims[PET_ANIM_IDLE].default_fps;
+    s_anims[PET_ANIM_SAD].loop = 1;
 
     /* 常驻池 idle: 两个分支都只设了 s_anims 结构, 帧数据在这里一次性载入 */
     ESP_LOGI(TAG, "加载 idle (zhanli)...");
