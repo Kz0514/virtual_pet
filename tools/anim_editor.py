@@ -269,8 +269,6 @@ class App:
         self.selected = None          # Anim
         self.player = None
         self.after_id = None
-        # PhotoImage 引用防 GC (tk 引用计数不感知 PhotoImage)
-        self._images = []
         self._build_ui()
 
     # ── UI ──
@@ -356,7 +354,6 @@ class App:
             messagebox.showerror("打开失败", str(e))
             return
         self.pack = pack
-        self._images.clear()
         try:
             loops, seq_anims = parse_seq_blob(pack.pack)
         except (IndexError, struct.error) as e:
@@ -386,7 +383,7 @@ class App:
         return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
     def _predecode(self):
-        """后台预解码全部素材帧 → Anims[].gil (播放/浏览零等待)."""
+        """后台预解码全部素材帧 → Anims[].gil; 每动画完成即刷新缩略条."""
         pack = self.pack
         if not pack:
             return
@@ -398,24 +395,28 @@ class App:
                 if img is None:
                     break
                 a.gil[idx] = img
+            self.root.after(0, self._thumbs_refresh, a)
         self.root.after(0, self.var_state.set, "预解码完成 — 全部帧就绪")
+
+    def _thumbs_refresh(self, a):
+        if self.selected is a:
+            self._redraw_thumbs()
 
     # ── 显示 ──
     def _photo(self, img, size):
-        from PIL import ImageTk
+        from PIL import Image, ImageTk
         if img.size != (size, size):
             img = img.resize((size, size), Image.LANCZOS)
-        ph = ImageTk.PhotoImage(img)
-        self._images.append(ph)      # 防 GC
-        return ph
+        return ImageTk.PhotoImage(img)
 
-    def _anim_img(self, anim, idx):
+    def _anim_img(self, anim, idx, decode=True):
+        """取帧图. decode=False 时只查缓存 (缩略条用 — 缺帧画灰块,
+        由 _predecode 线程补齐后刷新, 避免同步解码卡 UI / 递归重绘)."""
         img = anim.gil.get(idx)
-        if img is None and idx < anim.count:
+        if img is None and decode and idx < anim.count:
             img = self.pack.frame_pil(anim.id, idx)
             if img is not None:
                 anim.gil[idx] = img
-                self._redraw_thumbs()
         return img
 
     def _show_frame(self, anim, idx):
@@ -425,8 +426,9 @@ class App:
             self.canvas.create_text(FW * SCALE // 2, FH * SCALE // 2,
                                     text="无帧", fill="#888")
             return
-        self.canvas.create_image(0, 0, image=self._photo(img, FW * SCALE),
-                                 anchor=tk.NW)
+        # 引用挂 canvas 属性: 覆盖旧图 → 旧 PhotoImage 释放 (防播放内存泄漏)
+        self.canvas._photo = self._photo(img, FW * SCALE)
+        self.canvas.create_image(0, 0, image=self.canvas._photo, anchor=tk.NW)
 
     def _redraw_thumbs(self):
         c = self.thumb_canvas
@@ -434,19 +436,22 @@ class App:
         a = self.selected
         if not a:
             return
+        photos = []          # 本次重绘的引用集中持有, 覆盖旧列表即释放
         x = 4
         for idx in range(a.count):
             tag = f"t{idx}"
-            img = self._anim_img(a, idx)
+            img = self._anim_img(a, idx, decode=False)
             if img is None:
                 c.create_rectangle(x, 2, x + THUMB, 2 + THUMB, fill="#555")
             else:
-                c.create_image(x, 2, image=self._photo(img, THUMB),
-                               anchor=tk.NW, tags=(tag,))
+                ph = self._photo(img, THUMB)
+                photos.append(ph)
+                c.create_image(x, 2, image=ph, anchor=tk.NW, tags=(tag,))
             c.create_text(x + THUMB // 2, THUMB + 8, text=str(idx),
                           fill="#ccc", font=("Helvetica", 8))
             c.tag_bind(tag, "<Button-1>", lambda e, k=idx: self._thumb_click(k))
             x += THUMB + 8
+        c._photos = photos
         c.configure(scrollregion=(0, 0, x, THUMB + 26))
 
     def _thumb_click(self, idx):
@@ -563,7 +568,6 @@ class App:
         self._show_frame(p.anim, idx)
         self.tree.selection_set(str(idx + 1))
         self.tree.see(str(idx + 1))
-        frac = p.loop_count * (1 if len(p.anim.frames) else 1)
         self.var_state.set(f"{p.anim.name} 帧序 #{idx}  dur={dur}ms"
                            f"{'  完成一轮' if done else ''}  轮 {p.loop_count}")
         self.after_id = self.root.after(dur, self._tick_loop)
