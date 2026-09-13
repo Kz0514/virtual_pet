@@ -149,3 +149,9 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# anim_editor 帧图 URI 缓存 (sidecar 靠近 anims.bin, 不入库)
+*.uris.json
+
+# PyInstaller 构建产物 (便利文件, 不入库)
+anim_editor.spec

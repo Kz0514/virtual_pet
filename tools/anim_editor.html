@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>动画包 v3 编辑器</title>
+<style>
+:root{
+  --bg:#101418; --panel:#171d24; --panel2:#1d2530; --line:#2a333d;
+  --txt:#d7e0e8; --dim:#7b8894; --dim2:#5a6672;
+  --accent:#4f8cff; --accent-deep:#3a6fd8; --gold:#ffd23d;
+  --r:10px; --r-sm:7px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--bg);color:var(--txt);font:14px/1.5 system-ui,"Segoe UI",sans-serif;
+  height:100vh;display:flex;flex-direction:column;overflow:hidden;user-select:none;
+}
+/* ═══ 顶栏 ═══ */
+header{
+  display:flex;align-items:center;gap:8px;padding:10px 14px;
+  background:linear-gradient(180deg,#1a2129,#171d24);border-bottom:1px solid var(--line);
+}
+.brand{font-weight:600;display:flex;align-items:center;gap:8px}
+.brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);
+  box-shadow:0 0 10px var(--accent)}
+button{
+  background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+  padding:6px 14px;border-radius:var(--r-sm);font:inherit;cursor:pointer;
+  transition:background .15s,border-color .15s,transform .05s;
+}
+button:hover{background:#25303c;border-color:#3a4756}
+button:active{transform:translateY(1px)}
+button.acc{background:var(--accent);border-color:var(--accent);color:#fff}
+button.acc:hover{background:var(--accent-deep)}
+button.ghost{background:transparent}
+button:disabled{opacity:.4;cursor:default}
+.sep{width:1px;height:22px;background:var(--line);margin:0 4px}
+label{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:13px}
+input[type=number]{
+  background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+  border-radius:var(--r-sm);padding:4px 6px;width:54px;font:inherit;
+}
+.spacer{flex:1}
+#status{color:var(--dim);font-size:12.5px;max-width:44vw;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;text-align:right}
+#status.ok{color:var(--accent)}
+/* ═══ 主区 ═══ */
+main{flex:1;display:flex;min-height:0}
+#anim-list{
+  width:200px;min-width:200px;overflow-y:auto;padding:10px;gap:6px;display:flex;
+  flex-direction:column;background:var(--panel);border-right:1px solid var(--line);
+}
+.anim-card{
+  background:var(--panel2);border:1px solid var(--line);border-radius:var(--r);
+  padding:9px 11px;cursor:pointer;transition:border-color .15s;
+}
+.anim-card:hover{border-color:#3a4756}
+.anim-card.active{border-color:var(--accent);background:#202a3a;
+  box-shadow:0 0 0 1px var(--accent) inset}
+.anim-card .nm{font-weight:600;font-size:13.5px;display:flex;justify-content:space-between}
+.anim-card .id{color:var(--dim2);font-size:11px}
+.anim-card .meta{color:var(--dim);font-size:12px;margin-top:3px;
+  display:flex;justify-content:space-between;align-items:center}
+.anim-card .fps-badge{background:#2b3644;border-radius:20px;padding:0 8px;
+  font-size:11px;color:#9fb2c4}
+/* ═══ 舞台 ═══ */
+#stage{flex:1;display:flex;flex-direction:column;min-width:0;padding:14px}
+#preview{flex:1;display:flex;align-items:center;justify-content:center;
+  flex-direction:column;min-height:0;gap:9px}
+#pv-img{
+  max-width:min(480px,58vh);max-height:min(480px,58vh);aspect-ratio:1/1;
+  border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.5);
+  background:#0c0f13;object-fit:cover;
+}
+#pv-cap{color:var(--dim);font-size:12.5px;background:var(--panel2);
+  padding:3px 14px;border-radius:20px;border:1px solid var(--line)}
+/* 帧轴 */
+#axle-wrap{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);
+  padding:10px 10px 0;overflow:hidden}
+#axle{width:100%;height:134px;display:block;cursor:crosshair}
+#axle-hint{color:var(--dim2);font-size:11px;padding:5px 2px 9px;display:flex;
+  justify-content:space-between;gap:20px}
+#axle-hint b{color:#3a4756;font-weight:600}
+/* ═══ 帧序表 ═══ */
+#table-panel{
+  width:300px;min-width:300px;display:flex;flex-direction:column;gap:8px;
+  background:var(--panel);border-left:1px solid var(--line);padding:10px;
+}
+.panel-title{display:flex;align-items:center;gap:8px;font-weight:600;font-size:13.5px}
+.panel-title .tg{color:var(--dim);font-size:12px;font-weight:400}
+#tbl-scroll{flex:1;overflow-y:auto;border:1px solid var(--line);border-radius:var(--r-sm)}
+table{width:100%;border-collapse:collapse}
+th{
+  position:sticky;top:0;background:var(--panel);color:var(--dim);font-size:11.5px;
+  font-weight:500;text-align:right;padding:6px 10px;border-bottom:1px solid var(--line);z-index:2;
+}
+th:first-child,td:first-child{text-align:center}
+td{padding:2px 5px;border-bottom:1px solid #1f2630}
+td input{
+  width:100%;background:transparent;border:1px solid transparent;border-radius:5px;
+  color:var(--txt);font:inherit;text-align:right;padding:3px 6px;outline:none;
+}
+td input:hover{border-color:var(--line)}
+td input:focus{border-color:var(--accent);background:#1b2430}
+tr.sel td{background:#202a3a}
+tr td.lb{color:var(--dim)}
+tr.loop td.lb{color:var(--gold);font-weight:600}
+/* 右键菜单 */
+#ctx{position:fixed;display:none;z-index:99;background:var(--panel2);
+  border:1px solid var(--line);border-radius:9px;box-shadow:0 10px 30px rgba(0,0,0,.55);
+  padding:4px;min-width:190px}
+#ctx button{display:block;width:100%;text-align:left;background:transparent;border:0;
+  padding:7px 12px;border-radius:6px;font-size:13px;color:var(--txt)}
+#ctx button:hover{background:#28313e}
+#ctx .cap{color:var(--dim2);font-size:11px;padding:4px 12px 2px}
+/* 模态 */
+#modal{position:fixed;inset:0;display:none;z-index:98;background:rgba(6,9,12,.6);
+  align-items:center;justify-content:center}
+#modal .box{background:var(--panel2);border:1px solid var(--line);border-radius:12px;
+  padding:18px 20px;width:320px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+#modal h3{font-size:14.5px;margin-bottom:10px;font-weight:600}
+#modal .row{display:flex;gap:8px;margin-top:14px;justify-content:flex-end}
+#modal input{width:100%;background:var(--panel);border:1px solid var(--line);
+  color:var(--txt);border-radius:7px;padding:7px 10px;font:inherit;outline:none}
+#modal input:focus{border-color:var(--accent)}
+#modal .hint{color:var(--dim2);font-size:12px;margin-top:7px}
+/* toast */
+#toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);
+  background:var(--panel2);border:1px solid var(--line);border-radius:20px;
+  padding:9px 20px;font-size:13px;opacity:0;pointer-events:none;
+  transition:opacity .2s,transform .2s;z-index:97;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.err{border-color:#d8534f;color:#ffb3b0}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot"></span>动画包 v3 编辑器</div>
+  <button id="btn-open">打开包…</button>
+  <button id="btn-json" class="ghost">保存 JSON</button>
+  <button id="btn-pack" class="ghost">打包 anims.bin</button>
+  <div class="sep"></div>
+  <button id="btn-play" class="acc">▶ 播放</button>
+  <button id="btn-stop" class="ghost">■ 停止</button>
+  <label>循环轮数 <input id="in-loops" type="number" min="1" max="9" value="3"></label>
+  <label id="lbl-fps" hidden>帧序fps <input id="in-fps" type="number" min="1" max="60" value="8"></label>
+  <div class="spacer"></div>
+  <div id="status">启动中…</div>
+</header>
+<main>
+  <aside id="anim-list"></aside>
+  <section id="stage">
+    <div id="preview">
+      <img id="pv-img" alt="">
+      <div id="pv-cap">未打开包</div>
+    </div>
+    <div id="axle-wrap">
+      <canvas id="axle"></canvas>
+      <div id="axle-hint">
+        <span><b>·</b>滚轮/拖动:平移　<b>·</b>单击:跳帧　<b>·</b>双击:时长　<b>·</b>右键:菜单</span>
+        <span><b>○</b>拖括弧圆点 = 调整循环区间</span>
+      </div>
+    </div>
+  </section>
+  <section id="table-panel">
+    <div class="panel-title">帧序表 <span class="tg" id="tbl-name">—</span>
+      <div class="spacer"></div></div>
+    <div id="tbl-scroll"><table>
+      <thead><tr><th style="width:34px">#</th><th>时长ms</th><th>回跳</th><th>额外</th></tr></thead>
+      <tbody id="tbl-body"></tbody>
+    </table></div>
+  </section>
+</main>
+<div id="ctx"></div>
+<div id="modal"><div class="box">
+  <h3 id="modal-title"></h3>
+  <input id="modal-input" type="number" min="0" max="65535">
+  <div class="hint" id="modal-hint"></div>
+  <div class="row">
+    <button id="modal-cancel" class="ghost">取消</button>
+    <button id="modal-ok" class="acc">确定</button>
+  </div>
+</div></div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* ══════════ 状态 ══════════ */
+let meta=null, frames={}, info=null, selAnim=0;
+let playing=false, timer=null;
+let player={pos:0,loopCount:0,loopActive:false,loopRemaining:0};
+let hl=-1, scrollX=0;
+const SLOT_W=76, SLOT_H=64, THUMB_X=2, THUMB_Y=7, AXLE_H=134, BAND_H=18, BAND_STEP=6;
+const LOOP_COLORS=["#e8a33d","#5aa7e8","#7dc95a","#c96ac9"];
+const $=id=>document.getElementById(id);
+const imgCache={};
+
+/* ══════════ 工具 ══════════ */
+const api=()=> window.pywebview? window.pywebview.api : null;
+function toast(msg,err){const t=$("toast");t.textContent=msg;
+  t.className="show"+(err?" err":"");clearTimeout(t._h);
+  t._h=setTimeout(()=>{t.className="";},2800);}
+function status(m,ok){const s=$("status");s.textContent=m;s.className=ok?"ok":"";}
+function imgFor(aid,idx){
+  const k=aid+":"+idx;
+  if(!(k in imgCache)){
+    const u=frames[k];
+    imgCache[k]= u? (()=>{const im=new Image();im.src=u;return im;})() : null;
+  }
+  return imgCache[k];
+}
+const durOf=(a,f)=> f.dur>0? f.dur : Math.round(1000/(a.fps||15));
+
+/* ══════════ 装载 ══════════ */
+async function init(){
+  bindButtons();
+  if(!api()){ status("未检测到 pywebview — 请通过 anim_editor.py 启动",false);
+    return; }
+  /* 加载期: 列表锁定 + 状态提示 (首帧解码需 1-2s, 有 sidecar 缓存则秒开) */
+  $("anim-list").style.pointerEvents="none";
+  status("正在加载动画包…",false);
+  try{
+    const r=await api().load_default();
+    if(r) applyPack(r); else status("就绪 — 点「打开包」",false);
+  }catch(e){ status("载入默认包失败: "+e,false); }
+  $("anim-list").style.pointerEvents="";
+}
+function openPack(){
+  api().open_pack_dialog().then(r=>{
+    if(!r) return;
+    if(!r.ok) toast("打开失败: "+r.error,true);
+    else applyPack(r);
+  }).catch(e=>toast("打开异常: "+e,true));
+}
+function applyPack(r){
+  meta=r.meta; frames=r.frames; info=r.info;
+  $("in-loops").value=meta.play_loops;
+  status(info.path.replace(/^.*[\\/]/,"")+" — v3 包 "+info.total+" 帧",true);
+  renderList(); selectAnim(0);
+  toast("已载入 "+info.total+" 帧");
+}
+function saveJson(){ if(!meta)return toast("先打开包",true);
+  api().save_json(meta).then(r=>toast(r.ok?"JSON 已保存: "+r.path:r.error,!r.ok)); }
+function rebuildPack(){ if(!meta)return toast("先打开包",true);
+  api().rebuild_pack(meta).then(r=>toast(r.ok?
+    "打包完成: "+info.path.replace(/^.*[\\/]/,"")+" ⇒ "+r.path+" ("+
+    (r.size/1048576).toFixed(2)+" MB)" : r.error,!r.ok)); }
+
+/* ══════════ 动画列表 & 预览 ══════════ */
+function renderList(){
+  $("anim-list").innerHTML="";
+  meta.anims.forEach((a,i)=>{
+    const c=document.createElement("div"); c.className="anim-card"+(i===selAnim?" active":"");
+    c.innerHTML=`<div class="nm">${a.name}<span class="id">id${a.id}</span></div>
+      <div class="meta"><span>${a.count} 帧</span><span class="fps-badge">${a.fps}fps</span></div>`;
+    c.onclick=()=>selectAnim(i);
+    $("anim-list").appendChild(c);
+  });
+}
+function selectAnim(i){
+  if(!meta)return; selAnim=i; playing&&stopPlay();
+  const a=meta.anims[i];
+  Array.from($("anim-list").children).forEach((c,k)=>c.classList.toggle("active",k===i));
+  setBig(a,0,true);
+  $("tbl-name").textContent=`${a.name} · ${a.count}帧`;
+  $("in-fps").value=a.fps; $("lbl-fps").hidden=false;
+  renderTable(); setTableRow(0);
+  hl=-1; drawAxle();
+}
+function setBig(a,idx,resetFit){
+  const im=imgFor(a.id,idx);
+  $("pv-img").src= im? im.src : "";
+  $("pv-cap").textContent=`${a.name} · 帧${idx} · 时长${durOf(a,a.frames[idx]||
+    {dur:0})}ms${a.frames[idx]&&a.frames[idx].loop_back>0?
+    " · ↺"+a.frames[idx].loop_back:""}`;
+}
+/* ══════════ 帧序表 ══════════ */
+function renderTable(){
+  const a=meta.anims[selAnim]; const body=$("tbl-body"); body.innerHTML="";
+  a.frames.forEach((f,i)=>{
+    const tr=document.createElement("tr"); tr.dataset.i=i;
+    tr.classList.toggle("loop",f.loop_back>0);
+    tr.innerHTML=`<td>${i}</td>
+      <td><input type="number" min="0" max="65535" data-k="dur" value="${f.dur||""}"
+          placeholder="${durOf(a,f)}"></td>
+      <td><input type="number" min="0" max="255" data-k="loop_back" value="${f.loop_back}"></td>
+      <td><input type="number" min="0" max="255" data-k="loop_extra" value="${f.loop_extra}"></td>`;
+    body.appendChild(tr);
+    tr.querySelectorAll("input").forEach(inp=>{
+      inp.onchange=()=>{
+        const max=inp.dataset.k==="dur"?65535:255;
+        let v=Math.max(0,Math.min(+inp.value||0,max)); inp.value=v;
+        f[inp.dataset.k]=v;
+        if(inp.dataset.k==="dur"){ inp.value=f.dur||""; setBig(a,i); }
+        if(inp.dataset.k==="loop_back"){
+          tr.classList.toggle("loop",f.loop_back>0);
+          setBig(a,i); drawAxle();
+        }
+        if(playing){ /* 播放中实时生效: 重读状态由 tick 决定 */ }
+      };
+      inp.onkeydown=e=>{if(e.key==="Enter")inp.blur();};
+    });
+  });
+}
+function setTableRow(i){
+  Array.from($("tbl-body").children).forEach((tr,k)=>{
+    tr.classList.toggle("sel",k===i);
+  });
+  const t=$("tbl-scroll"), tr=$("tbl-body").children[i];
+  if(tr && (tr.offsetTop<t.scrollTop || tr.offsetTop+tr.clientHeight>t.scrollTop+t.clientHeight))
+    t.scrollTop=tr.offsetTop-(t.clientHeight/2);
+}
+
+/* ══════════ 播放 (语义与固件 frame_timer_cb 一致) ══════════ */
+function startPlay(){
+  if(!meta)return toast("先打开包",true);
+  if(playing)stopPlay();
+  player={pos:0,loopCount:0,loopActive:false,loopRemaining:0};
+  playing=true; $("btn-play").disabled=true;
+  tick();
+}
+function stopPlay(){
+  playing=false;
+  if(timer)clearTimeout(timer),timer=null;
+  $("btn-play").disabled=false;
+}
+function tick(){
+  if(!playing)return;
+  const a=meta.anims[selAnim];
+  const f=a.frames[player.pos];
+  let dur;
+  if(f.loop_back>0){
+    if(!player.loopActive){
+      player.loopActive=true;
+      player.loopRemaining=(meta.play_loops>0?meta.play_loops-1:0);
+    }
+    if(player.loopRemaining>0){
+      player.loopRemaining--;
+      player.pos-=f.loop_back;
+      const f2=a.frames[player.pos];
+      /* 与固件 frame_timer_cb 一致: 回跳帧立即出图 */
+      hl=player.pos; setBig(a,player.pos); setTableRow(player.pos);
+      dur=durOf(a,f2);
+      drawAxle(); timer=setTimeout(tick,dur); return;
+    }
+    player.loopActive=false;
+  }
+  player.pos++;
+  let done=false;
+  if(player.pos>=a.frames.length){
+    player.pos=0;
+    player.loopCount++;
+    const hasSub=a.frames.some(x=>x.loop_back>0);
+    const target=hasSub?1:meta.play_loops;
+    if(player.loopCount>=target){
+      player.loopCount=0; done=true;   /* 预览循环连播 */
+    }
+  }
+  const f3=a.frames[player.pos];
+  /* 推进帧在推进后出图 (对齐固件) — 此前在 tick 开头出图,
+   * 回跳帧画面会被同拍的"回跳出图"立刻顶掉 → 2帧循环看起来卡在第一帧 */
+  hl=player.pos; setBig(a,player.pos); setTableRow(player.pos);
+  dur=durOf(a,f3);
+  drawAxle();
+  timer=setTimeout(tick,dur);
+}
+
+/* ══════════ 帧轴绘制 ══════════ */
+const cv=$("axle"), cx=cv.getContext("2d");
+function axisW(){return cv.clientWidth;}
+function virtualW(){return 4+meta.anims[selAnim].count*SLOT_W;}
+function slotX(i){return 4+i*SLOT_W;}          /* 虚拟 x */
+function slotFrom(vx){return Math.round((vx-4)/SLOT_W);}
+function loopRows(){
+  /* 返回 [{s,e,lb,idx,lvl}] 按起点贪心分层 */
+  const a=meta.anims[selAnim], spans=[];
+  a.frames.forEach((f,i)=>{ if(f.loop_back>0 && i-f.loop_back>=0)
+    spans.push({s:i-f.loop_back,e:i,lb:f.loop_back,idx:i}); });
+  spans.sort((p,q)=>p.s-q.s || q.e-p.e);
+  const ends=[];
+  return spans.map(sp=>{
+    let lvl=0; while(lvl<ends.length && ends[lvl]>=sp.s) lvl++;
+    if(lvl===ends.length) ends.push(sp.e); else ends[lvl]=sp.e;
+    return {...sp,lvl};
+  });
+}
+function drawAxle(){
+  if(!meta)return; cv.width=cv.clientWidth; cv.height=AXLE_H;
+  cx.clearRect(0,0,cv.width,cv.height);
+  const a=meta.anims[selAnim];
+  /* 背景底格 */
+  cx.fillStyle="#10161d"; cx.fillRect(0,0,cv.width,AXLE_H);
+  cx.strokeStyle="#232c36"; cx.lineWidth=1;
+  for(let i=0;i<=a.frames.length;i++){
+    const x=slotX(i)-scrollX;
+    cx.beginPath(); cx.moveTo(x+.5,0); cx.lineTo(x+.5,AXLE_H-24); cx.stroke();
+  }
+  /* 缩略图 + 编号 */
+  for(let i=0;i<a.frames.length;i++){
+    const x=slotX(i)-scrollX;
+    if(x+SLOT_W<0 || x>cv.width) continue;
+    const im=imgFor(a.id,i);
+    if(im&&im.complete&&im.naturalWidth)
+      cx.drawImage(im,x+THUMB_X,THUMB_Y,SLOT_W-4,SLOT_H);
+    else
+      cx.fillStyle="#232c36",cx.fillRect(x+THUMB_X,THUMB_Y,SLOT_W-4,SLOT_H);
+    /* 编号 */
+    cx.fillStyle=i===hl?"#ffd23d":"#7b8894";
+    cx.font="600 10px system-ui"; cx.textAlign="center";
+    cx.fillText(i,x+SLOT_W/2,THUMB_Y+SLOT_H+12);
+  }
+  /* 当前帧高亮 */
+  if(hl>=0){
+    const x=slotX(hl)-scrollX;
+    cx.strokeStyle="#ffd23d"; cx.lineWidth=2;
+    cx.strokeRect(x+1,THUMB_Y-1,SLOT_W-2,SLOT_H+2);
+  }
+  /* 循环色带: 半透明带 [回跳目标点, 循环终点] + 两端把手 */
+  const y0=THUMB_Y+SLOT_H+22;
+  loopRows().forEach(r=>{
+    const col=LOOP_COLORS[r.lvl%LOOP_COLORS.length];
+    const x1=slotX(r.s)-scrollX+SLOT_W/2, x2=slotX(r.e)-scrollX+SLOT_W/2;
+    const y=y0+r.lvl*BAND_STEP;
+    const xA=Math.min(x1,x2), xB=Math.max(x1,x2);
+    if(xB<0 || xA>cv.width) return;
+    /* 带体 */
+    cx.fillStyle=col+"30"; cx.strokeStyle=col; cx.lineWidth=1.2;
+    cx.beginPath();
+    if(cx.roundRect) cx.roundRect(xA,y,xB-xA,BAND_H,5); else cx.rect(xA,y,xB-xA,BAND_H);
+    cx.fill(); cx.stroke();
+    /* 回跳标签: 两端帧号 + 回跳量, 实色 pill 底保证可读 (居中于色带) */
+    const lbl = r.lb===1 ? (r.s+"↺"+r.e) : (r.s+"↺"+r.lb+"→"+r.e);
+    cx.font="700 12.5px system-ui";
+    const tw=cx.measureText(lbl).width, tx=(xA+xB)/2-tw/2, ty=y-2, th=BAND_H+4;
+    cx.fillStyle=col; cx.strokeStyle="rgba(11,14,18,.6)"; cx.lineWidth=1;
+    cx.beginPath();
+    if(cx.roundRect) cx.roundRect(tx-6,ty,tw+12,th,7); else cx.rect(tx-6,ty,tw+12,th);
+    cx.fill(); cx.stroke();
+    cx.fillStyle="#0b0e12"; cx.textAlign="left";
+    cx.fillText(lbl,tx,ty+th/2+4.5);
+    /* 两端把手: 左=回跳目标, 右=循环终点 (均可拖) */
+    cx.fillStyle=col; cx.strokeStyle="#0b0e12"; cx.lineWidth=1.5;
+    cx.beginPath(); cx.arc(xA,y+BAND_H/2,4.5,0,7); cx.fill(); cx.stroke();
+    cx.beginPath(); cx.arc(xB,y+BAND_H/2,4.5,0,7); cx.fill(); cx.stroke();
+  });
+}
+
+/* ══════════ 帧轴交互 ══════════ */
+let downX=0, downSX=0, dragging=null, moved=false, cvr=null;
+function hitNubs(px,py){
+  /* 两种把手: start=回跳目标点(左), end=循环终点(右) */
+  const y0=THUMB_Y+SLOT_H+22;
+  for(const r of loopRows()){
+    const y=y0+r.lvl*BAND_STEP+BAND_H/2;
+    const x1=slotX(r.s)-scrollX+SLOT_W/2, x2=slotX(r.e)-scrollX+SLOT_W/2;
+    if(Math.hypot(px-x1,py-y)<8) return {end:"start",r};
+    if(Math.hypot(px-x2,py-y)<8) return {end:"end",r};
+  }
+  return null;
+}
+cv.addEventListener("pointerdown",e=>{
+  if(!meta)return; e.preventDefault();
+  downX=e.clientX; downSX=scrollX; moved=false;
+  cvr=cv.getBoundingClientRect();
+  dragging=hitNubs(e.clientX-cvr.left,e.clientY-cvr.top);
+  try{ cv.setPointerCapture(e.pointerId); }catch(_){}
+  /* 拖动手势挂 document — 指针出画布/出窗口都不丢 */
+  document.addEventListener("pointermove",axleMove);
+  document.addEventListener("pointerup",axleUp);
+});
+function axleMove(e){
+  if(!meta)return;
+  const rx=e.clientX-cvr.left;
+  if(dragging){
+    const a=meta.anims[selAnim], r=dragging.r, vx=rx+scrollX;
+    if(dragging.end==="end"){
+      /* 拖循环终点 = 把"回跳"从旧帧搬到新帧 (组整体伸缩) */
+      const ne=Math.max(r.s+1,Math.min(a.frames.length-1,slotFrom(vx)));
+      if(ne!==r.e){
+        a.frames[r.e].loop_back=0;
+        a.frames[ne].loop_back=ne-r.s;
+        r.e=ne; r.lb=ne-r.s;
+        renderTable(); drawAxle();
+      }
+    }else{
+      /* 拖回跳目标点 = 改回跳步数 */
+      const t=Math.max(0,Math.min(r.idx-1,slotFrom(vx)));
+      const newLb=r.idx-t;
+      if(newLb!==r.lb){
+        a.frames[r.idx].loop_back=newLb;
+        r.lb=newLb;
+        renderTable(); drawAxle();
+      }
+    }
+  }else if((e.buttons&1) && Math.abs(e.clientX-downX)>5){
+    /* 仅按住左键才算拖动滚轴 — 悬停移动不滚 */
+    moved=true;
+    scrollX=Math.max(0,Math.min(virtualW()-cv.clientWidth,
+                                downSX-(e.clientX-downX)));
+    drawAxle();
+  }else if(!(e.buttons&1)){
+    /* 悬停反馈: 罩在把手上时给 grab 光标 */
+    cv.style.cursor=hitNubs(rx,e.clientY-cvr.top)?"grab":"crosshair";
+  }
+}
+function axleUp(e){
+  document.removeEventListener("pointermove",axleMove);
+  document.removeEventListener("pointerup",axleUp);
+  if(dragging){
+    const r=dragging.r;
+    if(dragging.end==="end")
+      status("循环组: 帧"+r.s+"→"+r.e+" (回跳 "+r.lb+")"),
+      toast("循环终点已拖至帧"+r.e);
+    else
+      status("循环组: 帧"+(r.idx-r.lb)+"→"+r.idx+" (回跳 "+r.lb+")"),
+      toast("回跳点已拖至帧"+(r.idx-r.lb));
+  }else if(!moved && cvr){
+    const ix=slotFrom(e.clientX-cvr.left+scrollX);
+    if(ix>=0 && ix<meta.anims[selAnim].count){
+      playing&&stopPlay();
+      hl=ix; setBig(meta.anims[selAnim],ix); setTableRow(ix); drawAxle();
+    }
+  }
+  dragging=null; moved=false; cvr=null;
+}
+cv.addEventListener("wheel",e=>{
+  e.preventDefault();
+  scrollX=Math.max(0,Math.min(virtualW()-cv.clientWidth,scrollX+e.deltaY));
+  drawAxle();
+},{passive:false});
+cv.addEventListener("dblclick",e=>{
+  const ix=slotFrom(e.offsetX+scrollX);
+  if(ix<0||ix>=meta.anims[selAnim].count)return;
+  ask("帧"+ix+" 时长", "时长ms (0=默认fps)", 0,65535,
+      meta.anims[selAnim].frames[ix].dur, "0 → "+durOf(meta.anims[selAnim],meta.anims[selAnim].frames[ix])+"ms (fps默认)",
+      v=>{ meta.anims[selAnim].frames[ix].dur=v; renderTable(); setBig(meta.anims[selAnim],ix); drawAxle(); });
+});
+cv.addEventListener("contextmenu",e=>{
+  if(!meta)return;
+  e.preventDefault();
+  const ix=slotFrom(e.offsetX+scrollX);
+  if(ix<0||ix>=meta.anims[selAnim].count)return;
+  showCtx(e.clientX,e.clientY,ix);
+});
+
+/* 右键菜单 */
+function showCtx(x,y,ix){
+  const a=meta.anims[selAnim], f=a.frames[ix];
+  const m=$("ctx"); m.innerHTML="";
+  const cap=document.createElement("div"); cap.className="cap";
+  cap.textContent=`${a.name} 帧${ix}`; m.appendChild(cap);
+  const items=[
+    ["时长…",()=>{ m.style.display="none";
+      ask("帧"+ix+" 时长","时长ms (0=默认fps)",0,65535,f.dur,
+        "0 → "+durOf(a,f)+"ms (默认fps)",
+        v=>{a.frames[ix].dur=v;renderTable();drawAxle();setBig(a,ix);}); }],
+    ["设置子循环跳回点…",()=>{ m.style.display="none";
+      if(ix===0)return toast("帧0之前无帧可回跳",true);
+      const cur=f.loop_back>0?ix-f.loop_back:Math.max(0,ix-1);
+      ask("帧"+ix+" 子循环","播完跳回帧 #",0,ix-1,cur,
+        "回跳步数 = "+ix+" − 目标",v=>{
+          if(v<ix){ a.frames[ix].loop_back=ix-v;
+            renderTable(); drawAxle(); setBig(a,ix);
+            toast("循环组: 帧"+v+"→"+ix); } }); }],
+  ];
+  if(f.loop_back>0) items.push(["清除本帧循环",()=>{
+    m.style.display="none";
+    a.frames[ix].loop_back=0; renderTable(); drawAxle(); setBig(a,ix);
+    toast("循环已清除"); }]);
+  items.forEach(([l,fn])=>{
+    const b=document.createElement("button"); b.textContent=l; b.onclick=fn; m.appendChild(b);
+  });
+  m.style.display="block";
+  m.style.left=Math.min(x,document.documentElement.clientWidth-210)+"px";
+  m.style.top=Math.min(y,document.documentElement.clientHeight-m.offsetHeight-10)+"px";
+  /* 菜单外点击关闭 (点菜单内不关 — 按钮自身负责隐藏) */
+  document.addEventListener("pointerdown",(ev)=>{
+    if(!m.contains(ev.target)) m.style.display="none";
+  },{once:true});
+}
+
+/* ══════════ 模态 ask ══════════ */
+let askResolve=null;
+function ask(title,label,min,max,val,hint,onOk){
+  $("modal-title").textContent=title;
+  const inp=$("modal-input"); inp.min=min; inp.max=max; inp.value=val;
+  $("modal-hint").textContent=hint||"";
+  $("modal").style.display="flex";
+  inp.focus(); inp.select();
+  askResolve=onOk;
+}
+function closeModal(){ $("modal").style.display="none"; askResolve=null; }
+$("modal-ok").onclick=()=>{
+  const inp=$("modal-input");
+  let v=Math.max(+inp.min,Math.min(+inp.value||0,+inp.max));
+  const fn=askResolve; closeModal();
+  if(fn)fn(v);
+};
+$("modal-cancel").onclick=closeModal;
+$("modal-input").onkeydown=e=>{ if(e.key==="Enter")$("modal-ok").click();
+  if(e.key==="Escape")$("modal-cancel").click(); };
+
+/* ══════════ 按钮绑定 ══════════ */
+function bindButtons(){
+  $("btn-open").onclick=openPack;
+  $("btn-json").onclick=saveJson;
+  $("btn-pack").onclick=rebuildPack;
+  $("btn-play").onclick=startPlay;
+  $("btn-stop").onclick=()=>{stopPlay();};   /* 停止需重绘? hl保留 */
+  $("in-loops").onchange=()=>{ meta.play_loops=Math.max(1,Math.min(9,+$("in-loops").value||3));
+    toast("循环轮数 → "+meta.play_loops); };
+  $("in-fps").onchange=()=>{
+    const a=meta.anims[selAnim];
+    a.fps=Math.max(1,Math.min(60,+$("in-fps").value||1));
+    renderTable(); setBig(a,hl>=0?hl:0); toast(`帧序fps → ${a.fps}`);
+  };
+}
+window.addEventListener("resize",()=>{ if(meta)drawAxle(); });
+document.addEventListener("keydown",e=>{
+  if(e.code==="Space" && document.activeElement===document.body){
+    e.preventDefault();
+    if(!meta)return; if(playing)stopPlay(); else startPlay();
+  }
+  });
+window.addEventListener("pywebviewready",init);
+if(window.pywebview) init();     /* 已就绪场景 */
+</script>
+</body>
+</html>
