@@ -106,8 +106,8 @@ def load_meta():
 def build_seq_blob(meta):
     """帧序段 (v3): u8 play_loops + pad3 + u32 anim_count +
     anim_count × {u16 anim_id, u8 count, u8 fps, u8 pad} +
-    anim_count × count × {u16 duration_ms, u8 loop_back, u8 pad}.
-    布局与固件 pet_avatar.c 解析一一对应, 修改必须两侧同步."""
+    anim_count × count × {u16 duration_ms, u8 loop_back, u8 loop_extra}.
+    布局与固件 pet_avatar.c seq_apply 解析一一对应, 修改必须两侧同步."""
     out = bytearray()
     out += struct.pack("<B", int(meta["play_loops"]))
     out += b"\x00\x00\x00"
@@ -122,7 +122,8 @@ def build_seq_blob(meta):
         out += b"\x00"
         for fr in frames:
             out += struct.pack("<HBB", int(fr.get("dur", 0)),
-                                int(fr.get("loop_back", 0)), 0)
+                                int(fr.get("loop_back", 0)),
+                                int(fr.get("loop_extra", 0)))
     return bytes(out)
 
 
@@ -299,8 +300,8 @@ def unpack_seq_blob(pack, version):
             if pos + 4 > len(seq):
                 print(f"ERROR: 帧序段截断 (帧 {anim_id} @{pos})")
                 return None, seq_len, None
-            dur, lb = struct.unpack_from("<HB", seq, pos)
-            frames.append((dur, lb))
+            dur, lb, le = struct.unpack_from("<HBB", seq, pos)
+            frames.append((dur, lb, le))
             pos += 4
         meta["anims"].append({"id": anim_id, "count": count, "fps": fps,
                               "frames": frames})
