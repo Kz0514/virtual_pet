@@ -575,10 +575,9 @@ static esp_err_t http_server_start(void)
     }
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
-    /* LWIP_MAX_SOCKETS=12 时 httpd 内部占用 3 个 socket, 上限 12-3=9;
-     * 设 12 会 ESP_ERR_INVALID_ARG → 配网门户起不来。
-     * 8 = 上限内最大, 激进门户探测并发也够 */
-    cfg.max_open_sockets = 8;
+    /* 规则 (httpd_main.c): max_open_sockets + 3 ≤ LWIP_MAX_SOCKETS, 否则 INVALID_ARG;
+     * LWIP=8 (sdkconfig.defaults) → 上限 5。旧值 8 使配网门户起不来 (2026-09-16 新板首烧发现) */
+    cfg.max_open_sockets = 5;
     esp_err_t err = httpd_start(&s_httpd, &cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start 失败: %s (errno=%d, port=%u)",
