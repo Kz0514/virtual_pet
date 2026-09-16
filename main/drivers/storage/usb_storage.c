@@ -56,6 +56,7 @@
 #include "freertos/FreeRTOS.h" /* vTaskDelay — 重启前留日志时间 */
 #include "freertos/task.h"
 #include <stdio.h>
+#include <string.h> /* memcmp — README 比对 */
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -168,11 +169,12 @@ static FRESULT fatfs_remount(void);
 /* 手动重建 /data 挂载 — 开机一次性注册 (boot 堆干净, 可靠) + 自愈兜底 */
 static esp_err_t repair_data_mount(bool allow_format);
 
-/* /data 预置说明文件 — USB 直读时告知目录用途与恢复方式 */
+/* /data 预置说明文件 — USB 直读时告知目录用途与恢复方式。
+ * 先读后比, 内容一致就不写 (开机 + 每次退出 U盘模式都会调本函数):
+ * 覆写要擦数据扇区 + 目录项两个扇区, 而更坏的是 O_TRUNC **先截断再写** —
+ * 卷已经坏了写不进去时, README 反而被自己抹掉。空文件 / 读失败才落笔 */
 static void write_data_readme(void)
 {
-    int fd = open("/data/README.txt", O_CREAT | O_TRUNC | O_WRONLY);
-    if (fd < 0) return;
     char txt[512];
     const char *pet = config_get_str(CFG_KEY_PET_NAME, "萝莉丝");
     int n = snprintf(txt, sizeof(txt),
@@ -187,7 +189,18 @@ static void write_data_readme(void)
         " - 若电脑提示\"此磁盘未格式化\", 请在设备设置页执行\n"
         " \"格式化存储\", 然后重新插拔 USB\n",
         pet, pet);
-    if (n > 0 && n < (int)sizeof(txt)) write(fd, txt, n);
+    if (n <= 0 || n >= (int)sizeof(txt)) return;
+
+    int fd = open("/data/README.txt", O_RDONLY);
+    if (fd >= 0) {
+        char old[512];
+        ssize_t r = read(fd, old, sizeof(old));
+        close(fd);
+        if (r == (ssize_t)n && memcmp(old, txt, (size_t)n) == 0) return;
+    }
+    fd = open("/data/README.txt", O_CREAT | O_TRUNC | O_WRONLY);
+    if (fd < 0) return;
+    write(fd, txt, n);
     close(fd);
 }
 
@@ -197,6 +210,8 @@ static void set_hidden_attr(const char *path)
 {
     FILINFO finfo;
     if (f_stat(path, &finfo) != FR_OK) return;
+    /* 属性已对就不调 f_chmod — 它会重写目录项, 每次开机白送一次擦除 */
+    if ((finfo.fattrib & (AM_HID | AM_SYS)) == (AM_HID | AM_SYS)) return;
     f_chmod(path, AM_HID | AM_SYS, AM_HID | AM_SYS);
 }
 
@@ -229,6 +244,21 @@ static void write_usb_assets(void)
     set_hidden_attr("/data/autorun.inf");
 }
 
+/* 卷标比较必须忽略大小写: f_setlabel 存盘前过 ff_wtoupper (ff.c 里
+ * `wc = ff_uni2oem(ff_wtoupper(dc), CODEPAGE)`), 根目录里躺着的是
+ * "VIRTUALPET", f_getlabel 读回来原样返回不做小写还原 —— 直接 strcmp
+ * 永远不等, 每次开机照写一次 BPB。FF_LFN_UNICODE 下的 CodePage 转换对
+ * 纯 ASCII 是恒等, 手写 ASCII 折叠即可 */
+static bool label_ci_equal(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        char ca = (*a >= 'a' && *a <= 'z') ? (char)(*a - 32) : *a;
+        char cb = (*b >= 'a' && *b <= 'z') ? (char)(*b - 32) : *b;
+        if (ca != cb) return false;
+    }
+    return *a == 0 && *b == 0;
+}
+
 /* 磁盘卷标 — Windows 以卷标显示盘名。盘号由 ff_diskio_get_drive 动态分配,
  * 不能硬编码 "0:"; 需 CONFIG_FATFS_USE_LABEL=y (f_setlabel 才编译进) */
 static void ensure_volume_label(void)
@@ -238,6 +268,13 @@ static void ensure_volume_label(void)
     BYTE pdrv = ff_diskio_get_pdrv_wl(wl);
     if (pdrv == 0xff) return;
     char label[24];
+    /* 卷标已是目标值就不调 f_setlabel — 它无条件重写 BPB (引导扇区,
+     * 卷上最要紧的一个扇区), 每次开机白送一次擦除。读失败 (无卷标 /
+     * 卷异常) 回落原行为: 照写 */
+    char dpath[3] = {(char)('0' + pdrv), ':', 0};
+    char cur[24] = "";
+    if (f_getlabel(dpath, cur, NULL) == FR_OK && label_ci_equal(cur, USB_VOL_LABEL))
+        return;
     snprintf(label, sizeof(label), "%d:%s", (int)pdrv, USB_VOL_LABEL);
     FRESULT fr = f_setlabel(label);
     if (fr != FR_OK)
