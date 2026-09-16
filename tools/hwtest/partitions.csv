@@ -1,0 +1,26 @@
+# Virtualpet 分区表 (hwtest 与主工程必须同表, 否则 app-flash 落点会错)
+# Flash: 32MB (W25Q256JVEIQ, 0x2000000)
+# ESP32-S3 bootloader: 0x0000-0x8FFF (保留)
+# 无 factory 分区 — 首次烧录直接写入 ota_0
+#
+# 分区概览:
+#   nvs       24KB    WiFi凭据 / 设备Token / 系统设置
+#   otadata   8KB     OTA状态
+#   phy_init  4KB     射频校准
+#   ota_0     2MB     当前固件
+#   ota_1     2MB     OTA更新槽位
+#   nvskey    16KB    加密密钥
+#   config    512KB   设备内部存储 (LittleFS, /cfg): wifi.json / memory.txt / pet.json / CSV (880K→512K)
+#   data      1MB    用户可见存储 (FatFS, /data): 日记 HTML / 交互日志 — USB 直读展示
+#   assets    26MB    动画包 anims.bin / 音效 / 字体 / ESP-SR模型 (LittleFS)
+
+# Name,      Type,    SubType,    Offset,      Size,        Flags
+nvs,         data,    nvs,        0x9000,      0x6000,
+otadata,     data,    ota,        0xf000,      0x2000,
+phy_init,    data,    phy,        0x11000,     0x1000,
+ota_0,       app,     ota_0,      0x20000,     0x200000,
+ota_1,       app,     ota_1,      0x220000,    0x200000,
+nvskey,      data,    nvs_keys,   0x420000,    0x4000,
+config,      data,    littlefs,   0x424000,    0x80000,
+data,        data,    fat,        0x4A4000,    0x100000,
+assets,      data,    littlefs,   0x5A4000,    0x1A5C000,

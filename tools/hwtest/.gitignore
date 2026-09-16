@@ -1,0 +1,9 @@
+build/
+sdkconfig
+sdkconfig.old
+logs/
+# 现场 WiFi 凭据由 run.py 生成 — 不入库 (模板见 main/hw_secrets.h.in)
+main/hw_secrets.h
+dependencies.lock
+# 自检说明文档留在本地, 不入库
+README.md

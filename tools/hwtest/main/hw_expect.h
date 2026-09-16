@@ -1,0 +1,155 @@
+/**
+ * @file hw_expect.h
+ * @brief ★ 全部"配置真值"集中在此 —— 板子改版 / 期望值要改, 只动这个文件 + board.h。
+ *
+ * 判定语义 (见 hw_report.h):
+ *   PASS = 实测与期望一致      FAIL = 不一致 / 器件不应答
+ *   SKIP = 条件不满足(无电池/未烧 assets/被开关关掉) —— 不算错
+ *   WARN = 器件活着但数值不符预期(需人看一眼, 不判死)
+ */
+#ifndef HW_EXPECT_H
+#define HW_EXPECT_H
+
+#include <stdint.h>
+
+#define HW_FW_VERSION "hwtest-1.0"
+
+/* ═══ A. 系统 ═══ */
+#define HW_EXP_FLASH_BYTES (32u * 1024 * 1024) /* W25Q256 */
+#define HW_EXP_PSRAM_MIN_BYTES (7u * 1024 * 1024)
+#define HW_EXP_PSRAM_MAX_BYTES (9u * 1024 * 1024)
+#define HW_EXP_PSRAM_TEST_BYTES (1024u * 1024) /* 实际写-读校验 1MB */
+#define HW_EXP_HEAP_FREE_MIN (64u * 1024)      /* 内部堆剩余下限 (测试时刻) */
+#define HW_EXP_CHIP_CORES 2
+#define HW_EXP_TEMP_MIN_C (-20)
+#define HW_EXP_TEMP_MAX_C (90)
+
+/* 分区表逐项核对 (与 partitions.csv / 主工程同表) */
+typedef struct {
+    const char *name;
+    const char *subtype; /* 仅用于打印 */
+    uint32_t offset;
+    uint32_t size;
+} hw_part_exp_t;
+
+extern const hw_part_exp_t HW_EXP_PARTS[];
+extern const int HW_EXP_PARTS_N;
+
+/* ═══ B. I2C 总线 ═══ */
+/* 上电空闲时两条线都必须是高 (无内部上拉, 靠板载 2.2K)。
+ * 若某器件上电钳 SCL → GPIO0 strapping 也会被拉低 → 直接起不来, 所以这条最致命。 */
+#define HW_EXP_ADDRS_INITIAL                                              \
+    {                                                                     \
+        0x18, 0x40, 0x44, 0x55, 0x68 /* QMC6309 挂 AUX, 单列一项 */      \
+    }
+#define HW_EXP_ADDRS_N 5
+/* QMC6309: 挂 MPU6500 的 AUX, 靠 INT_PIN_CFG.BYPASS_EN 桥到主总线。
+ * 旁路打开后它出现在 **0x0C** 且 reg 0x00 = 0x90;
+ *                     未贴装的板 0x0C 与 0x2C 都 NACK。
+ * 主工程 board.h:41 / qmc6309.c:31 用的 0x2C 从未观察到应答 → 只作对照探一下。
+ * 注意: qmc6309.c:80 那个 "WIA(0x0D)=0x31" 也在硬件上读回 0x00 (该驱动从未被调用过) → 不作判据。 */
+#define HW_EXP_QMC_ADDR 0x0C     /* 旁路开后应答的地址 */
+#define HW_EXP_QMC_ADDR_ALT 0x2C /* 主工程里的常量, 本硬件无应答 */
+#define HW_EXP_RISE_MAX_NS 2000    /* 上升时间上限 (基准值见 hw_i2c.c) */
+#define HW_EXP_HAMMER_N 400        /* 每地址背靠背连打笔数 */
+
+/* B7 SDA 直流体检 (ADC 实测) 阈值 —— SDA=GPIO1 正好是 ADC1_CH0。
+ * 板载上拉 2.2K; 内部上/下拉按 45K 名义值粗算 (实件散布 30~80K) → 阻值只报数量级。
+ * 注意 ADC 12dB 衰减的满量程约 3100mV: 线接近 VDD 时会读成"饱和", 不是异常。 */
+#define HW_EXP_VDD_MV 3300.0f       /* 分压粗算用的电源轨 (量出来才知道真值) */
+#define HW_EXP_INT_PULL_K 45.0f     /* ESP32-S3 内部上/下拉名义阻值 */
+#define HW_EXP_PULLUP_NOMINAL_K 2.2f
+#define HW_EXP_PULLUP_MAX_K 3.2f    /* 等效上拉高于此 = 上拉偏弱/开路 */
+#define HW_EXP_PULLDOWN_MIN_K 10.0f /* 等效下拉低于此 = 有器件在强拖低 (漏电/半短路) */
+#define HW_EXP_PAD_HI_MIN_MV 2400   /* 推挽拉高低于此 = 脚高侧坏 或 外部强钳 */
+#define HW_EXP_PAD_LO_MAX_MV 300    /* 推挽拉低高于此 = 脚低侧坏 */
+#define HW_EXP_SDA_FLOAT_MIN_MV 150 /* "外部上拉几乎不存在"的判据 (内部下拉下测) */
+#define HW_EXP_INT_MID_MIN_MV 1200  /* 内部上下拉"同开"的下限: 正常≈半轨; 更低 = 外部有下拉/引脚可疑 */
+#define HW_EXP_SDA_HOLD_S 20        /* B7 判出异常时开的量线窗口秒数 (给人拿表量, 见 i2c.sdahold) */
+
+/* ═══ C. 器件身份 / 配置 ═══ */
+#define HW_EXP_HDC_ID 0x1050
+#define HW_EXP_OPT_ID 0x3001
+#define HW_EXP_OPT_MANUF 0x5449
+/* OPT3001 配置: 主工程 opt3001.c:51 写入的字节 (连续测量 800ms + 自动量程)。
+ * 注意 [15:12] RN 是自动量程的**只读回读**(随环境光变), 比对时必须掩掉 → 用 MASK。 */
+#define HW_EXP_OPT_CFG_WRITE 0xCE10
+#define HW_EXP_OPT_CFG_MASK 0x0FFF
+/* BQ27220 DeviceType: TI 写法的 Control(0x0001) 在本硬件上三种写法都读回 0x0000
+ * → 只记录不作判据, 身份改由"数值是否合理"判定 */
+#define HW_EXP_BQ_DEVTYPE 0x0001
+#define HW_EXP_MPU_WHO 0x70
+#define HW_EXP_QMC_ID_REG 0x00 /* 芯片 ID (应答时为 0x90) */
+#define HW_EXP_QMC_ID 0x90
+#define HW_EXP_QMC_WIA_REG 0x0D /* 主工程驱动声称 0x31, 本硬件读回 0x00 → 只记录不判定 */
+
+/* BQ27220 合理性区间 (无电池时电压≈0 → SKIP) */
+#define HW_EXP_BAT_VOLT_MIN_MV 3000
+#define HW_EXP_BAT_VOLT_MAX_MV 4400
+#define HW_EXP_BAT_NOPACK_MV 1000 /* 低于此值判定"无电池" */
+#define HW_EXP_BAT_TEMP_MIN_K 2400 /* 温度(0.1K) 合理区间: -33~87°C */
+#define HW_EXP_BAT_TEMP_MAX_K 3600
+
+/* MPU6500 配置期望: 主工程 mpu6500.c:85-104 的写入值, 回读必须一致 */
+typedef struct {
+    uint8_t reg;
+    uint8_t val;
+    const char *name;
+} hw_reg_exp_t;
+
+extern const hw_reg_exp_t HW_EXP_MPU_REGS[];
+extern const int HW_EXP_MPU_REGS_N;
+
+/* ES8311 配置期望 —— 由 hw_devices.c 按**主工程 codec 路径**顺序写入后回读。
+ * 值来源: esp_codec_dev/device/es8311/es8311.c
+ *   es8311_open() (:500-560) + es8311_config_sample() (:418-487) + es8311_start() (:270-330)
+ * MCLK = 48000 × 256 = 12.288MHz (= I2S_STD_CLK_DEFAULT_CONFIG), 系数表行
+ *   {12288000,48000, pre_div=1, mult=1, adc_div=1, dac_div=1, fs=0, lrck_h=0, lrck_l=0xff,
+ *    bclk_div=4, adc_osr=0x10, dac_osr=0x10}
+ * ES8311 没有固定 ID 寄存器 (0xFD/0xFE/0xFF 是 CHIP ID/VERSION, 无文档值),
+ * 所以身份判据 = 寄存器写进去能读回来 + ID 三连读稳定非全 0/全 FF。 */
+typedef struct {
+    uint8_t reg;
+    uint8_t val;
+    const char *name;
+} hw_es_reg_exp_t;
+
+extern const hw_es_reg_exp_t HW_EXP_ES_SEQ[]; /* 按序写入 (照 codec 路径) */
+extern const int HW_EXP_ES_SEQ_N;
+extern const hw_es_reg_exp_t HW_EXP_ES_CMP[]; /* 写完全部后的期望状态, 逐条回读 */
+extern const int HW_EXP_ES_CMP_N;
+#define HW_EXP_ES_ID_REGS 0xFD /* CHIP ID1 / 0xFE ID2 / 0xFF VERSION 三连读 */
+
+/* ═══ D. 面板 ═══ */
+#define HW_EXP_BL_DUTY_PCT 50 /* 背光自检占空比 (10bit → 511), 之后关掉等看板 */
+
+/* ═══ E. 触摸 ═══ */
+/* 基线量程参考: 各通道基线的绝对高度天然散布很大 (几万量级都算正常), 所以
+ * "高位"根本不是饱和: 真正的死通道是**恒 0**(断线)或打满 64k(短路), 别把中间值当阈值。 */
+#define HW_EXP_TOUCH_MIN_RAW 2000  /* 低于此值 = 通道没读数 (断线/未焊接) */
+#define HW_EXP_TOUCH_MAX_RAW 64000 /* 高于此值 = 打满/异常 */
+#define HW_EXP_TOUCH_SAMPLES 8
+
+/* ═══ G. 马达 ═══ */
+#define HW_EXP_HAPTIC_DUTY_PCT 50
+
+/* ═══ H. 存储 ═══ */
+#define HW_EXP_CFG_SIZE 0x80000  /* 512KB */
+#define HW_EXP_DATA_SIZE 0x100000 /* 1MB 分区 */
+/* FAT 可见容量必然小于分区: wear_levelling 先吃掉一块 (1MB 分区上剩不到 256 扇区),
+ * 再扣 FAT 表/根目录 → 可见容量通常落在 700KB 上下。
+ * 所以只卡"明显缩水"的下限, 不跟分区大小比。 */
+#define HW_EXP_DATA_MIN_BYTES (512u * 1024)
+/* FAT12/16 的根目录是**固定表**: IDF 的 f_mkfs 传 n_root=0,
+ * ff.c:5974 把它补成 512 项 → 根目录满时新建/建目录一律 FR_DENIED(=EACCES)。
+ * 表里没有 0x00/0xE5 空位时, 新建文件/目录一律 FR_DENIED(=EACCES) —— 卷脏, 非硬件。
+ * (卷几何别去读 ff.h 的 FATFS 字段: FF_FS_EXFAT 改字段宽度, csize 会读歪。) */
+#define HW_EXP_FAT_ROOT_MAX 512
+#define HW_EXP_ASSETS_SIZE 0x1A5C000 /* 26MB */
+#define HW_EXP_NVS_FREE_MIN_PCT 15 /* NVS 空闲低于此比例 → WARN */
+
+/* ═══ I. WiFi ═══ */
+#define HW_EXP_WIFI_SCAN_TIMEOUT_MS 15000 /* 全信道扫描宽限 */
+#define HW_EXP_WIFI_CONNECT_TIMEOUT_MS 25000 /* 连接 + DHCP 宽限 */
+
+#endif /* HW_EXPECT_H */
