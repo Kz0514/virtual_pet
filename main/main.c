@@ -246,7 +246,7 @@ void app_main(void)
                               bat.soc_pct > BATTERY_CRITICAL_THRESHOLD_PCT);
             memory_store_set_writes_safe(writes_ok);
             data_writer_set_gate(writes_ok);
-            data_writer_tick(); /* 到点的 /data 攒批在此落盘 (每 30s 一次) */
+            data_writer_tick(); /* 到点的 /data 攒批在此落盘 (各文件周期见 data_writer.c) */
 
             /* Log sensor snapshot */
             if (have_env && have_bat && memory_store_writes_safe()) {

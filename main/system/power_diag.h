@@ -2,11 +2,13 @@
  * @file power_diag.h
  * @brief 功耗/睡眠离线诊断 (⑤-1 从 main.c 拆出)
  *
- * power_log.csv (2s 追加, >64KB 重开) + power_seg.csv (256KB 环形 ≈25h)
+ * power_log.csv (2s 追加, 48KB 重开) + power_seg.csv (192KB 环形, ≈46h)
  * + 息屏锁/timer dump + tasks.txt — 拔电期间串口死, 只能靠这些 CSV/文件
  * 回看功耗与唤醒。fd 路径零分配, 禁 fopen (SRAM 紧张 abort); 唯一例外:
  * 息屏锁 dump (esp_pm_dump_locks/esp_timer_dump 官方 API 硬依赖 FILE*,
  * 内部堆 <8KB 时跳过)。
+ *
+ * 四个输出的落盘全在 data_writer (攒批 + 闸门 + 擦除计数), 本模块只攒行。
  */
 #pragma once
 
@@ -29,7 +31,7 @@ void power_diag_note_wake_source(uint8_t wake_src);
 /** 2s 节拍内, 与屏幕状态无关: 轻睡窗口 + 统计日志 (30s 一次) */
 void power_diag_pm_stats_log(void);
 
-/** 息屏 15s 一次诊断: 轻睡计数 + PM 锁/timer dump + tasks.txt */
+/** 息屏 90s 一次诊断: 轻睡计数 + PM 锁/timer dump + tasks.txt */
 void power_diag_screen_off_diag(void);
 
 #ifdef __cplusplus

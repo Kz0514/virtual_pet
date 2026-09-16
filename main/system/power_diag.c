@@ -8,8 +8,15 @@
  * 息屏锁 dump (esp_pm_dump_locks/esp_timer_dump 官方 API 硬依赖 FILE*,
  * 内部堆 <8KB 时跳过)。
  *
- * power_log.csv 的写入已移交 data_writer (攒批 + 闸门 + 擦除计数) —
- * 本文件只负责攒出文本行, open/close 时机与擦除次数不再由这里决定。
+ * 三个文件的写入**全部**移交 data_writer (攒批 + 闸门 + 擦除计数) — 本文件
+ * 只负责攒出文本行, open/close 时机与擦除次数不再由这里决定。
+ *
+ * ⚠️ 原有的"满盘防御" power_diag_disk_low() 已删: 它在数据进 data_writer
+ * **之前** return, 而它判"卷低"的判据正是 f_getfree 报 0 空闲簇 —— 那恰好
+ * 是 FAT 表损坏的指纹 (报 FR_OK 却 0 空闲)。后果是卷坏时全部诊断在生产者
+ * 侧被静默丢弃: drop 计数恒 0、串口无警告、几小时数据无声蒸发, 而现有体检
+ * 把它当"盘满"打进 I 级日志。它的正当用途 (别撑爆分区) 已由 data_writer 的
+ * 48KB/192KB 滚动上限从构造上保证, 不再需要运行时兜底。
  */
 #include "power_diag.h"
 
@@ -21,17 +28,12 @@
 #include "power_manager.h"
 #include "time_manager.h"
 #include "touch_fpc.h"
-#include "sensor_logger.h" /* sensor_logger_data_mounted — FAT 可用性守卫 */
-#include "data_writer.h"   /* power_log.csv 统一写入口 */
-#include "usb_storage.h"   /* usb_storage_get_drive — f_getfree 盘号 */
-#include "ff.h"            /* f_getfree — 满盘防御 */
+#include "data_writer.h" /* power_log/power_seg/tasks.txt 统一写入口 */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
 #include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 static const char *TAG = "pwr_diag";
 
@@ -56,53 +58,12 @@ extern volatile char xDiagWinName[16];
 extern volatile uint32_t xDiagSleepErr;    /* : esp_light_sleep_start 最后错误码 */
 extern volatile uint32_t xDiagSleepErrCnt; /* : 错误累计计数 */
 
-/* /data/power_log.csv — 2s 一条追加 (state: 0=亮 1=变暗 2=息屏), >48KB 重开。
- * fd 路径零分配 — newlib fopen 分配 FILE+锁 (内部 RAM), 耗尽直接 abort。
- * 超限重开: 不 remove (FAT 释放链更新丢失会累积孤儿簇 → U盘卷可用空间
- * 持续缩水; chkdsk 曾一次找回 37 条孤儿链 320KB), 改 O_TRUNC 原地截断
- * 复用簇链 — 簇始终被文件引用, FAT 更新丢失最坏只是长度回退, 不产生
- * 不可达簇。无状态实现: 每次写入前查文件当前大小, 超限即截断 — 重启
- * 丢失任何内存标志也不影响 (教训: 内存标志版被重启打断后 550KB 不再截断)。
- * 注意: 裸 O_TRUNC 在 ESP-IDF FAT VFS 是 no-op (fat_mode_conv 只有
- * O_CREAT|O_TRUNC 才 FA_CREATE_ALWAYS; 裸 O_TRUNC 落 else 只读打开不截断) —
- * 必须带 O_CREAT。1.0.283 实崩: 截断从未生效, power_log 一路涨到 577KB
- * 写满 724KB 分区 (采集 24h 钓出) */
-static void power_diag_roll(const char *path, int64_t limit)
-{
-    int fd = open(path, O_CREAT | O_APPEND | O_WRONLY);
-    if (fd < 0)
-        return;
-    if (lseek(fd, 0, SEEK_END) > limit) {
-        close(fd);
-        int t = open(path, O_CREAT | O_TRUNC | O_WRONLY);
-        if (t >= 0)
-            close(t);
-    } else {
-        close(fd);
-    }
-}
-
-/* 满盘防御: 可用空间 < 32KB → 停写诊断日志 (诊断可弃, 用户数据/功能优先;
- * 预算重定后 48+192+256(life)+128(diary) = 624KB < 724KB 分区, 此检查兜底
- * 预算误差)。仅数据模式 (FAT 挂载) 调用 — U盘模式下卷已 f_mount(NULL)
- * 分离, f_getfree 走进已释放内存 → LoadProhibited 崩溃 */
-static bool power_diag_disk_low(void)
-{
-    if (!sensor_logger_data_mounted())
-        return true;
-    FATFS *fs = NULL;
-    DWORD fre_clu = 0;
-    char dpath[3] = {(char)('0' + usb_storage_get_drive()), ':', 0};
-    if (f_getfree(dpath, &fre_clu, &fs) != FR_OK || !fs)
-        return true; /* 卷异常 → 停写诊断 */
-    uint64_t free_bytes = (uint64_t)fre_clu * fs->csize * fs->ssize;
-    return free_bytes < (32u * 1024u);
-}
+/* power_log.csv 的 48KB 滚动、无状态截断、O_TRUNC 必须带 O_CREAT (1.0.283
+ * 实崩: 截断从未生效, 一路涨到 577KB 写满分区) 等实现细节已随写入权一并
+ * 移入 data_writer.c 的 dw_write_all — 此处不再持有文件句柄 */
 
 void power_diag_log_append(const bq27220_data_t *bat, int state)
 {
-    if (power_diag_disk_low())
-        return;
     /* 落盘移交 data_writer: 攒批 30s → open/close 次数降两个量级 (每次
      * close 都要重写数据扇区 + 目录项扇区 = 2 次 4KB 擦除)。表头与
      * 48KB 滚动由 data_writer 的文件表统一维护 */
@@ -156,7 +117,8 @@ void power_diag_log_append(const bq27220_data_t *bat, int state)
  *   S 行: 每 60s 聚合 = 段内平均电流/电压/SOC + 亮屏时长 + 唤醒次数
  *   W 行: 每次亮屏翻转瞬间 = 时刻 (unix+uptime) + 来源 + 当时电量
  * 来源 src: 1=探针 2 连击 (假唤醒嫌疑), 0=其他 (左键/摇动/操作)。
- * fd 零分配路径遍历, 禁 fopen (SRAM 紧张 abort) */
+ * 行文本在此攒出, 落盘交 data_writer (表头 + 192KB 滚动由它维护) —
+ * S 行随攒批周期走, W 行用 urgent 投递 (见 power_diag_note_wake_source) */
 #define SEG_MS (60 * 1000 * 1000LL) /* esp_timer 段长 60s */
 
 static int64_t s_seg_start_us = 0;   /* 当前段起点 */
@@ -171,27 +133,12 @@ static uint16_t s_bat_last_mv = 0;
 static int16_t s_bat_last_ma = 0;
 static uint8_t s_bat_last_soc = 0;
 
-static void power_diag_seg_write_row(const char *buf, int len)
-{
-    if (power_diag_disk_low())
-        return;
-    power_diag_roll("/data/power_seg.csv", 192 * 1024);
-    int fd = open("/data/power_seg.csv", O_CREAT | O_APPEND | O_WRONLY);
-    if (fd < 0)
-        return;
-    if (lseek(fd, 0, SEEK_END) == 0) {
-        static const char hdr[] = "type,ts_ms,up_ms,ma,mv,soc,src,wake_cnt,on_ms,seg_ms\n";
-        write(fd, hdr, sizeof(hdr) - 1);
-    }
-    if (len > 0)
-        write(fd, buf, (size_t)len);
-    off_t sz = lseek(fd, 0, SEEK_END);
-    close(fd);
-    (void)sz; /* 重开由 power_diag_roll 在写入前无状态检查完成 */
-}
-
 /* 唤醒翻转点调用: 记录 W 行 (主要靠二次分析来源)。
- * ③-4′ 桥已收敛: power_manager 唤醒全流程经 note_interaction 调本函数记账 */
+ * ③-4′ 桥已收敛: power_manager 唤醒全流程经 note_interaction 调本函数记账。
+ *
+ * urgent 投递: W 行是触摸假唤醒排查唯一看重的那份数据, 攒批 30s 意味着
+ * 最坏丢 30s。代价 = 每次唤醒多 2 次擦除, 而唤醒量级 ~十几次/天, 相对
+ * ~1000 次/天的总账可忽略 */
 void power_diag_note_wake_source(uint8_t wake_src)
 {
     s_seg_wake_cnt++;
@@ -204,7 +151,8 @@ void power_diag_note_wake_source(uint8_t wake_src)
                       (int)(s_bat_last_ok ? s_bat_last_mv : 0),
                       (unsigned)(s_bat_last_ok ? s_bat_last_soc : 0),
                       (unsigned)wake_src);
-    power_diag_seg_write_row(line, ln);
+    if (ln > 0)
+        data_writer_append_urgent(DW_POWER_SEG, line, ln);
 }
 
 /* 2s 块调用 (have_bat 时): 累积段统计, 每 60s 落 S 行 */
@@ -242,7 +190,8 @@ void power_diag_seg_tick(const bq27220_data_t *bat)
                           (unsigned)(s_seg_mv_cnt ? (s_seg_soc_sum + s_seg_mv_cnt / 2u) / s_seg_mv_cnt : 0),
                           (unsigned)(s_seg_on_us / 1000), (unsigned)s_seg_wake_cnt,
                           (int)((nowus - s_seg_start_us) / 1000));
-        power_diag_seg_write_row(line, ln);
+        if (ln > 0)
+            data_writer_append(DW_POWER_SEG, line, ln);
         s_seg_ma_sum = s_seg_mv_sum = 0;
         s_seg_ma_cnt = s_seg_mv_cnt = s_seg_soc_sum = 0;
         s_seg_on_us = 0;
@@ -274,7 +223,7 @@ void power_diag_pm_stats_log(void)
              (unsigned)xDiagSleepErrCnt);
 }
 
-/* 息屏每 60s 诊断一次: 轻睡计数 + PM 锁列表 */
+/* 息屏每 90s 诊断一次: 轻睡计数 + PM 锁列表 */
 /* FILE* 型诊断 dump — 官方 API 硬依赖 FILE*, 走不了文本投递; 交给
  * data_writer 的单槽 stream: 回调在写盘任务上下文执行, fp 已按序接在
  * power_log 攒批之后, 主线不做 flash 写 */
@@ -307,13 +256,11 @@ void power_diag_screen_off_diag(void)
         /* 任务延迟探针 — vTaskList 列每任务状态 + 剩余 delay tick:
          * tick 列表高频到期任务会阻轻睡 (prvGetExpectedIdle
          * Time < 3 → vApplicationSleep 永不调用)。写
-         * /data/tasks.txt 覆盖, U盘拷出 */
+         * /data/tasks.txt 覆盖 (DW_TASKS 是覆盖模式), U盘拷出 */
         static char s_tasklist[2048];
         vTaskList(s_tasklist);
-        int tfd = open("/data/tasks.txt", O_CREAT | O_TRUNC | O_WRONLY);
-        if (tfd >= 0) {
-            write(tfd, s_tasklist, strlen(s_tasklist));
-            close(tfd);
-        }
+        size_t tlen = strlen(s_tasklist);
+        if (tlen)
+            data_writer_append(DW_TASKS, s_tasklist, (int)tlen);
     }
 }

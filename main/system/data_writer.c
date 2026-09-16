@@ -23,7 +23,6 @@
 
 static const char *TAG = "data_writer";
 
-#define DW_FLUSH_INTERVAL_MS 30000  /* 攒批周期: 2s 级数据一整天 → 2.9 千次落盘 */
 #define DW_HIGH_WATER_NUM 3         /* 攒到 3/4 缓冲提前落盘 */
 #define DW_HIGH_WATER_DEN 4
 #define DW_WSTAT_INTERVAL_MS 300000 /* # wstat 计数行 (5min) */
@@ -33,23 +32,62 @@ static const char POWER_LOG_HDR[] =
     "evalcnt,ret0,ret1,wincnt,wincore,winrem,winname,err,errcnt,wk,ph,tc,"
     "d0,d1,d2,d3,d4,d5,d6,d7,d8,d9,d10,d11\n";
 
+static const char POWER_SEG_HDR[] =
+    "type,ts_ms,up_ms,ma,mv,soc,src,wake_cnt,on_ms,seg_ms\n";
+
+/* 覆盖模式: 每批即整份内容 (tasks.txt 要的是快照, 不是历史) */
+typedef enum { DW_MODE_APPEND, DW_MODE_OVERWRITE } dw_mode_t;
+
 typedef struct {
     const char *path;
     const char *hdr;    /* 空文件时先写 (NULL=无) */
     uint32_t max_bytes; /* 追加超限 → 原地截断重开 (0=不滚) */
     uint16_t buf_size;  /* 攒批缓冲 (PSRAM) */
+    uint32_t flush_ms;  /* 本文件的攒批周期 — 必须长于数据点间隔才有降幅 */
+    dw_mode_t mode;
     char *buf;
     uint16_t len;
     bool pending;
     int64_t due_ms;
 } dw_entry_t;
 
+/* 攒批周期的取值逻辑: 每文件独立计时, 一批只装"周期内到达的数据点" —
+ * 周期短于数据点间隔时一批恰好一行, 擦除次数与直写**完全相同** (白攒)。
+ * 所以周期必须跨越多个数据点, 否则这个文件进不进 manager 都不省擦除。
+ * 反过来说, 周期越长越省, 代价 = 掉电丢失窗口变长 → 按"掉一行有多疼"
+ * 分别取值, 不搞一刀切。 */
 static dw_entry_t s_files[DW_FILE_N] = {
+    /* 2s 一行: 一行就是一个时刻的电源快照, 单独看也有意义 → 30s 只攒 15 行,
+     * 但它的量最大, 已经是成本的绝对主项 (估 8458 擦除/天) */
     [DW_POWER_LOG] = {
         .path = "/data/power_log.csv",
         .hdr = POWER_LOG_HDR,
         .max_bytes = 48 * 1024,
         .buf_size = 4096,
+        .flush_ms = 30000,
+        .mode = DW_MODE_APPEND,
+    },
+    /* 60s 一条 S 行, 单行只是聚合值 → 300s 攒 5 条才落一次盘
+     * (2880 → 576 擦除/天)。丢 5 条聚合行不影响趋势判定。
+     * W 行走 urgent 投递, 不受这个周期约束 */
+    [DW_POWER_SEG] = {
+        .path = "/data/power_seg.csv",
+        .hdr = POWER_SEG_HDR,
+        .max_bytes = 192 * 1024,
+        .buf_size = 1024,
+        .flush_ms = 300000,
+        .mode = DW_MODE_APPEND,
+    },
+    /* 90s 一次快照, 30s 周期 = 一批一行 = 不省 — 故意不省: tasks.txt 的
+     * 用处正是"出事那一刻任务卡在哪", 它越新越有用, 拿新鲜度换那点擦除
+     * 不划算。覆盖模式故不滚 */
+    [DW_TASKS] = {
+        .path = "/data/tasks.txt",
+        .hdr = NULL,
+        .max_bytes = 0,
+        .buf_size = 2048,
+        .flush_ms = 30000,
+        .mode = DW_MODE_OVERWRITE,
     },
 };
 
@@ -137,6 +175,16 @@ static void dw_wstat_maybe(const char *hold)
  * 必须带 O_CREAT, 否则截断永不生效 (1.0.283 实崩: 写满 724KB 分区) */
 static bool dw_write_all(const dw_entry_t *e, const char *buf, int len)
 {
+    if (e->mode == DW_MODE_OVERWRITE) {
+        /* 覆盖写。O_TRUNC 必须与 O_CREAT 同用: 裸 O_TRUNC 在 ESP-IDF FAT
+         * VFS 是 no-op (fat_mode_conv 只在 O_CREAT|O_TRUNC 时给
+         * FA_CREATE_ALWAYS) — 见下 */
+        int fd = open(e->path, O_CREAT | O_TRUNC | O_WRONLY);
+        if (fd < 0) return false;
+        ssize_t w = write(fd, buf, (size_t)len);
+        close(fd);
+        return (w == (ssize_t)len);
+    }
     if (e->max_bytes) {
         int fd = open(e->path, O_CREAT | O_APPEND | O_WRONLY);
         if (fd < 0) return false;
@@ -241,35 +289,50 @@ void data_writer_tick(void)
     }
 }
 
-bool data_writer_append(dw_file_t f, const char *buf, int len)
+static bool dw_append_impl(dw_file_t f, const char *buf, int len, bool urgent)
 {
     if (f >= DW_FILE_N || !buf || len <= 0 || !s_ready) return false;
     dw_entry_t *e = &s_files[f];
     if (!e->buf || len > (int)e->buf_size) return false;
 
     if (xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return false;
-    /* 缓冲满 → 丢最老的行: 最接近掉电的数据最要紧 */
-    while ((int)e->len + len > (int)e->buf_size) {
-        char *nl = memchr(e->buf, '\n', e->len);
-        if (!nl) {
-            e->len = 0;
-            break;
+    if (e->mode == DW_MODE_OVERWRITE) {
+        e->len = 0; /* 覆盖模式: 攒批期内多次投递只留最后一次 */
+    } else {
+        /* 缓冲满 → 丢最老的行: 最接近掉电的数据最要紧 */
+        while ((int)e->len + len > (int)e->buf_size) {
+            char *nl = memchr(e->buf, '\n', e->len);
+            if (!nl) {
+                e->len = 0;
+                break;
+            }
+            size_t d = (size_t)(nl - e->buf) + 1;
+            memmove(e->buf, e->buf + d, (size_t)e->len - d);
+            e->len -= (uint16_t)d;
+            s_drop++;
         }
-        size_t d = (size_t)(nl - e->buf) + 1;
-        memmove(e->buf, e->buf + d, (size_t)e->len - d);
-        e->len -= (uint16_t)d;
-        s_drop++;
     }
     memcpy(e->buf + e->len, buf, (size_t)len);
     e->len += (uint16_t)len;
     if (!e->pending) {
         e->pending = true;
-        e->due_ms = dw_now_ms() + DW_FLUSH_INTERVAL_MS;
+        e->due_ms = dw_now_ms() + e->flush_ms;
     }
-    if (e->len >= (int)(e->buf_size / DW_HIGH_WATER_DEN * DW_HIGH_WATER_NUM))
+    if (urgent ||
+        e->len >= (int)(e->buf_size / DW_HIGH_WATER_DEN * DW_HIGH_WATER_NUM))
         e->due_ms = dw_now_ms(); /* 攒满前先吐, 避免丢行 */
     xSemaphoreGive(s_lock);
     return true;
+}
+
+bool data_writer_append(dw_file_t f, const char *buf, int len)
+{
+    return dw_append_impl(f, buf, len, false);
+}
+
+bool data_writer_append_urgent(dw_file_t f, const char *buf, int len)
+{
+    return dw_append_impl(f, buf, len, true);
 }
 
 bool data_writer_append_stream(dw_file_t f, dw_emit_fn emit, void *arg)
@@ -319,9 +382,15 @@ esp_err_t data_writer_init(void)
     s_wstat_ms = dw_now_ms();
     s_ready = true;
     /* 带上闸门/挂载状态 — 插上串口复位一次就能看出 /data 通不通 */
-    ESP_LOGI(TAG, "就绪 (/data 统一写入, 攒批 %d ms, 缓冲 %u B PSRAM) — 闸门%s, /data %s",
-             DW_FLUSH_INTERVAL_MS, (unsigned)stage,
+    ESP_LOGI(TAG, "就绪 (/data 统一写入, 缓冲 %u B PSRAM) — 闸门%s, /data %s",
+             (unsigned)stage,
              s_gate_ok ? "开" : "关",
              sensor_logger_data_mounted() ? "已挂载" : "未挂载");
+    /* 逐文件列出台账 — 哪个文件没注册上, 开机日志直接暴露 */
+    for (int i = 0; i < DW_FILE_N; i++)
+        if (s_files[i].path && s_files[i].buf)
+            ESP_LOGI(TAG, "  %s 攒批 %us%s", s_files[i].path,
+                     (unsigned)(s_files[i].flush_ms / 1000),
+                     s_files[i].mode == DW_MODE_OVERWRITE ? " 覆盖写" : "");
     return ESP_OK;
 }
