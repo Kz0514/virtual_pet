@@ -296,7 +296,19 @@ static int first_selectable(page_id_t p)
     return -1;
 }
 
-/* 数据分区信息: U盘模式中 → "U盘模式中"; 未挂载 → "未挂载"; 挂载态 → 总容量 + 空闲空间。
+/* 卷已判定损坏 (修复失败) 且当前不在 U盘模式 — 值文本与文字颜色两处都用它,
+ * 必须同源, 否则会出现"损坏"印成灰色的半吊子状态。
+ * 为什么不能靠探测数字表达: FAT 表被写坏时 f_getfree 仍返回 FR_OK 且
+ * 报 0 空闲簇 (见 usb_storage.c 的指纹判定), 显示"空闲 0K"会被主人读成
+ * "盘满" — 而它其实是写不进去的损坏态, 处置方式完全不同 */
+static bool storage_vol_broken(void)
+{
+    return !usb_storage_is_active() && usb_storage_data_mounted() &&
+           usb_storage_volume_bad();
+}
+
+/* 数据分区信息: U盘模式中 → "U盘模式中"; 未挂载 → "未挂载"; 卷损坏 → "损坏";
+ * 挂载态 → 总容量 + 空闲空间。
  * 总/空闲均取自 FatFS 卷本身 (fs->n_fatent/csize/ssize + f_getfree), 与
  * Windows 资源管理器一致; 卷容量 = 分区减去 WL 磨损均衡保留区, 小于分区为正常。
  * 探测走 usb_storage 互斥 API — 只探测 WL 注册盘号, 且与 repair 重建互斥 */
@@ -308,6 +320,11 @@ static void storage_info_text(char *buf, size_t len)
     }
     if (!usb_storage_data_mounted()) {
         snprintf(buf, len, "未挂载");
+        return;
+    }
+    /* 卷坏 → 不给数字 (给了会误导成"盘满"), 由暗红字 + 下面"格式化存储"表达 */
+    if (storage_vol_broken()) {
+        snprintf(buf, len, "损坏");
         return;
     }
 
@@ -440,6 +457,9 @@ typedef struct {
     int8_t row_kind; /* -1=未缓存; 0=普通项 1=开关项 */
     bool sw_checked; /* 开关选中态 */
     bool has_arrow;  /* 父项箭头 (LV_SYMBOL_RIGHT) */
+    int8_t val_col;  /* -1=未缓存; 0=灰(常态) 1=白(调值中) 2=暗红(卷损坏) —
+                        必须参与缓存比对: 卷坏状态翻转时值文本一个字都不变
+                        ("总/空闲"→"损坏"之外还有别的组合), 漏比就不重绘 */
     const char *lbl; /* 行标签 (static 字符串, 指针比较) — 必须参与缓存比对;
     漏比则窗口滚动后行内容变化但标签不更新 */
     char val[40];    /* 数值文本 (开关项缓存为 "") ≥ version[32] */
@@ -455,6 +475,7 @@ static void cache_invalidate_all(void)
         s_cache[i].row_kind = -1;
         s_cache[i].sw_checked = false;
         s_cache[i].has_arrow = false;
+        s_cache[i].val_col = -1;
         s_cache[i].lbl = NULL;
         s_cache[i].val[0] = '\0';
     }
@@ -500,12 +521,20 @@ static void refresh(void)
         else
             get_value_text(s_page, idx, vbuf, sizeof(vbuf));
 
+        /* 值文本颜色: 0=灰(常态) 1=白(调值中, 浅蓝底上突出) 2=暗红(卷损坏)。
+         * 卷损坏压过调值态 —— 它是要主人动手处置的状态, 不该被"正在调值"
+         * 冲淡成白色 */
+        int8_t val_col = (s_page == PAGE_STORAGE && idx == 1 && storage_vol_broken())
+                             ? 2
+                             : (adj_here ? 1 : 0);
+
         /* 与缓存比对: 无变化则跳过, 不产生任何失效 */
         row_cache_t *c = &s_cache[i];
         if (c->bg_state == bg_state &&
             c->row_kind == (is_toggle ? 1 : 0) &&
             c->sw_checked == sw_on &&
             c->has_arrow == has_arrow &&
+            c->val_col == val_col &&
             c->lbl == it->label &&
             strcmp(c->val, vbuf) == 0) {
             continue;
@@ -540,9 +569,12 @@ static void refresh(void)
             /* 无箭头的叶子项, 数值贴右缘; 父项给箭头留位 (数值本身为空) */
             lv_obj_align(s_row_val[i], LV_ALIGN_RIGHT_MID,
                          has_arrow ? -28 : -10, 0);
-            /* 调值中的数值用白色 (浅蓝底上突出) */
+            /* 数值颜色: 调值中=白 (浅蓝底上突出) / 卷损坏=暗红 / 常态=灰 */
             lv_obj_set_style_text_color(s_row_val[i],
-                                        adj_here ? lv_color_hex(0xffffff) : lv_color_hex(0x888888), 0);
+                                        (val_col == 2)   ? lv_color_hex(0xCC3333)
+                                        : (val_col == 1) ? lv_color_hex(0xffffff)
+                                                         : lv_color_hex(0x888888),
+                                        0);
         }
 
         /* 应用完毕 → 更新缓存 */
@@ -550,6 +582,7 @@ static void refresh(void)
         c->row_kind = is_toggle ? 1 : 0;
         c->sw_checked = sw_on;
         c->has_arrow = has_arrow;
+        c->val_col = val_col;
         c->lbl = it->label;
         memcpy(c->val, vbuf, sizeof(c->val));
     }
