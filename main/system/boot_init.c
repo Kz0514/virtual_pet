@@ -52,6 +52,7 @@
 #include "tap_detector.h"
 #include "pat_detector.h"
 #include "sensor_logger.h"
+#include "data_writer.h"
 #include "life_log.h"
 #include "memory_store.h"
 #include "diary_mgr.h"
@@ -241,6 +242,7 @@ void boot_init(void)
     /* 存储挂载 (/cfg LittleFS + /data FatFS + 首启搬移) — 必须先于一切文件读写;
      * life_log 依赖 /data 可用性 (sensor_logger_data_mounted) */
     sensor_logger_init();
+    data_writer_init(); /* /data 单写者 — 须先于任何 power_log 写入 */
     life_log_init();
     memory_store_init();
     diary_mgr_init();

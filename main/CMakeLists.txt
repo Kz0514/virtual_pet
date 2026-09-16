@@ -11,6 +11,7 @@ idf_component_register(
         "system/time_manager.c"
         "system/sensor_logger.c"
         "system/memory_store.c"
+        "system/data_writer.c"
         "system/flash_writer_lock.c"
         # Drivers - Display (lvgl_port provided by esp_lvgl_port component)
         "drivers/display/st7789.c"

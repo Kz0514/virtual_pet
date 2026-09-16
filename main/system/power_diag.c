@@ -7,6 +7,9 @@
  * 回看功耗与唤醒。fd 路径零分配, 禁 fopen (SRAM 紧张 abort); 唯一例外:
  * 息屏锁 dump (esp_pm_dump_locks/esp_timer_dump 官方 API 硬依赖 FILE*,
  * 内部堆 <8KB 时跳过)。
+ *
+ * power_log.csv 的写入已移交 data_writer (攒批 + 闸门 + 擦除计数) —
+ * 本文件只负责攒出文本行, open/close 时机与擦除次数不再由这里决定。
  */
 #include "power_diag.h"
 
@@ -19,6 +22,7 @@
 #include "time_manager.h"
 #include "touch_fpc.h"
 #include "sensor_logger.h" /* sensor_logger_data_mounted — FAT 可用性守卫 */
+#include "data_writer.h"   /* power_log.csv 统一写入口 */
 #include "usb_storage.h"   /* usb_storage_get_drive — f_getfree 盘号 */
 #include "ff.h"            /* f_getfree — 满盘防御 */
 
@@ -99,14 +103,9 @@ void power_diag_log_append(const bq27220_data_t *bat, int state)
 {
     if (power_diag_disk_low())
         return;
-    power_diag_roll("/data/power_log.csv", 48 * 1024);
-    int fd = open("/data/power_log.csv", O_CREAT | O_APPEND | O_WRONLY);
-    if (fd < 0)
-        return;
-    if (lseek(fd, 0, SEEK_END) == 0) {
-        static const char hdr[] = "ms,mv,ma,soc,state,sleeps,rejects,winus,nxtalm,dexp,ddel,sof,tsf,prob,evalcnt,ret0,ret1,wincnt,wincore,winrem,winname,err,errcnt,wk,ph,tc,d0,d1,d2,d3,d4,d5,d6,d7,d8,d9,d10,d11\n";
-        write(fd, hdr, sizeof(hdr) - 1);
-    }
+    /* 落盘移交 data_writer: 攒批 30s → open/close 次数降两个量级 (每次
+     * close 都要重写数据扇区 + 目录项扇区 = 2 次 4KB 擦除)。表头与
+     * 48KB 滚动由 data_writer 的文件表统一维护 */
     /* 离线诊断列: 电源/睡眠/触摸三类 — sleeps=轻睡评估次数 (enter_cb),
      * rejects=评估未真睡, winus=最后睡眠窗口 µs, sof/tsf/prob 见下,
      * nxtalm=esp_timer 最早可唤醒 alarm 距现在 µs (巨大=窗口来自 tick 列表),
@@ -149,10 +148,7 @@ void power_diag_log_append(const bq27220_data_t *bat, int state)
                       (int)td[0], (int)td[1], (int)td[2], (int)td[3], (int)td[4], (int)td[5],
                       (int)td[6], (int)td[7], (int)td[8], (int)td[9], (int)td[10], (int)td[11]);
     if (ln > 0)
-        write(fd, line, (size_t)ln);
-    off_t sz = lseek(fd, 0, SEEK_END);
-    close(fd);
-    (void)sz; /* 重开由 power_diag_roll 在写入前无状态检查完成 */
+        data_writer_append(DW_POWER_LOG, line, ln);
 }
 
 /* ── 分段功耗/唤醒统计: /data/power_seg.csv (192KB 环形 ≈46h 全量保留,
@@ -279,33 +275,35 @@ void power_diag_pm_stats_log(void)
 }
 
 /* 息屏每 60s 诊断一次: 轻睡计数 + PM 锁列表 */
+/* FILE* 型诊断 dump — 官方 API 硬依赖 FILE*, 走不了文本投递; 交给
+ * data_writer 的单槽 stream: 回调在写盘任务上下文执行, fp 已按序接在
+ * power_log 攒批之后, 主线不做 flash 写 */
+static void power_diag_emit_dump(FILE *fp, void *arg)
+{
+    (void)arg;
+    int64_t ts = time_manager_is_synced() ? time_manager_get_unix_sec() * 1000LL : 0;
+    fprintf(fp, "# locks @ %lld\n", (long long)ts);
+    esp_pm_dump_locks(fp);
+    /* esp_timer dump — 定位周期 alarm 来源 (任务名直接可见) */
+    fprintf(fp, "# timers @ %lld\n", (long long)ts);
+    esp_timer_dump(fp);
+}
+
 void power_diag_screen_off_diag(void)
 {
     static uint8_t diag_cnt = 0;
-    if (++diag_cnt >= 7) { /* 息屏 15s 一次诊断 (加密锁采样) */
+    if (++diag_cnt >= 45) { /* 息屏 90s 一次诊断 (加密锁采样) */
         diag_cnt = 0;
         power_manager_dump_stats();
         /* 锁/计时器 dump 写进 power_log.csv (# 注释行) —
-         * 拔电期间串口死, 只能靠这里看。fopen 堆守卫:
-         * newlib fopen 分配 FILE+锁, 内部堆耗尽 abort;
-         * 不足 8KB 跳过 (锁列表仍走上面日志) */
+         * 拔电期间串口死, 只能靠这里看。fopen 堆守卫: newlib fopen
+         * 分配 FILE+锁, 内部堆耗尽 abort; 不足 8KB 跳过 (锁列表仍走
+         * 上面日志) */
         if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 8192) {
             ESP_LOGW(TAG, "内部堆不足, 跳过 power_log.csv 锁诊断");
-        } else {
-            FILE *lf = fopen("/data/power_log.csv", "a");
-            if (lf) {
-                fseek(lf, 0, SEEK_END);
-                fprintf(lf, "# locks @ %lld\n",
-                        (long long)(time_manager_is_synced() ? time_manager_get_unix_sec() * 1000LL : 0));
-                esp_pm_dump_locks(lf);
-                /* esp_timer dump — 定位周期 alarm 来源
-                 * (任务名直接可见) */
-                fprintf(lf, "# timers @ %lld\n",
-                        (long long)(time_manager_is_synced() ? time_manager_get_unix_sec() * 1000LL : 0));
-                esp_timer_dump(lf);
-                fclose(lf);
-            }
-        } /* else: 内部堆充足才写 CSV 诊断 */
+        } else if (!data_writer_append_stream(DW_POWER_LOG, power_diag_emit_dump, NULL)) {
+            ESP_LOGW(TAG, "dump 单槽被占, 本次锁/timer 诊断跳过");
+        }
         /* 任务延迟探针 — vTaskList 列每任务状态 + 剩余 delay tick:
          * tick 列表高频到期任务会阻轻睡 (prvGetExpectedIdle
          * Time < 3 → vApplicationSleep 永不调用)。写

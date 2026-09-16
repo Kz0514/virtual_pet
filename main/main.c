@@ -35,6 +35,7 @@
 #include "usb_storage.h"
 #include "sensor_logger.h"
 #include "memory_store.h"
+#include "data_writer.h"
 #include "time_manager.h"
 #include "diary_sync.h"
 #include "noise_detector.h"
@@ -237,11 +238,15 @@ void app_main(void)
                     power_diag_screen_off_diag();
             }
 
-            /* 低电量写盘闸: SOC < 阈值 (BATTERY_CRITICAL_THRESHOLD_PCT) 暂停
-             * flash 写 — 断电中断写是 data 分区损坏的元凶; 读失败保持
-             * fail-open (闸开可写) */
-            memory_store_set_writes_safe(!have_bat ||
-                                         bat.soc_pct >= BATTERY_CRITICAL_THRESHOLD_PCT);
+            /* 低电量写盘闸: SOC 降到阈值及以下 → 暂停 flash 写。统一判据,
+             * 同时驱动 /cfg 各写入点与 /data 单写者 — 低电期间设备反复
+             * 欠压重启, 每次重启都重擦同一批扇区, 闸住这段时间即闸住
+             * 损坏窗口。读失败保持 fail-open (闸开可写) */
+            bool writes_ok = (!have_bat ||
+                              bat.soc_pct > BATTERY_CRITICAL_THRESHOLD_PCT);
+            memory_store_set_writes_safe(writes_ok);
+            data_writer_set_gate(writes_ok);
+            data_writer_tick(); /* 到点的 /data 攒批在此落盘 (每 30s 一次) */
 
             /* Log sensor snapshot */
             if (have_env && have_bat && memory_store_writes_safe()) {
