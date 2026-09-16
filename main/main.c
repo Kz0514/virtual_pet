@@ -233,7 +233,9 @@ void app_main(void)
                  * 30s 宽限后释放锁 → 平时恢复轻睡。读失败不改变状态 */
                 usb_storage_set_charging(bat.soc_pct >= 100 ||
                                          bat.current_ma >= -5);
-                /* 息屏诊断 (轻睡计数 + 锁/timer dump + tasks.txt, 15s 一次) */
+                /* 息屏诊断 (轻睡计数 + 锁/timer dump + tasks.txt)。节拍 90s,
+                 * 由 power_diag 内部计数 — 早期是 14s, 为压擦除量整体放慢,
+                 * 取舍与代价见 power_diag_screen_off_diag 头注释 */
                 if (!power_manager_is_screen_on())
                     power_diag_screen_off_diag();
             }

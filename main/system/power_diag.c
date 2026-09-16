@@ -223,7 +223,21 @@ void power_diag_pm_stats_log(void)
              (unsigned)xDiagSleepErrCnt);
 }
 
-/* 息屏每 90s 诊断一次: 轻睡计数 + PM 锁列表 */
+/* 息屏每 90s 诊断一次: 轻睡计数 + 锁/timer dump + 任务快照
+ *
+ * ⚠️ 这个节拍是**取舍**, 不是随手定的: 早期 (6c136d7) 是 14s (7×2s), c47f97d
+ * 为了压擦除量整体改成 90s (45×2s) —— 代价是**锁/timer dump 的分辨率也从
+ * 14s 掉到 90s**, 属于同一次改动的副作用。2026-09-17 复核过要不要拆开:
+ *
+ *   14s: +20,844 擦除/天 (总账 ~3×)  ← 与本项目"省擦除"主线正面冲突
+ *   30s: +5,760 擦除/天 (总账 ~1.5×)
+ *   90s: 现状, 0 额外
+ *
+ * 之所以这么贵: stream dump 走 data_writer 的 append_stream, 而 dump 请求会
+ * **强制落一次盘** (tick 里 due 含 s_stream.used) ≈2 次擦除/次; 且 dump 自身
+ * 有 4KB 量级, 还推高 bytes/4096 那一项。
+ * 用户 2026-09-17 决定: 保持 90s, 不拆 (线上要看分辨率有串口, 离线场景认了)。 */
+
 /* FILE* 型诊断 dump — 官方 API 硬依赖 FILE*, 走不了文本投递; 交给
  * data_writer 的单槽 stream: 回调在写盘任务上下文执行, fp 已按序接在
  * power_log 攒批之后, 主线不做 flash 写 */
@@ -241,7 +255,7 @@ static void power_diag_emit_dump(FILE *fp, void *arg)
 void power_diag_screen_off_diag(void)
 {
     static uint8_t diag_cnt = 0;
-    if (++diag_cnt >= 45) { /* 息屏 90s 一次诊断 (加密锁采样) */
+    if (++diag_cnt >= 45) { /* 息屏 90s (45×2s 主循环节拍) — 取舍见函数头注释 */
         diag_cnt = 0;
         power_manager_dump_stats();
         /* 锁/计时器 dump 写进 power_log.csv (# 注释行) —
