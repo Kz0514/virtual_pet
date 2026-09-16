@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h> /* mkdir — 上层目录幂等补建 (仅 life/log.txt 需要) */
 
 static const char *TAG = "data_writer";
 
@@ -41,6 +42,7 @@ typedef enum { DW_MODE_APPEND, DW_MODE_OVERWRITE } dw_mode_t;
 
 typedef struct {
     const char *path;
+    const char *dir;    /* 落盘前幂等补建的上层目录 (NULL=根目录下, 不用建) */
     const char *hdr;    /* 空文件时先写 (NULL=无) */
     uint32_t max_bytes; /* 追加超限 → 原地截断重开 (0=不滚) */
     uint16_t buf_size;  /* 攒批缓冲 (PSRAM) */
@@ -92,6 +94,19 @@ static dw_entry_t s_files[DW_FILE_N] = {
         .buf_size = 2048,
         .flush_ms = 30000,
         .mode = DW_MODE_OVERWRITE,
+    },
+    /* 交互事件 (对话/摸头/摇晃/敲击) 稀疏且不可预测 — 30s 周期对擦除几乎
+     * 没降幅 (一批通常就一行), 它的收益是闸门统一。上限 128KB 就地清空
+     * 重来: 原实现是 log.txt → log.old 两档轮转 (峰值 256KB), 换成截断后
+     * 峰值减半, 且不再碰 remove (见 dw_write_all 的孤儿簇注释) */
+    [DW_LIFE_LOG] = {
+        .path = "/data/life/log.txt",
+        .dir = "/data/life",
+        .hdr = NULL,
+        .max_bytes = 128 * 1024,
+        .buf_size = 2048,
+        .flush_ms = 30000,
+        .mode = DW_MODE_APPEND,
     },
 };
 
@@ -195,6 +210,10 @@ static void dw_wstat_maybe(const char *hold)
  * 必须带 O_CREAT, 否则截断永不生效 (1.0.283 实崩: 写满 724KB 分区) */
 static bool dw_write_all(const dw_entry_t *e, const char *buf, int len)
 {
+    /* 上层目录幂等补建 (首启 / 格式化后 / 被主机清过) — 失败不致命:
+     * 目录本就在时 mkdir 返回 EEXIST, 真失败则下面的 open 会报错计数 */
+    if (e->dir) mkdir(e->dir, 0777);
+
     if (e->mode == DW_MODE_OVERWRITE) {
         /* 覆盖写。O_TRUNC 必须与 O_CREAT 同用: 裸 O_TRUNC 在 ESP-IDF FAT
          * VFS 是 no-op (fat_mode_conv 只在 O_CREAT|O_TRUNC 时给

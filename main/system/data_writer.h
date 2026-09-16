@@ -15,10 +15,13 @@
  *
  * 攒批周期**每文件独立** (dw_entry_t.flush_ms), 且必须长于该文件的数据点
  * 间隔, 否则一批恰好一行、擦除次数与直写完全相等 (白攒)。按"掉一行有
- * 多疼"分别取值: power_log 30s / power_seg 300s / tasks.txt 30s。
+ * 多疼"分别取值: power_log 30s / power_seg 300s / tasks.txt 30s /
+ * life/log.txt 30s (事件稀疏, 一批往往就一行 — 它的收益不在擦除,
+ * 在闸门统一与滚动方式)。
  *
  * 不建专用任务: 内部 RAM 仅剩 ~10KB, 再要 4KB 栈 + 4KB 缓冲会压垮
- * power_diag 的 8KB 堆守卫 (锁 dump 会永久停写)。缓冲放 PSRAM (PSRAM
+ * power_diag 的 8KB 堆守卫 (锁 dump 会永久停写)。life_log 原有 4KB 栈
+ * 任务, 并入后已回收 (内部堆多出 4KB, 正是最紧张的那块)。缓冲放 PSRAM (PSRAM
  * 缓冲直接 write 到 /data 已被 diary_sync 的 128KB HTML 走通), 落盘借用
  * 调用方任务 — 主线每 30s 阻塞一次 100-400ms, 远好于现状的每 2s 一次。
  * 单次擦除实测 96.5ms (数据手册 45ms, 差额是"关双核 cache + IPC 停另一核"
@@ -38,6 +41,11 @@ typedef enum {
     DW_POWER_SEG,
     /* /data/tasks.txt — 覆盖写: 每批即整份内容, 非追加 */
     DW_TASKS,
+    /* /data/life/log.txt — 交互记录 (对话/摸头/摇晃/敲击), 追加, 128KB 截断重开。
+     * 原为独立队列+任务 (life_log.c); 并入本模块后 TTS/U盘/低电/卷坏四个
+     * 闸门自动全覆盖, 且滚动由 remove+rename 换成原地截断 (见 data_writer.c
+     * 的 dw_write_all 注释: remove 的链释放更新丢失会攒孤儿簇) */
+    DW_LIFE_LOG,
     DW_FILE_N
 } dw_file_t;
 

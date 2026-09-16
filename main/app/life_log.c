@@ -6,144 +6,73 @@
  * 注意: LLM 上下文**不**从这里取 (仍只读 /cfg/memory.txt) —
  * 这份文件是给主人看的"生命记录"。
  *
- * 实现: 入队-落盘分离 — 调用方 (LVGL 定时器/WS 事件回调等小栈上下文)
- * 只 malloc + 入队, 由专用任务 (4KB 栈) 统一写盘, 天然串行化;
- * TTS 播放期间任务内等待, 日志不丢且音频不被 flash 冻结卡顿。
- * 512KB 滚动: 超限轮转为 log.old, 再超限丢弃 log.old。
+ * 实现: 只是一层格式化 + 投递, 落盘全部交给 data_writer (DW_LIFE_LOG)。
+ * 原实现自建 入队 + 4KB 栈专用任务, 现回收; 换来的是 TTS 播放/U盘模式/
+ * 低电闸门/卷坏 四个条件由 data_writer 一处统一判断 (原先只判了 TTS),
+ * 且滚动从 remove+rename 换成原地截断 —— remove 的 FAT 链释放更新一旦
+ * 丢失就攒孤儿簇 (见 data_writer.c 的 dw_write_all 注释)。
+ *
+ * 语义变化: 时间戳取**调用时刻** (开口/被摸那一刻), 而非原先任务出队
+ * (TTS 播完) 的时刻 —— 事件日志本就该记事件发生的时刻。
+ * 代价: 掉电丢失窗口由"毫秒级"变成所在文件的攒批周期 (30s)。
  */
 #include "life_log.h"
-#include "sensor_logger.h"
+#include "data_writer.h"
 #include "time_manager.h"
-#include "tts_client.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/task.h"
 #include <stdarg.h>
 #include <stdio.h>
-#include <string.h>
-#include <errno.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 static const char *TAG = "life_log";
 
 #define LIFE_DIR "/data/life"
-#define LIFE_FILE "/data/life/log.txt"
-#define LIFE_OLD_FILE "/data/life/log.old"
-/* 128KB 滚动一档 (log.txt + log.old 峰值 256KB) — 1.0.283 预算重定:
- * 全分区 724KB, 原 512KB 单文件占 71% 且与 diary/power 预算叠加超支,
- * 满盘曾致 power_log 停更; 用户数据优先级: diary 128 + life 256 +
- * power 48+192 = 624KB < 724KB 留余量 */
-#define LIFE_MAX_BYTES (128 * 1024)
-#define LIFE_QUEUE_LEN 16
 #define LIFE_LINE_MAX 256
-
-static QueueHandle_t s_q = NULL;
-
-/* 落盘 (专用任务上下文, 4KB 栈) */
-static void append_line(const char *ts, const char *line)
-{
-    if (!sensor_logger_data_mounted()) return;
-
-    /* 目录自愈 (幂等): 首启 / 格式化后 /data/life 不存在 → 重建 */
-    mkdir(LIFE_DIR, 0777);
-
-    /* 512KB 滚动: 超限 → log.old (已存在则丢弃), 再超限丢 log.old */
-    struct stat st;
-    if (stat(LIFE_FILE, &st) == 0 && st.st_size > LIFE_MAX_BYTES) {
-        remove(LIFE_OLD_FILE);
-        rename(LIFE_FILE, LIFE_OLD_FILE);
-    }
-
-    /* 写失败告警 (限频 5s) — 把 open/write 失败暴露出来,
-     * 避免写失败被静默吞掉 */
-    static int64_t s_last_warn_us = 0;
-    int64_t now_us = esp_timer_get_time();
-
-    int fd = open(LIFE_FILE, O_CREAT | O_APPEND | O_WRONLY);
-    if (fd < 0) {
-        if (now_us - s_last_warn_us > 5000000) {
-            ESP_LOGW(TAG, "打开 %s 失败 (errno=%d) — /data 卷异常或写失败",
-                     LIFE_FILE, errno);
-            s_last_warn_us = now_us;
-        }
-        return;
-    }
-    bool wr_err = false;
-    wr_err |= (write(fd, "[", 1) < 0);
-    wr_err |= (write(fd, ts, strlen(ts)) < 0);
-    wr_err |= (write(fd, "] ", 2) < 0);
-    wr_err |= (write(fd, line, strlen(line)) < 0);
-    wr_err |= (write(fd, "\n", 1) < 0);
-    if (wr_err && now_us - s_last_warn_us > 5000000) {
-        ESP_LOGW(TAG, "写入 %s 失败 — FAT 异常或 flash 写错误 (errno=%d)",
-                 LIFE_FILE, errno);
-        s_last_warn_us = now_us;
-    }
-    close(fd);
-}
-
-static void life_log_task(void *arg)
-{
-    (void)arg;
-    char line[LIFE_LINE_MAX];
-    for (;;) {
-        char *msg = NULL;
-        if (xQueueReceive(s_q, &msg, portMAX_DELAY) != pdTRUE || !msg) continue;
-        strncpy(line, msg, LIFE_LINE_MAX - 1);
-        line[LIFE_LINE_MAX - 1] = '\0';
-        free(msg);
-
-        /* TTS 播放期间等待 — flash 写会冻结双核卡音频; 日志可等, 音频不可卡 */
-        while (tts_client_is_playing())
-            vTaskDelay(pdMS_TO_TICKS(100));
-
-        char ts[32];
-        if (time_manager_is_synced()) {
-            time_t t = (time_t)time_manager_get_unix_sec();
-            struct tm tm;
-            localtime_r(&t, &tm);
-            snprintf(ts, sizeof(ts), "%02d-%02d %02d:%02d",
-                     tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
-        } else {
-            snprintf(ts, sizeof(ts), "--:-- --:--"); /* 未校时 */
-        }
-        append_line(ts, line);
-    }
-}
 
 void life_log_line(const char *fmt, ...)
 {
-    if (!s_q || !sensor_logger_data_mounted()) return;
-
+    /* 行缓冲用 PSRAM 而非栈: 调用方是 LVGL 定时器 / WS 事件回调等小栈
+     * 上下文 (内部 RAM 栈), 这里省 256B 比省一次 malloc 值 */
     char *buf = heap_caps_malloc(LIFE_LINE_MAX, MALLOC_CAP_SPIRAM);
     if (!buf) return;
+
+    char ts[32];
+    if (time_manager_is_synced()) {
+        time_t t = (time_t)time_manager_get_unix_sec();
+        struct tm tm;
+        localtime_r(&t, &tm);
+        snprintf(ts, sizeof(ts), "%02d-%02d %02d:%02d",
+                 tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+    } else {
+        snprintf(ts, sizeof(ts), "--:-- --:--"); /* 未校时 */
+    }
+
+    int n = snprintf(buf, LIFE_LINE_MAX, "[%s] ", ts);
+    if (n < 0 || n >= LIFE_LINE_MAX) {
+        free(buf);
+        return;
+    }
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, LIFE_LINE_MAX, fmt, ap);
+    int m = vsnprintf(buf + n, LIFE_LINE_MAX - (size_t)n, fmt, ap);
     va_end(ap);
-    if (xQueueSend(s_q, &buf, 0) != pdTRUE)
-        free(buf); /* 队列满 → 丢最新, 日志可丢 */
+    if (m > 0) n += m;
+    /* vsnprintf 返回的是"本该写多长", 截断时会 > 实际可容 — 必须夹一次,
+     * 否则末尾补 '\n' 越界 */
+    if (n > LIFE_LINE_MAX - 2) n = LIFE_LINE_MAX - 2;
+    buf[n++] = '\n';
+
+    data_writer_append(DW_LIFE_LOG, buf, n);
+    free(buf);
 }
 
 esp_err_t life_log_init(void)
 {
-    s_q = xQueueCreate(LIFE_QUEUE_LEN, sizeof(char *));
-    if (!s_q) return ESP_ERR_NO_MEM;
-    TaskHandle_t th;
-    /* 栈保持内部 RAM — 本任务直接写 /data (flash 写期间 cache 冻结,
-     * PSRAM 栈会 double exception) */
-    if (xTaskCreatePinnedToCore(life_log_task, "life_log", 4096,
-                                NULL, 2, &th, 0) != pdPASS) {
-        vQueueDelete(s_q);
-        s_q = NULL;
-        return ESP_FAIL;
-    }
-    ESP_LOGI(TAG, "就绪 (%s)", LIFE_FILE);
+    /* 目录在落盘时也会幂等补建 (entry 的 dir 字段), 这里先建一次是为了
+     * 首启/U盘模式下 /data/life 就已在位 — 免得主机看见一个空分区 */
+    mkdir(LIFE_DIR, 0777);
+    ESP_LOGI(TAG, "就绪 (%s/log.txt, 经 data_writer 攒批)", LIFE_DIR);
     return ESP_OK;
 }
