@@ -44,6 +44,7 @@
 #include "wear_levelling.h"
 #include "diskio_wl.h"   /* ff_diskio_get_pdrv_wl / register — 盘号动态分配 */
 #include "diskio_impl.h" /* ff_diskio_get_drive / unregister — 重挂修复 */
+#include "diskio.h"      /* disk_read/disk_write/RES_OK — 卷修复直读写扇区 */
 #include "ff.h"          /* f_mount/f_mkfs/f_setlabel/f_chmod — 挂载生命周期 */
 #include "esp_vfs_fat.h" /* esp_vfs_fat_register_cfg — 开机一次性注册 */
 #include "esp_private/usb_phy.h"
@@ -81,6 +82,15 @@ static const char *DATA_MOUNT = "/data";
 
 static tinyusb_msc_storage_handle_t s_handle = NULL;
 static bool s_active = false; /* U盘模式标志 (粘滞: 开关=手动进/退) */
+
+/* 卷修复窗口标志 — 修复期间 /data 处于"解除挂载"态 (f_mount(NULL)),
+ * 被 usb_storage_data_mounted() 透出, 让 life_log/diary 这类写者在
+ * 窗口内自己退避 (同 U盘模式的退避机制, 不新增契约) */
+static volatile bool s_repairing = false;
+
+/* 卷不可用 (修复失败) — 单向置起的"停写"信号, 由 data_writer 的闸门消费。
+ * 只有 usb_storage_volume_repair() 修好 (或本来就好) 才清 */
+static volatile bool s_vol_bad = false;
 
 /* : U盘模式禁轻睡锁 — 轻睡每 ~40ms 冻结 USB OTG 设备栈时钟 →
  * Windows 端枚举失效 "无法识别的设备" + 磁盘消失。锁跟随充电状态:
@@ -283,6 +293,461 @@ static void ensure_volume_label(void)
         ESP_LOGI(TAG, "磁盘卷标已设: %s", USB_VOL_LABEL);
 }
 
+/* ══ 卷损坏识别与修复 (FAT 修复阶梯 第 0 级) ═══════════════════════════
+ *
+ * 指纹: f_getfree 返回 FR_OK 却 **0 空闲簇**。掉电正好落在 FAT 扇区的
+ * "已擦未写"窗口时, FAT12 整表成 0xFF → 每项都是 0xFFF(EOC) → FatFS
+ * 认为"全部已分配", 体检把它读成"盘满", 真实含义是"盘坏了"。
+ * 不能只看 0 空闲 (真满盘也是 0) → 再读 FAT 扇区看 FAT12 头还在不在:
+ * 字节 0..2 = F8 FF FF (媒介字节 + 簇0=FF8、簇1=FFF 的 12bit 打包)。
+ *
+ * ⚠️ 修复**只写 FAT 扇区一个扇区, 绝不碰数据簇** —— 所以不可能毁掉
+ * 文件内容, 最坏是映射猜错。这是整个方案的安全底线。
+ * 反过来说也有硬上限: 目录项只存**起始簇**, 后续簇走向只存在于 FAT 里
+ * (而 FAT 已经没了), 所以:
+ *   - 未碎片化文件 → 完整恢复 (我们的写入多为 last_clst 顺序前推)
+ *   - 顺序前推撞上别人起始簇的文件 → **截断** (读出来短)
+ * 截断 > 静默读错 (读出来是别人的数据); chkdsk 在 FAT 全毁时同样如此。
+ * 他人的**起始簇是事实**(目录项里写着)而延伸簇是猜测 → 事实全占先,
+ * 猜测只允许落在没被事实占的簇上。
+ *
+ * 写入前把 BPB/FAT/根目录备份到 /cfg —— 唯一退路, 备份不成就别修。
+ * 修完重挂重探当硬验收: 探测不过就当没修过, 交回调用方挂起。 */
+
+#define VOL_META_DIR "/cfg/volmeta"
+#define BPB_MEDIA_OFF 21 /* BPB_Media: 卷的媒介描述符 (FAT12/16 识别用) */
+#define DE_ATTR 11
+#define DE_CLST 26
+#define DE_SIZE 28
+#define DE_ATTR_VOL 0x08 /* AM_VOL 是 ff.c 的内部宏, ff.h 不导出 */
+#define FAT12_EOC 0xFFF
+#define VOL_ENT_MAX 256
+#define VOL_DIR_MAX 8          /* 子目录扫描上限 (本项目 life/ + diary/ 两个) */
+#define VOL_DIR_MAX_CLUSTERS 8 /* 子目录链推测上限 (本项目目录 1 簇装得下) */
+
+/* 卸挂载前抄出来的几何 — f_mount(NULL) 会清 fs_type/pdrv, 其余字段不保证 */
+typedef struct {
+    UINT ssz, csize;
+    DWORD ncl;   /* n_fatent: 合法簇号 2 .. ncl-1 */
+    DWORD nroot; /* 根目录项数 (FAT12/16) */
+    LBA_t volbase, fatbase, dirbase, database;
+} vol_geom_t;
+
+typedef struct {
+    DWORD cl;
+    DWORD size;
+    BYTE attr;
+    char dtag[12]; /* 所在目录 ("diary/", 根目录为 "") — 只进日志 */
+    char name[16];
+} vol_ent_t;
+
+/* 一个子目录认领到的簇链 (根目录不占簇, 不进这个表) */
+typedef struct {
+    DWORD start;
+    DWORD chain[VOL_DIR_MAX_CLUSTERS];
+    int nchain;
+    char path[24]; /* "diary/" 这样的前缀 — 只进日志 */
+} vol_dir_t;
+
+static WORD le16(const BYTE *p) { return (WORD)(p[0] | (p[1] << 8)); }
+static DWORD le32(const BYTE *p)
+{
+    return (DWORD)p[0] | ((DWORD)p[1] << 8) | ((DWORD)p[2] << 16) | ((DWORD)p[3] << 24);
+}
+
+/* FAT12 项写入: 第 n 项落在字节 n + n/2, 奇偶项共享中间那个字节 */
+static void fat12_set(BYTE *fat, DWORD n, WORD val)
+{
+    DWORD off = n + (n >> 1);
+    if (n & 1) {
+        fat[off] = (BYTE)((fat[off] & 0x0F) | ((val << 4) & 0xF0));
+        fat[off + 1] = (BYTE)(val >> 4);
+    } else {
+        fat[off] = (BYTE)(val & 0xFF);
+        fat[off + 1] = (BYTE)((fat[off + 1] & 0xF0) | ((val >> 8) & 0x0F));
+    }
+}
+
+static LBA_t vol_cluster_sec(const vol_geom_t *g, DWORD n)
+{
+    return g->database + (LBA_t)(n - 2) * g->csize;
+}
+
+/* 备份 BPB/FAT/根目录到 /cfg (LittleFS) — 建在即将被覆盖的东西之外,
+ * 是重建写坏时唯一的退路。scratch 由调用方给 (整个修复流程共用一块
+ * 扇区缓冲, 内部 RAM 只占 4KB —— 运行期修复时内部堆很紧) */
+static bool vol_backup_meta(const vol_geom_t *g, BYTE pdrv, BYTE *scratch)
+{
+    BYTE *buf = scratch;
+    mkdir(VOL_META_DIR, 0777); /* 幂等; /cfg 已挂载 */
+
+    const DWORD root_secs = (g->nroot * 32 + g->ssz - 1) / g->ssz;
+    const struct {
+        const char *path;
+        LBA_t sec;
+        DWORD n;
+    } jobs[] = {
+        {VOL_META_DIR "/bpb.bin", g->volbase, 1},
+        {VOL_META_DIR "/fat.bin", g->fatbase, 1},
+        {VOL_META_DIR "/root.bin", g->dirbase, root_secs},
+    };
+    bool ok = true;
+    for (size_t j = 0; j < sizeof(jobs) / sizeof(jobs[0]) && ok; j++) {
+        FILE *f = fopen(jobs[j].path, "wb");
+        if (!f) {
+            ESP_LOGE(TAG, "备份 %s 打不开 — 放弃修复", jobs[j].path);
+            ok = false;
+            break;
+        }
+        for (DWORD i = 0; i < jobs[j].n && ok; i++) {
+            if (disk_read(pdrv, buf, jobs[j].sec + i, 1) != RES_OK ||
+                fwrite(buf, 1, g->ssz, f) != g->ssz)
+                ok = false;
+        }
+        fclose(f);
+        if (ok) ESP_LOGI(TAG, "  备份 %s (%u 扇区)", jobs[j].path, (unsigned)jobs[j].n);
+    }
+    return ok;
+}
+
+/* 目录项名字 → 8.3 文本 (FatFS 把短名原样放在项里, LFN 在 0x0F 项, 这里只取短名) */
+static void vol_ent_name(const BYTE *de, char *out, size_t n)
+{
+    char nm[9], ex[4];
+    int a = 0, b = 0;
+    for (int c = 0; c < 8 && de[c] != ' '; c++) nm[a++] = (char)de[c];
+    nm[a] = 0;
+    for (int c = 8; c < 11 && de[c] != ' '; c++) ex[b++] = (char)de[c];
+    ex[b] = 0;
+    if ((de[DE_ATTR] & AM_DIR) || b == 0) snprintf(out, n, "%.8s", nm);
+    else snprintf(out, n, "%.8s.%.3s", nm, ex);
+}
+
+/* 扫一个子目录 (起始簇 start), 边走链边收集:
+ *   - 文件项 → ents[] (起始簇同时记进 fact[])
+ *   - 子目录 → dirs[] (待扫, 由调用方用同一个数组当下标递增的工作队列)
+ *   - 自己的簇链 → out->chain[] (后面要照它写 FAT —— 只标 used 不写链的话,
+ *     目录簇在新 FAT 里是 0 = 空闲, 会被后续分配直接覆盖掉)
+ * 目录链前推: 某簇里出现 0x00 项 = 目录到此为止 (FatFS 删项写 0xE5,
+ * 0x00 = 从未用过); 没出现就是链还长, 顺序前推到下一簇。
+ * 撞上已被认领的簇 / 事实簇 / 越界 → 停, 只认前面一段 (截断, 同文件规则) */
+static void vol_scan_dir(const vol_geom_t *g, BYTE pdrv, BYTE *scratch, DWORD start,
+                         const char *dtag, bool *fact, bool *used, vol_ent_t *ents,
+                         int *nent, int maxent, vol_dir_t *dirs, int *ndir, int maxdir,
+                         vol_dir_t *out)
+{
+    if (out) out->nchain = 0;
+    DWORD n = start;
+    bool end = false;
+    for (int k = 0; k < VOL_DIR_MAX_CLUSTERS && !end; k++) {
+        if (n < 2 || n >= g->ncl) break;
+        if (used[n]) break;              /* 已被认领 (交叉链接) → 不再猜 */
+        if (k > 0 && fact[n]) break;     /* 延伸簇不许抢别的项的起始簇 */
+        used[n] = true;
+        if (out && out->nchain < VOL_DIR_MAX_CLUSTERS) out->chain[out->nchain++] = n;
+        if (disk_read(pdrv, scratch, vol_cluster_sec(g, n), 1) != RES_OK) return;
+        for (UINT i = 0; i < g->ssz / 32; i++) {
+            const BYTE *de = scratch + (size_t)i * 32;
+            BYTE a = de[DE_ATTR];
+            if (de[0] == 0x00) { end = true; break; }
+            /* '.' 开头的项是真目录项里的 "." / ".." — 不滤掉会被当成子目录,
+             * 白吃 VOL_DIR_MAX 槽位 (FatFS 自己也这么滤, ff.c 里 b == '.') */
+            if (de[0] == 0xE5 || de[0] == '.' || a == 0x0F || (a & DE_ATTR_VOL)) continue;
+            DWORD cl = le16(de + DE_CLST);
+            if (a & AM_DIR) {
+                if (*ndir < maxdir) {
+                    vol_dir_t *d = &dirs[(*ndir)++];
+                    char nm[16];
+                    vol_ent_name(de, nm, sizeof(nm));
+                    d->start = cl;
+                    d->nchain = 0;
+                    snprintf(d->path, sizeof(d->path), "%.8s%.11s/", dtag, nm);
+                } else {
+                    ESP_LOGW(TAG, "  子目录数超 %d — 更深的目录不扫了 (其内容簇会被当空闲)",
+                             maxdir);
+                }
+                if (cl >= 2 && cl < g->ncl) fact[cl] = true;
+                continue;
+            }
+            if (*nent >= maxent) { end = true; break; }
+            vol_ent_t *e = &ents[(*nent)++];
+            e->cl = cl; /* FAT12/16 无高字 */
+            e->size = le32(de + DE_SIZE);
+            e->attr = a;
+            snprintf(e->dtag, sizeof(e->dtag), "%.11s", dtag);
+            vol_ent_name(de, e->name, sizeof(e->name));
+            if (cl >= 2 && cl < g->ncl) fact[cl] = true; /* 起始簇是事实 */
+        }
+        if (end) break;
+        n++;
+    }
+}
+
+/* 重建 FAT 表并写回。返回是否**尝试并成功**写出。
+ * scratch 由调用方给 —— 整个流程 (BPB 读 → 根目录扫 → 目录簇推测 → FAT
+ * 构建) 是严格顺序的, 同一块 4KB 轮着用, 内部 RAM 占用恒为一块扇区 */
+static bool vol_rebuild_fat(const vol_geom_t *g, BYTE pdrv, BYTE *scratch)
+{
+    const DWORD clbytes = (DWORD)g->csize * g->ssz;
+    const DWORD root_secs = (g->nroot * 32 + g->ssz - 1) / g->ssz;
+
+    /* FAT12 表可能跨扇区, 本实现只重建首扇区 —— 跨扇区时若只写首扇区,
+     * 后续残留的 0xFF 仍是 EOC, 而重探会因为首扇区有 0 而**假通过**,
+     * 于是报"修好了"却依旧坏。本项目 183 簇 = 275B 装得下一个 4KB,
+     * 一旦不是这个几何就明说放弃, 不猜 */
+    const DWORD fat_bytes = (g->ncl - 1) + ((g->ncl - 1) >> 1) + 2;
+    if ((fat_bytes + g->ssz - 1) / g->ssz != 1) {
+        ESP_LOGE(TAG, "FAT12 表需 %lu 字节 (跨扇区) — 本实现不处理, 不修",
+                 (unsigned long)fat_bytes);
+        return false;
+    }
+
+    vol_ent_t *ents = heap_caps_calloc(VOL_ENT_MAX, sizeof(vol_ent_t), MALLOC_CAP_SPIRAM);
+    bool *fact = heap_caps_calloc(g->ncl, sizeof(bool), MALLOC_CAP_SPIRAM);
+    bool *used = heap_caps_calloc(g->ncl, sizeof(bool), MALLOC_CAP_SPIRAM);
+    vol_dir_t *dirs = heap_caps_calloc(VOL_DIR_MAX, sizeof(vol_dir_t), MALLOC_CAP_SPIRAM);
+    bool ok = false;
+    int nent = 0, nfile = 0, ndir = 0, ndir_ok = 0, ntrunc = 0, nbad = 0;
+
+    if (!ents || !fact || !used || !dirs) {
+        /* 分配失败 ≠ 卷坏 — 不能拿内存不足去判卷坏了 (会平白停写)。
+         * PSRAM 十几 KB, 失败只可能是真枯竭, 下一轮再试 */
+        ESP_LOGW(TAG, "修复所需 PSRAM 分配失败 — 本轮不判, 稍后重试");
+        goto out;
+    }
+
+    /* 1. 媒介描述符只能取自 BPB — 坏 FAT 里那个已经没意义了 */
+    if (disk_read(pdrv, scratch, g->volbase, 1) != RES_OK) goto out;
+    BYTE media = scratch[BPB_MEDIA_OFF];
+    if (media < 0xF0) {
+        ESP_LOGE(TAG, "BPB 媒介字节 0x%02X 不像 FAT — 不猜, 放弃修复", media);
+        goto out;
+    }
+
+    /* 2. 备份 (不成就别修) */
+    if (!vol_backup_meta(g, pdrv, scratch)) goto out;
+
+    /* 3. 扫根目录收集有效项; 0x00 空槽 = 根目录到此为止。
+     * 根目录占固定扇区不占簇 → 不产生链 */
+    {
+        bool end = false;
+        for (DWORD s = 0; s < root_secs && !end; s++) {
+            if (disk_read(pdrv, scratch, g->dirbase + s, 1) != RES_OK) goto out;
+            for (UINT i = 0; i < g->ssz / 32; i++) {
+                const BYTE *de = scratch + (size_t)i * 32;
+                BYTE a = de[DE_ATTR];
+                if (de[0] == 0x00) { end = true; break; }
+                if (de[0] == 0xE5 || de[0] == '.' || a == 0x0F || (a & DE_ATTR_VOL)) continue;
+                if (nent >= VOL_ENT_MAX) { end = true; break; }
+                DWORD cl = le16(de + DE_CLST); /* FAT12/16 无高字 */
+                if (a & AM_DIR) {
+                    if (ndir < VOL_DIR_MAX) {
+                        vol_dir_t *d = &dirs[ndir++];
+                        char nm[16];
+                        vol_ent_name(de, nm, sizeof(nm));
+                        d->start = cl;
+                        d->nchain = 0;
+                        snprintf(d->path, sizeof(d->path), "%.11s/", nm);
+                    } else {
+                        ESP_LOGW(TAG, "  子目录数超 %d — 更深的目录不扫了 "
+                                      "(其内容簇会被当空闲)", VOL_DIR_MAX);
+                    }
+                    if (cl >= 2 && cl < g->ncl) fact[cl] = true;
+                    continue;
+                }
+                vol_ent_t *e = &ents[nent++];
+                e->cl = cl;
+                e->size = le32(de + DE_SIZE);
+                e->attr = a;
+                e->dtag[0] = '\0';
+                vol_ent_name(de, e->name, sizeof(e->name));
+                if (cl >= 2 && cl < g->ncl) fact[cl] = true; /* 起始簇是事实 */
+            }
+        }
+    }
+    if (nent == 0 && ndir == 0) {
+        ESP_LOGE(TAG, "根目录一个有效项都没有 — 目录也坏了, 不猜");
+        goto out;
+    }
+
+    /* 4. 子目录逐个扫 (dirs[] 同时是工作队列: 扫 dirs[i] 时往里追加更深一层)。
+     * 必须先把所有项收齐再排链 —— 延伸簇一律不许抢**任何**项的起始簇,
+     * 而"任何"要等全扫完才知道。取名字多带一级目录, 日志里才分得清哪个文件 */
+    for (int i = 0; i < ndir; i++) {
+        if (dirs[i].start < 2 || dirs[i].start >= g->ncl) continue;
+        vol_scan_dir(g, pdrv, scratch, dirs[i].start, dirs[i].path, fact, used, ents, &nent,
+                     VOL_ENT_MAX, dirs, &ndir, VOL_DIR_MAX, &dirs[i]);
+    }
+
+    /* 5. 建全新 FAT: 簇0 = 媒介|0xF00, 簇1 = EOC, 其余先当空闲。
+     * 目录链推导已结束 → scratch 腾出来当 FAT 缓冲 (同一块扇区轮用) */
+    BYTE *fat = scratch;
+    memset(fat, 0, g->ssz);
+    fat12_set(fat, 0, (WORD)(0xF00 | media));
+    fat12_set(fat, 1, FAT12_EOC);
+
+    /* 5a. 目录链先写 —— 不写的话目录簇在 FAT 里是 0(空闲),
+     * 后续分配会直接盖掉目录项本身 (曾经漏过, 见"只标 used 不写链"的教训) */
+    for (int i = 0; i < ndir; i++) {
+        const vol_dir_t *d = &dirs[i];
+        for (int k = 0; k < d->nchain; k++)
+            fat12_set(fat, d->chain[k],
+                      (k + 1 == d->nchain) ? FAT12_EOC : (WORD)(d->chain[k] + 1));
+        if (d->nchain) ndir_ok++;
+    }
+
+    /* 5b. 文件链 */
+    for (int i = 0; i < nent; i++) {
+        const vol_ent_t *e = &ents[i];
+        if (e->attr & AM_DIR) continue;
+        if (e->cl < 2 || e->cl >= g->ncl) {
+            if (e->size) {
+                ESP_LOGW(TAG, "  %s%s 起始簇 %lu 越界 — 无法恢复", e->dtag, e->name,
+                         (unsigned long)e->cl);
+                nbad++;
+            }
+            continue;
+        }
+        DWORD need = (DWORD)((e->size + clbytes - 1) / clbytes);
+        if (need == 0) need = 1; /* 空文件也认一个簇 (目录项里就写着它) */
+        DWORD got = 1;
+        for (DWORD k = 1; k < need; k++) {
+            DWORD cur = e->cl + k;
+            if (cur >= g->ncl || used[cur] || fact[cur]) break; /* 事实簇不许抢 */
+            used[cur] = true;
+            got++;
+        }
+        for (DWORD k = 0; k < got; k++)
+            fat12_set(fat, e->cl + k, (k + 1 == got) ? FAT12_EOC : (WORD)(e->cl + k + 1));
+        used[e->cl] = true;
+        nfile++;
+        if (got < need) {
+            ESP_LOGW(TAG, "  %s%s 需 %lu 簇只得 %lu — 截断 (原链已随 FAT 丢失, 只能顺序猜)",
+                     e->dtag, e->name, (unsigned long)need, (unsigned long)got);
+            ntrunc++;
+        }
+    }
+
+    /* 6. 回写 FAT 扇区 */
+    if (disk_write(pdrv, fat, g->fatbase, 1) != RES_OK) {
+        ESP_LOGE(TAG, "FAT 扇区回写失败");
+        goto out;
+    }
+    {
+        DWORD free_cl = 0;
+        for (DWORD n = 2; n < g->ncl; n++)
+            if (!used[n]) free_cl++;
+        ESP_LOGI(TAG, "FAT 重建完成: %d 文件 (%d 截断 / %d 不可恢复), %d/%d 子目录已挂链, "
+                      "空闲 %lu 簇",
+                 nfile, ntrunc, nbad, ndir_ok, ndir, (unsigned long)free_cl);
+    }
+    ok = true;
+
+out:
+    heap_caps_free(ents);
+    heap_caps_free(fact);
+    heap_caps_free(used);
+    return ok;
+}
+
+/* 卷健康检查 + 必要时修复。返回修复后是否可用。
+ * 幂等, 可在开机挂载后与运行期写失败累积时调用。
+ * 健康 → 免修直接返回 true; 指纹命中 → 备份 + 重建 + 重挂重探 (硬验收) */
+bool usb_storage_volume_repair(void)
+{
+    /* s_vol_bad 只在**判定明确**时改: 确认健康 → 清; 确认坏且修不好 → 置。
+     * "判不出来"(探测失败 / 内存不够 / 拿不到锁) 一律不动它 —— 内存不足
+     * 平白停写是比漏判更糟的失败模式 (停写后连诊断都没了) */
+    if (!s_fatfs_fs) return false;
+    wl_handle_t wl = sensor_logger_get_wl_handle();
+    if (wl == WL_INVALID_HANDLE) return false;
+    BYTE pdrv = ff_diskio_get_pdrv_wl(wl);
+    if (pdrv == 0xff) return false;
+    char dpath[3] = {(char)('0' + pdrv), ':', 0};
+
+    /* 1. 探: 有空间就是好的 (本项目分区 724KB, 正常余量 500KB+) */
+    DWORD fre = 0;
+    FATFS *fs = NULL;
+    if (f_getfree(dpath, &fre, &fs) != FR_OK || !fs) {
+        ESP_LOGW(TAG, "卷探测失败 (f_getfree) — 无法判定, 本轮不判不修");
+        return false;
+    }
+    if (fre > 0) {
+        s_vol_bad = false;
+        return true;
+    }
+
+    /* 2. 指纹确认: FAT12 头还在 → 真满盘, 不是坏卷 */
+    vol_geom_t g = {
+        .ssz = fs->ssize,
+        .csize = fs->csize,
+        .ncl = fs->n_fatent,
+        .nroot = fs->n_rootdir,
+        .volbase = fs->volbase,
+        .fatbase = fs->fatbase,
+        .dirbase = fs->dirbase,
+        .database = fs->database,
+    };
+    BYTE *scratch = heap_caps_malloc(g.ssz, MALLOC_CAP_INTERNAL);
+    if (!scratch) {
+        ESP_LOGW(TAG, "修复缓冲分配失败 (4KB 内部 RAM) — 本轮不判不修");
+        return false;
+    }
+    bool head_ok = disk_read(pdrv, scratch, g.fatbase, 1) == RES_OK &&
+                   scratch[0] == 0xF8 && scratch[1] == 0xFF && scratch[2] == 0xFF;
+    if (head_ok) {
+        heap_caps_free(scratch);
+        ESP_LOGW(TAG, "0 空闲簇但 FAT12 头完好 — 判为真满盘, 不做修复");
+        s_vol_bad = false;
+        return true;
+    }
+
+    ESP_LOGE(TAG, "卷损坏指纹命中: f_getfree 成功却 0 空闲簇 + FAT12 头丢失 "
+                  "(%u 簇全成 EOC) — 尝试重建 FAT",
+             (unsigned)g.ncl);
+
+    /* 3. 修复窗口: 必须脱离挂载态 —— FatFS 的 win[] 可能持有脏扇区,
+     * 直接 disk_write 会被它回写覆盖。同时把 data_mounted 置否,
+     * 让 life_log/diary 这类写者在窗口内自己退避 */
+    if (!s_fs_mutex ||
+        xSemaphoreTake(s_fs_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        heap_caps_free(scratch);
+        ESP_LOGE(TAG, "拿不到 FS 锁 — 本轮不判不修");
+        return false;
+    }
+    s_repairing = true;
+    f_mount(NULL, dpath, 1); /* 丢窗口, 防脏扇区反盖重建结果 */
+    bool rebuilt = vol_rebuild_fat(&g, pdrv, scratch);
+    FRESULT fr = f_mount(s_fatfs_fs, dpath, 1); /* 重挂: 从磁盘重读 FAT */
+    s_repairing = false;
+    xSemaphoreGive(s_fs_mutex);
+    heap_caps_free(scratch);
+
+    if (!rebuilt || fr != FR_OK) {
+        s_vol_bad = true; /* 指纹已确认 + 修不好 = 明确的坏 */
+        ESP_LOGE(TAG, "卷修复失败 (重建%s, 重挂 %d) — /data 停止写入, "
+                      "原始元数据已留在 %s",
+                 rebuilt ? "成功" : "失败", (int)fr, VOL_META_DIR);
+        return false;
+    }
+
+    /* 4. 硬验收: 重探不过就当没修过 */
+    DWORD fre2 = 0;
+    FATFS *fs2 = NULL;
+    if (f_getfree(dpath, &fre2, &fs2) != FR_OK || !fs2 || fre2 == 0) {
+        s_vol_bad = true;
+        ESP_LOGE(TAG, "修复后重探仍不正常 (空闲 %lu 簇) — /data 停止写入",
+                 (unsigned long)fre2);
+        return false;
+    }
+    ESP_LOGW(TAG, "卷修复完成: 空闲 %lu 簇 — /data 恢复写入 (原始元数据备份在 %s)",
+             (unsigned long)fre2, VOL_META_DIR);
+    s_vol_bad = false;
+    return true;
+}
+
+bool usb_storage_volume_bad(void) { return s_vol_bad; }
+
 /* 把内部 FSLS PHY 从 USB-OTG 切回 USB-Serial-JTAG。
  *
  * 背景: D+/D- 的归属由 RTC 域寄存器 RTCCNTL.usb_conf.sw_usb_phy_sel 决定
@@ -461,7 +926,15 @@ esp_err_t usb_storage_init(void)
         else
             ESP_LOGI(TAG, "重建挂载成功 (盘号 %d)", usb_storage_get_drive());
     }
-    if (data_fs_probe()) {
+    /* 卷损坏识别 + 修复 (第 0 级)。开机是主场景 —— 掉电正好落在 FAT 扇区
+     * 的"已擦未写"窗口 → 下次开机就是这里。健康则免修立即返回。
+     * 必须在开机文件 (README/图标/卷标) 之前: 卷坏了就别再往上戳 */
+    if (!usb_storage_volume_repair())
+        ESP_LOGE(TAG, "/data 卷不可用 — 写入闸门关闭, 直到修复成功或格式化");
+
+    if (usb_storage_volume_bad()) {
+        /* 卷不可用 → 不写任何开机文件 (写也是白写, 还可能覆盖残存数据) */
+    } else if (data_fs_probe()) {
         write_data_readme();
         write_usb_assets();
         ensure_volume_label();
@@ -499,7 +972,7 @@ bool usb_storage_is_active(void) { return s_active; }
 /* : FatFS 挂载生命周期归本模块 — 非 U盘模式即挂载态 (写者闸门) */
 bool usb_storage_data_mounted(void)
 {
-    return s_handle != NULL && !s_active;
+    return s_handle != NULL && !s_active && !s_repairing;
 }
 
 esp_err_t usb_storage_enter(void)

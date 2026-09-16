@@ -42,3 +42,13 @@ int usb_storage_get_drive(void);
 /** 数据分区探测 (总/空闲 KB) — 与 repair 重建互斥 (重建中间态会让 f_getfree
  * 返回 FR_NOT_ENABLED=12 误报"-"); 失败返回 false (卷不可用/重建中) */
 bool usb_storage_probe_data(uint32_t *total_kb, uint32_t *free_kb);
+
+/** 卷健康检查 + 必要时重建 FAT (第 0 级修复), 返回修复后是否可用。
+ * 指纹: f_getfree 返回 FR_OK 却 0 空闲簇 (FAT12 整表被写成 0xFF, 真满盘
+ * 也长这样 → 再验 FAT12 头 F8 FF FF)。修复只写 FAT 扇区, 不碰数据簇;
+ * 顺序前推撞上他人起始簇的文件截断 (读出来短, 而非读出来是别人的数据)。
+ * 写前把 BPB/FAT/根目录备份到 /cfg/volmeta。幂等, 健康时免修立即返回。 */
+bool usb_storage_volume_repair(void);
+
+/** 卷是否已被判定不可用 (修复失败) — data_writer 的停写闸门 */
+bool usb_storage_volume_bad(void);

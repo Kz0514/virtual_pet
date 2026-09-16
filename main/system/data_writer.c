@@ -9,7 +9,8 @@
  * 内部 RAM 占用为零。
  */
 #include "data_writer.h"
-#include "sensor_logger.h" /* sensor_logger_data_mounted — /data 可用性守卫 */
+#include "sensor_logger.h"  /* sensor_logger_data_mounted — /data 可用性守卫 */
+#include "usb_storage.h"    /* 卷健康/修复 — 写失败时触发, 卷坏时停写 */
 #include "tts_client.h"    /* tts_client_is_playing — 避让 flash 写冻结 */
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -98,6 +99,17 @@ static SemaphoreHandle_t s_lock = NULL;
 static char *s_stage = NULL; /* 落盘暂存 (PSRAM), 落盘串行故全局共用一份 */
 static bool s_ready = false;
 static volatile bool s_gate_ok = true; /* fail-open, 与 memory_store_writes_safe 同源 */
+
+/* 连续落盘失败计数 — 卷坏多半发生在**运行中** (掉电就掉在写的中途),
+ * 只靠开机的卷检查会漏掉"跑几天不重启"的板子。用写失败连击当代理信号
+ * 比运行期再调 FS API 判定更直接 (也避免与 VFS 并发) */
+static uint32_t s_fail_streak = 0;
+static int64_t s_vol_retry_ms = 0; /* 上次尝试修复的时刻 (见下方两个间隔) */
+#define DW_FAIL_TRIP 3              /* 连败几次触发一次卷修复尝试 */
+#define DW_VOL_RETRY_MS 60000       /* 未判定时的重试间隔 (只探一次 f_getfree, 便宜) */
+#define DW_VOL_BAD_RETRY_MS 600000  /* 已判定坏后的重试间隔 — 修不好时每轮都要
+                                     * 写 3 个备份 + FAT 扇区, 不能每分钟捶 */
+
 
 /* 跨上下文: dump 单槽 */
 static struct {
@@ -234,9 +246,12 @@ static void dw_flush(dw_file_t f)
         if (ok) {
             s_flush_cnt++;
             s_bytes += n;
+            s_fail_streak = 0;
         } else {
             s_drop++;
-            ESP_LOGW(TAG, "%s 落盘失败 — 本批 %u B 丢弃", e->path, (unsigned)n);
+            s_fail_streak++;
+            ESP_LOGW(TAG, "%s 落盘失败 (连败 %u) — 本批 %u B 丢弃", e->path,
+                     (unsigned)s_fail_streak, (unsigned)n);
         }
     }
 
@@ -272,16 +287,34 @@ static void dw_flush(dw_file_t f)
 void data_writer_tick(void)
 {
     if (!s_ready) return;
+    int64_t now = dw_now_ms();
 
-    /* 挂起原因 — 统计行必须无条件可见 (见 dw_wstat_maybe 注释) */
-    const char *hold = !s_gate_ok                      ? "闸门关"
-                       : !sensor_logger_data_mounted() ? "未挂载"
-                       : tts_client_is_playing()       ? "TTS"
-                                                       : "";
+    /* 运行期卷修复: 连败 3 次 = 卷可能刚坏 → 试一次重建。
+     * 解除挂载会在窗口内停写, 不能频繁触发; TTS 播放中不做 (flash 写
+     * 冻结双核会把音频卡出爆音)。修好了 hold 自然消失, 修不好就挂起;
+     * 挂起后**不放弃**: 只是把重试间隔拉长到 10min (见 DW_VOL_BAD_RETRY_MS)。
+     * 判据必须带 s_vol_bad: 挂起后 tick 在写循环前就 return 了, fail_streak
+     * 再也涨不到 3 —— 只看连败的话这条重试是死的 */
+    bool vol_suspect = (s_fail_streak >= DW_FAIL_TRIP) || usb_storage_volume_bad();
+    if (vol_suspect && !tts_client_is_playing() && sensor_logger_data_mounted() &&
+        now - s_vol_retry_ms > (usb_storage_volume_bad() ? DW_VOL_BAD_RETRY_MS
+                                                        : DW_VOL_RETRY_MS)) {
+        s_vol_retry_ms = now;
+        s_fail_streak = 0;
+        ESP_LOGW(TAG, "连续落盘失败 — 尝试卷修复");
+        usb_storage_volume_repair();
+    }
+
+    /* 挂起原因 — 统计行必须无条件可见 (见 dw_wstat_maybe 注释)。
+     * "卷坏"排最前: 它不是"稍后会好"的等待, 是"写下去会更糟"的止损 */
+    const char *hold = usb_storage_volume_bad()         ? "卷坏"
+                       : !s_gate_ok                     ? "闸门关"
+                       : !sensor_logger_data_mounted()  ? "未挂载"
+                       : tts_client_is_playing()        ? "TTS"
+                                                        : "";
     dw_wstat_maybe(hold);
     if (hold[0]) return;
 
-    int64_t now = dw_now_ms();
     for (int i = 0; i < DW_FILE_N; i++) {
         dw_entry_t *e = &s_files[i];
         if (!e->path || !e->buf) continue;
