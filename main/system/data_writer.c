@@ -69,12 +69,15 @@ static dw_entry_t s_files[DW_FILE_N] = {
     },
     /* 60s 一条 S 行, 单行只是聚合值 → 300s 攒 5 条才落一次盘
      * (2880 → 576 擦除/天)。丢 5 条聚合行不影响趋势判定。
-     * W 行走 urgent 投递, 不受这个周期约束 */
+     * W 行走 urgent 投递, 不受这个周期约束。
+     * 缓冲 2048 而非 1024: 本文件同时承载 5min 一条的 # wstat 行 (~130B),
+     * 而闸门关着时攒批刷不出去、只能靠缓冲留痕 —— 1024 只装得下 ~35 分钟,
+     * 放大后才够回看一次低电挂起 */
     [DW_POWER_SEG] = {
         .path = "/data/power_seg.csv",
         .hdr = POWER_SEG_HDR,
         .max_bytes = 192 * 1024,
-        .buf_size = 1024,
+        .buf_size = 2048,
         .flush_ms = 300000,
         .mode = DW_MODE_APPEND,
     },
@@ -132,7 +135,12 @@ static void dw_note_stall(int64_t t0)
  * data_writer 存在过都看不出来)。
  * hold 只进串口不进 CSV: 闸门关着时攒批刷不出去, 写进 CSV 是恒空死字段;
  * 但挂起期间的 wstat 仍会攒在缓冲里 — 闸门恢复后那一串 up_ms 递增而
- * flush 不变的注释行，正好是"被挂起多久"的事后记录 */
+ * flush 不变的注释行，正好是"被挂起多久"的事后记录。
+ *
+ * ⚠️ 落点是 **power_seg.csv 不是 power_log.csv**: 后者 48KB 滚动只留
+ * ~16 分钟, 而看这行的人要的是"跑一天下来多少擦除" —— 写进 power_log
+ * 等于样本还没读就被自己滚掉了。power_seg 192KB ≈ 46h 才留得住一天。
+ * 因此 power_seg 的缓冲也相应放大 (见文件表的 buf_size 注释) */
 static void dw_wstat_maybe(const char *hold)
 {
     int64_t now = dw_now_ms();
@@ -150,7 +158,7 @@ static void dw_wstat_maybe(const char *hold)
                      (unsigned)s_drop,
                      (unsigned)s_stall_last_us, (unsigned)s_stall_max_us,
                      (unsigned long long)(s_stall_sum_us / 1000));
-    if (n > 0) data_writer_append(DW_POWER_LOG, line, n);
+    if (n > 0) data_writer_append(DW_POWER_SEG, line, n);
     /* 冻结占空比 = 累计冻结 / 运行时长 (万分之几) */
     unsigned duty = now > 0 ? (unsigned)(s_stall_sum_us / 1000 * 10000ULL / (uint64_t)now)
                             : 0;
