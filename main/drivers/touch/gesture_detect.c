@@ -12,7 +12,6 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include <math.h>
 
 /* ── 手势检测状态机 ── */
 typedef enum {
@@ -21,18 +20,14 @@ typedef enum {
     GS_SINGLE_TAP,    /* 单击已确认（等待可能的双击） */
     GS_DOUBLE_TAP,    /* 双击已确认（等待可能的三击） */
     GS_LONG_PRESS,    /* 长按进行中 */
-    GS_SWIPING,       /* 滑动进行中 */
 } gesture_state_t;
 
 typedef struct {
     gesture_state_t state;
     uint32_t press_start_us;       /* 当前按下开始的时间 */
-    uint32_t last_release_us;      /* 上次释放的时间 */
     uint32_t last_tap_us;          /* 最近一次点击释放的时间 */
     int tap_count;                 /* 当前序列中的连续点击次数 */
     bool reboot_fired;             /* 本次长按是否已发强制重启 (按住期只发一次) */
-    float swipe_start_pos;         /* 滑动起始位置 */
-    float swipe_current_pos;       /* 滑动当前位置 */
     /* 状态镜像 (只读, 唯一写入方见注释):
      *  screen_on   = main.c 屏幕状态机的只读镜像 — 唯一写入方 main.c
      *                (唤醒/息屏翻转点), 本驱动与 pat_detector 只读。禁止
@@ -53,7 +48,6 @@ static gesture_ctx_t s_gctx = {
     .event_pending = false,
 };
 
-#define TAP_TIMEOUT_US 300000       /* 点击间隔超时 300ms */
 #define LONG_PRESS_US 3000000       /* 长按阈值 3s */
 #define FORCE_REBOOT_US 10000000    /* 长按 ≥10s 强制重启 (逃生通道:
                                         触摸状态异常时的硬退出, 3s 语音已发
@@ -98,7 +92,7 @@ static struct {
 static gesture_event_cb_t s_event_cb = NULL;
 
 /* 事件出口: 注册了回调则同步调用(在 gesture_process 的运行上下文),
- * 否则进单槽队列由 gesture_poll_event 消费 */
+ * 否则进单槽队列 (未被注册消费时静默丢弃) */
 static void emit_event(gesture_event_t ev)
 {
     if (s_event_cb) {
@@ -216,12 +210,6 @@ void gesture_process(void)
         }
         break;
 
-    case GS_SWIPING:
-        /* 滑动手势通过滑块位置追踪处理 */
-        if (!touch_is_left_pressed()) {
-            s_gctx.state = GS_IDLE;
-        }
-        break;
     }
 
     /* 多次点击状态转换：单击 → 双击 → 三击 */
@@ -347,19 +335,6 @@ void gesture_process(void)
     }
 }
 
-/* ── 轮询手势事件 ── */
-bool gesture_poll_event(gesture_event_t *out_event)
-{
-    if (s_event_cb) return false; /* 回调模式: 事件不再进队列 */
-    if (s_gctx.event_pending) {
-        *out_event = s_gctx.pending_event;
-        s_gctx.event_pending = false;
-        s_gctx.pending_event = GESTURE_NONE;
-        return true;
-    }
-    return false;
-}
-
 void gesture_set_event_handler(gesture_event_cb_t cb)
 {
     s_event_cb = cb;
@@ -373,7 +348,6 @@ void gesture_set_event_handler(gesture_event_cb_t cb)
 /* ── 状态设置器（由屏幕/菜单管理器调用） ── */
 void gesture_set_screen_on(bool on) { s_gctx.screen_on = on; }
 void gesture_set_menu_active(bool a) { s_gctx.menu_active = a; }
-bool gesture_is_menu_active(void) { return s_gctx.menu_active; }
 bool gesture_is_screen_on(void) { return s_gctx.screen_on; }
 
 void gesture_reset_taps(void)
@@ -383,7 +357,6 @@ void gesture_reset_taps(void)
     s_gctx.reboot_fired = false;
     s_gctx.press_start_us = 0;
     s_gctx.last_tap_us = 0;
-    s_gctx.last_release_us = 0;
     s_gctx.event_pending = false;
     s_gctx.pending_event = GESTURE_NONE;
     s_nav.tracking = false;
@@ -392,38 +365,4 @@ void gesture_reset_taps(void)
     s_nav.hold_dir = 0;
     s_swipe.tracking = false;
     s_swipe.emitted = false;
-}
-
-/* ── 基于滑块的数值调节 ── */
-int gesture_read_volume_pct(void)
-{
-    /* 右侧滑块上半部分 = 音量 */
-    float pos = touch_right_position();
-    if (fabsf(pos) < 0.15f) return -1; /* 未被触摸 */
-    /* 映射 0..1 到 0-100，步长 5% */
-    int pct = (int)((pos + 1.0f) / 2.0f * 100.0f);
-    pct = (pct / 5) * 5; /* 量化为 5% 步长 */
-    if (pct > 100) pct = 100;
-    if (pct < 0) pct = 0;
-    return pct;
-}
-
-int gesture_read_brightness_pct(void)
-{
-    /* 右侧滑块 = 亮度, 阈值 0.15 过滤噪声 */
-    float pos = touch_right_position();
-    if (fabsf(pos) < 0.15f) return -1;
-    int pct = (int)((pos + 1.0f) / 2.0f * 100.0f);
-    pct = (pct / 5) * 5;
-    if (pct > 100) pct = 100;
-    if (pct < 0) pct = 0;
-    return pct;
-}
-
-int gesture_read_horizontal_select(void)
-{
-    /* 顶部滑块用于水平选择，返回 -1、0 或 +1 */
-    float pos = touch_top_position();
-    if (fabsf(pos) < 0.2f) return 0;
-    return (pos > 0) ? 1 : -1;
 }

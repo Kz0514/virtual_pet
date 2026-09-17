@@ -35,9 +35,6 @@ typedef enum {
 /** 处理触摸状态，识别手势事件（以约 50Hz 频率调用） */
 void gesture_process(void);
 
-/** 检查并消费一个手势事件（非阻塞） */
-bool gesture_poll_event(gesture_event_t *out_event);
-
 /** 手势事件回调（在 gesture_process 的调用上下文同步触发）。
  *  注册后事件不再进入 poll 队列; 传 NULL 恢复 poll 模式。 */
 typedef void (*gesture_event_cb_t)(gesture_event_t ev);
@@ -48,21 +45,11 @@ void gesture_set_event_handler(gesture_event_cb_t cb);
  *  仅 input_handler 调用 (页面状态唯一写入方)。均为镜像, 见 .c 注释。 */
 void gesture_set_screen_on(bool on);
 void gesture_set_menu_active(bool active);
-bool gesture_is_menu_active(void);
 bool gesture_is_screen_on(void);
 
 /** 重置击键/滑动序列状态(页面切换时调用, 防止跨页拼接双击/三击)。
  *  清空: 左键状态机、tap 计数、滑块导航/滑动子状态机、待发事件。 */
 void gesture_reset_taps(void);
-
-/** 右侧滑块：读取音量 0–100%（步长 5%），未触摸时返回 -1 */
-int gesture_read_volume_pct(void);
-
-/** 右侧滑块：读取亮度 0–100%（步长 5%），未触摸时返回 -1 */
-int gesture_read_brightness_pct(void);
-
-/** 顶部滑块：水平选择 -1（左）、0（无）、+1（右） */
-int gesture_read_horizontal_select(void);
 
 #ifdef __cplusplus
 }
