@@ -259,6 +259,18 @@ static const touch_pad_t s_pads[TOUCH_CH_COUNT] = {
     TOUCH_PAD_NUM13, /* 11: GPIO13 — 右侧 5 */
 };
 
+/* 把命中的通道下标拼成 "CH4 CH7" — 只报个数定位不到 GPIO, 排障时还得回头猜 */
+static void ch_list(char *dst, size_t cap, const int *idx, int n)
+{
+    dst[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        char one[16];
+        snprintf(one, sizeof(one), "%sCH%d", i ? " " : "", idx[i]);
+        if (strlen(dst) + strlen(one) >= cap) break;
+        strcat(dst, one);
+    }
+}
+
 void hw_periph_touch(void)
 {
     ESP_LOGI(TAG, "──── E 段: 12 通道触摸 ────");
@@ -313,13 +325,14 @@ void hw_periph_touch(void)
     it = hw_begin("touch.ch", "触摸 12 通道读数");
     int32_t rmin = ref[0], rmax = ref[0], worst = -1;
     int worst_n = 0, dead = 0, sat = 0, flat = 0;
+    int sat_ch[TOUCH_CH_COUNT], dead_ch[TOUCH_CH_COUNT];
     bool all_same = true;
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
         if (ref[i] < rmin) rmin = ref[i];
         if (ref[i] > rmax) rmax = ref[i];
         if (ref[i] != ref[0]) all_same = false;
-        if (ref[i] < HW_EXP_TOUCH_MIN_RAW) dead++;
-        if (ref[i] > HW_EXP_TOUCH_MAX_RAW) sat++;
+        if (ref[i] < HW_EXP_TOUCH_MIN_RAW) dead_ch[dead++] = i;
+        if (ref[i] > HW_EXP_TOUCH_MAX_RAW) sat_ch[sat++] = i;
         int32_t n = (int32_t)(mx[i] - mn[i]);
         if (n > worst) {
             worst = n;
@@ -334,7 +347,9 @@ void hw_periph_touch(void)
         hw_note(it, "12 通道基线完全相同 → 触摸外设没在扫描 (raw 常值)");
         hw_end(it, HW_ST_FAIL);
     } else if (sat) {
-        hw_note(it, "%d 个通道饱和 (>%d) → 焊盘短到地/进水", sat, HW_EXP_TOUCH_MAX_RAW);
+        char lst[64];
+        ch_list(lst, sizeof(lst), sat_ch, sat);
+        hw_note(it, "%d 个通道饱和 (>%d): %s → 焊盘短到地/进水", sat, HW_EXP_TOUCH_MAX_RAW, lst);
         hw_end(it, HW_ST_FAIL);
     } else if (worst >= 300) {
         /* 抖动 ≥ 按下阈值 (TOP 300/RIGHT 220) = 静置就会自触发 (幻触) */
@@ -345,8 +360,13 @@ void hw_periph_touch(void)
          * → 只 WARN, 不判死。
          * **零抖动不参与判定**: 8 次采样里安静通道完全可能逐位相同 (量化后无噪声),
          * 拿它判 WARN 会让同一条项 PASS↔WARN 反复横跳 —— 只记进值里给人看。 */
-        hw_note(it, "%d 个通道恒 0, 最大抖动 %ld(CH%d) — 需人工看一眼", dead, (long)worst,
-                worst_n);
+        char head[128] = "";
+        if (dead) {
+            char names[64];
+            ch_list(names, sizeof(names), dead_ch, dead);
+            snprintf(head, sizeof(head), "%d 个通道恒 0 (%s), ", dead, names);
+        }
+        hw_note(it, "%s最大抖动 %ld(CH%d) — 需人工看一眼", head, (long)worst, worst_n);
         hw_end(it, HW_ST_WARN);
     } else {
         hw_end(it, HW_ST_PASS);
