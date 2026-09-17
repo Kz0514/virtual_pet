@@ -90,23 +90,67 @@ def app_size():
 # ══════════════════════════════════════════════════════════════════════
 # 串口抓取
 # ══════════════════════════════════════════════════════════════════════
-def capture(port: str, timeout_s: float, reset: bool, log_path: str):
+def _open_serial(port: str):
     import serial
 
     ser = serial.Serial()
     ser.port = port
     ser.baudrate = BAUD
     ser.timeout = 0.2
-    ser.dtr = False
+    ser.dtr = False   # IO0 保持高
     ser.rts = False
     ser.open()
-    if reset:
-        # 硬复位进入正常运行 (照 esptool 的 seq: IO0 高, EN 脉冲)
-        ser.setDTR(False)
-        ser.setRTS(True)
+    return ser
+
+
+def _port_present(port: str) -> bool:
+    import serial.tools.list_ports as lp
+
+    return port in {p.device for p in lp.comports()}
+
+
+def _set_rts(ser, state: bool):
+    """置 RTS, 并补一次 DTR 写操作。
+
+    板子走 USB-Serial/JTAG (usbser.sys): DTR=IO0, RTS=EN。Windows 的 usbser.sys
+    只在伴随 DTR 写操作时才会把 RTS 的新状态真正下发 —— 少了这一步 setRTS 不生效,
+    复位等于没做。(esptool `ResetStrategy._setRTS` 是同一套补偿。)
+    """
+    ser.setRTS(state)
+    ser.setDTR(ser.dtr)
+
+
+def _hard_reset(port: str):
+    """硬复位到正常运行, 返回一个重开后的句柄。
+
+    复位的瞬间 USB 会掉线重枚举, 旧句柄随即变哑 (read 一直返回空, 且不抛异常),
+    看上去就像"板子没输出" —— 所以必须关掉重开, 不能抱着旧句柄读。
+    """
+    ser = _open_serial(port)
+    ser.setDTR(False)     # IO0=HIGH, 别把芯片带进下载模式
+    _set_rts(ser, True)   # EN=LOW
+    time.sleep(0.1)
+    _set_rts(ser, False)  # EN=HIGH
+    ser.close()
+
+    # 先等它掉线 (免得抢开一个马上要消失的句柄), 再等它回来
+    for _ in range(40):
+        if not _port_present(port):
+            break
         time.sleep(0.1)
-        ser.setRTS(False)
-        time.sleep(0.05)
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        if _port_present(port):
+            try:
+                return _open_serial(port)
+            except Exception:
+                pass
+        time.sleep(0.1)
+    raise RuntimeError("复位后串口 %s 没回来" % port)
+
+
+def capture(port: str, timeout_s: float, reset: bool, log_path: str):
+    ser = _hard_reset(port) if reset else _open_serial(port)
 
     lines, payload = [], None
     t0 = time.time()
