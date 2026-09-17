@@ -48,6 +48,8 @@ void app_main(void)
 {
     boot_init();
 
+    bq27220_probe_watch(); /* TEMP: 电量计 RC 积分观测, 验完删 */
+
     /* ════ 主循环 ════ */
     ESP_LOGI(TAG, "启动完成.");
     uint32_t last_tick = 0;

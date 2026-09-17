@@ -46,6 +46,10 @@ void bq27220_debug_scan(void);
  *  失败只告警, 不影响启动。副作用: 退出配置态会重算一次 RC, SOC 会跳。 */
 void bq27220_apply_capacity_cfg(void);
 
+/** TEMP: 只读观测 — 开机 dump 配置区供跨重启比对, 再起一个 20 分钟任务
+ *  采 ΔRC vs ∫I·dt。用于判定 RC 是否随电流积分, 验完即删。 */
+void bq27220_probe_watch(void);
+
 #ifdef __cplusplus
 }
 #endif

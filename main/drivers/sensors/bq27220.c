@@ -483,3 +483,121 @@ void bq27220_apply_capacity_cfg(void)
         ESP_LOGW(TAG, "容量配置: 写后回读失败");
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * 观测探针 (TEMP, 全只读)
+ *
+ * /data/power_log.csv 只记 SOC 不记 RC, 于是两种病灶分不开:
+ *   (a) RC 随电流正常累减, 只是被"满电同步"反复打回 FCC → 改 FCC/DCap 对症
+ *   (b) RC 根本不随电流动 → 库仑计没在积分, 改标尺白搭, 得走重新初始化
+ * 判据 = ΔRC 与 ∫I·dt 对不对得上。故把 RC/FCC/BatteryStatus 与自算的累计
+ * 电荷一起打出来, 每 2s 一行。
+ *
+ * 但插着 USB 只能看到充电侧, RC 又恰好顶在 FCC 上 —— 观测不到"降"。
+ * 故留一发 `OCV_CMD(0x000C)` 的挂点: 它强制按当前电压重算 DOD/RC, 与 POR
+ * 同一条路径、**不写任何配置字节**, 用来把上面两种病灶分开
+ * (默认关, 见 P1_OCV_AT)。
+ *
+ * 采样臂 = 独立任务 (不能在 boot_init 里阻塞: 要观测 20 分钟)。
+ * BS 的位序按 bq27xxx 通用表 (bit0=DSG, bit3=FC), 存疑一律看原始 hex。
+ * ══════════════════════════════════════════════════════════════════════ */
+#define P1_SAMPLES 600          /* 600 × 2s = 20 分钟 */
+/* OCV_CMD 那一发先关掉 — 它会重算 RC, 会盖掉容量写入本身的效果。
+ * 想再发就把值调回 150 (第 150 点 = 开机后 300s)。 */
+#define P1_OCV_AT  99999
+
+static void p1_watch_task(void *arg)
+{
+    (void)arg;
+    int64_t t0 = esp_timer_get_time(), tp = t0;
+    double mah = 0.0;                    /* ∫I·dt, 充电为正 */
+    uint16_t rc0 = 0, first = 1;
+
+    for (int k = 0; k < P1_SAMPLES; k++) {
+        if (k == P1_OCV_AT) {
+            /* 强制按当前电压重算 DOD/RC — 与 POR 同一条路径, 不写任何配置。
+             * 若 SOC 从 100% 掉到 ~82%(3.95V 在芯片自带的 DOD 表上的插值),
+             * 即证 OCV/DOD 通路活着、100% 是被"满电同步"打上去的;
+             * 若纹丝不动, 则是累加器本身不响应。 */
+            uint16_t v0 = 0, s0 = 0, r0 = 0;
+            reg_read(0x08, &v0); reg_read(0x2C, &s0); reg_read(0x10, &r0);
+            esp_err_t e = ctrl_write(0x000C);   /* OCV_CMD */
+            vTaskDelay(pdMS_TO_TICKS(50));
+            uint16_t v1 = 0, s1 = 0, r1 = 0;
+            reg_read(0x08, &v1); reg_read(0x2C, &s1); reg_read(0x10, &r1);
+            ESP_LOGW(TAG, "★ 发出 OCV_CMD(0x000C) = %s", esp_err_to_name(e));
+            ESP_LOGW(TAG, "★ 前: %umV SOC=%u%% RC=%umAh → 后: %umV SOC=%u%% RC=%umAh",
+                     v0, s0, r0, v1, s1, r1);
+        }
+
+        uint16_t v = 0, i = 0, soc = 0, rc = 0, fcc = 0, bs = 0;
+        reg_read(0x08, &v);  reg_read(0x0C, &i);   reg_read(0x2C, &soc);
+        reg_read(0x10, &rc); reg_read(0x12, &fcc); reg_read(0x0A, &bs);
+
+        int64_t tn = esp_timer_get_time();
+        mah += (double)(int16_t)i * (tn - tp) / 1e6 / 3600.0;
+        tp = tn;
+
+        if (first) {
+            first = 0; rc0 = rc; mah = 0.0;
+            ESP_LOGI(TAG, "P1 起点: %umV %dmA SOC=%u%% RC=%umAh FCC=%umAh BS=0x%04X "
+                          "(DSG=%u FC=%u)", v, (int)(int16_t)i, soc, rc, fcc, bs,
+                     bs & 1, (bs >> 3) & 1);
+        } else {
+            ESP_LOGI(TAG, "P1 %4llds %umV %6dmA SOC=%3u%% RC=%umAh dRC=%+5d ∫I=%+6.1fmAh "
+                          "FCC=%umAh BS=0x%04X",
+                     (long long)((tn - t0) / 1000000), v, (int)(int16_t)i, soc, rc,
+                     (int)rc - (int)rc0, mah, fcc, bs);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    ESP_LOGW(TAG, "P1 观测结束 (%d 点) — 任务退出", P1_SAMPLES);
+    vTaskDelete(NULL);
+}
+
+void bq27220_probe_watch(void)
+{
+    if (!s_dev) { ESP_LOGE(TAG, "未初始化, 跳过 P1 观测"); return; }
+
+    ESP_LOGI(TAG, "══════ P1 观测轮 (全只读, 不写任何配置) ══════");
+
+    /* 收尾核对 */
+    uint16_t os = 0;
+    reg_read(0x3A, &os);
+    ESP_LOGI(TAG, "收尾: OpStatus=0x%04X SEC=%d CFGUPDATE=%d",
+             os, sec_level(), (os >> 10) & 1);
+
+    /* 目标帧回读 */
+    {
+        uint8_t b[4];
+        if (dm_read(0x929D, b, sizeof(b)))
+            ESP_LOGI(TAG, "目标帧 0x929D: %02X %02X %02X %02X "
+                          "(FCC=%u, DesignCap=%u)", b[0], b[1], b[2], b[3],
+                     (b[0] << 8) | b[1], (b[2] << 8) | b[3]);
+        else
+            ESP_LOGW(TAG, "目标帧 0x929D 读失败");
+    }
+
+    /* 整片 dump — 跨重启逐字节比对用, 后续写 FCC 的持久性核对要靠它 */
+    ESP_LOGI(TAG, "dump 0x9180..0x92D1 (32B/行)");
+    int rows = 0;
+    for (uint16_t a = 0x9180; a <= 0x92D1; a += 0x20) {
+        uint8_t b[32];
+        memset(b, 0, sizeof(b));
+        uint16_t ec = 0;
+        int r = dm_read_ex(a, b, sizeof(b), &ec);
+        if (r != DM_OK) {
+            ESP_LOGW(TAG, "   %04X: 读失败 (%s, 回显 0x%04X)", a,
+                     r == DM_I2C ? "I2C" : "回显不符", ec);
+            continue;
+        }
+        rows++;
+        char h[3 * 32 + 1];
+        int p = 0;
+        for (int i = 0; i < 32; i++)
+            p += snprintf(h + p, sizeof(h) - p, "%02X ", b[i]);
+        ESP_LOGI(TAG, "   %04X: %s", a, h);
+    }
+    ESP_LOGI(TAG, "dump %d 行 — 启动 P1 观测任务 (每 2s, 共 20 分钟)", rows);
+    xTaskCreate(p1_watch_task, "bq_watch", 4096, NULL, 3, NULL);
+}
+
