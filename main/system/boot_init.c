@@ -261,6 +261,7 @@ void boot_init(void)
     hdc1080_init();
     opt3001_init();
     bq27220_init();
+    bq27220_apply_capacity_cfg(); /* 容量标尺改写 (回读守卫, 失败只告警) */
     mpu6500_init();
     dmp_mpu_init();
     shake_detector_init();

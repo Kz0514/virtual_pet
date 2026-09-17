@@ -41,6 +41,11 @@ uint16_t bq27220_soc_from_mv(uint16_t mv);
 /** 扫描 SBS 寄存器 (0x00-0x3F), 打印所有有效读数到日志 */
 void bq27220_debug_scan(void);
 
+/** 把数据内存里的容量标尺改成实际电芯容量 (FCC + DesignCapacity = 800mAh)。
+ *  回读守卫: 值已对就不写。开机调一次 — 芯片 DM 可能是 RAM 影子 (POR 即丢)。
+ *  失败只告警, 不影响启动。副作用: 退出配置态会重算一次 RC, SOC 会跳。 */
+void bq27220_apply_capacity_cfg(void);
+
 #ifdef __cplusplus
 }
 #endif
