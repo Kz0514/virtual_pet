@@ -91,13 +91,7 @@ void app_main(void)
             }
 
             tap_detector_set_touched(touched);
-            uint32_t wake_pad = 0;
-            if (power_manager_touch_woke(&wake_pad)) {
-                /* v2: 硬件触摸唤醒 (睡眠退出回调置位, 主循环消费) —
-                 * 轻触/快速点击在 50Hz 扫描停止期间也能可靠唤醒 */
-                ESP_LOGI(TAG, "触摸硬件唤醒 (pad %u) — 亮屏", (unsigned)wake_pad);
-                power_manager_note_interaction();
-            } else if (contacted && power_manager_is_screen_on()) {
+            if (contacted && power_manager_is_screen_on()) {
                 /* 息屏期不直判 contacted — 唤醒统一走动态频率探针
                  * (touch_fpc_sleep_probe: 限速基线 + 抖动自适应阈值 +
                  * 2 连击去抖; 拔电后 raw 持续偏移时此处会重复误报) */

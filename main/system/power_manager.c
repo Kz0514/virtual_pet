@@ -110,10 +110,6 @@ uint32_t power_manager_get_sleep_probe(void)
     return s_sleep_probe;
 }
 
-/* 触摸唤醒标志 — 睡眠退出回调置位, 主循环消费 (读后即清)。 */
-static volatile bool s_touch_woke = false;
-static volatile uint32_t s_touch_wake_pad = 0;
-
 /* : 最后唤醒原因码 (esp_sleep_get_wakeup_cause) — CSV wk 列。
  * 当前唤醒路径下预期恒为 ESP_SLEEP_WAKEUP_TIMER (定时器唤醒);
  * 触摸值为粘滞旧值, 0=异常/未定义 */
@@ -130,23 +126,7 @@ static esp_err_t pm_exit_cb(int64_t sleep_time_us, void *arg)
     s_win_wake = (uint32_t)esp_sleep_get_wakeup_cause();
     /* : slept≈0 → 窗口不足或被拒 (esp_light_sleep_start 失败), 未真睡 */
     if (sleep_time_us < 1000LL) s_rejects++;
-    /* 硬件触摸唤醒检测 — 只能在这里读唤醒源。esp_sleep_get_wakeup_cause
-     * 粘滞 (亮屏期锁禁睡后不再覆盖, 一直保持上次触摸值), 主循环直接轮询
-     * 会在息屏后立刻误报一次; 此回调只在真实睡眠退出时执行, 无假唤醒。
-     * 回调在 idle 临界区: 只置标志, 由主循环 1s 轮询消费。 */
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TOUCHPAD) {
-        s_touch_woke = true;
-        s_touch_wake_pad = (uint32_t)esp_sleep_get_touchpad_wakeup_status();
-    }
     return ESP_OK;
-}
-
-bool power_manager_touch_woke(uint32_t *pad)
-{
-    bool w = s_touch_woke;
-    s_touch_woke = false;
-    if (pad) *pad = s_touch_wake_pad;
-    return w;
 }
 
 /* 息屏诊断: 轻睡计数 + 当前 PM 锁列表 (有长持锁 = 轻睡被禁) */
@@ -329,7 +309,6 @@ void power_manager_screen_on(void)
     dmp_mpu_set_off(false); /* DMP 轮询回 50ms — 敲击/摇晃检测恢复全速 */
     es8311_drv_mute(false); /* 先解除 DAC 静音, 输出稳定后再上电 PA — 防上电 POP */
     es8311_drv_pa_set(true); /* : 恢复 PA — 与息屏关断配对 (见 screen_off) */
-    s_touch_woke = false;   /* 残留唤醒标志丢弃 — 本次唤醒已由主循环处理 */
 
     lvgl_port_lock(0);
     pet_avatar_resume();

@@ -79,7 +79,6 @@ extern "C" {
 #define TOUCH_CH_COUNT 12         /* 总通道数 */
 #define TOUCH_TOP_CH_COUNT 5      /* 顶部滑条通道数 */
 #define TOUCH_RIGHT_CH_COUNT 6    /* 右侧滑条通道数 */
-#define TOUCH_SAMPLE_PERIOD_MS 20 /* 采样周期 (50Hz) */
 
 /* ════════════════════════════════════════════════════════════════════════
  * 音频: ES8311 编解码器 + TPA2011D1 功放

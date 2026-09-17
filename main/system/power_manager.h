@@ -39,13 +39,6 @@ uint32_t power_manager_get_rejects(void);
  * - 计数>0 且 sleeps=0 → skip 恒 true (锁未放/periph skip) */
 uint32_t power_manager_get_sleep_probe(void);
 
-/** 硬件触摸唤醒消费 — 轻睡退出回调 (pm_exit_cb) 检测到
- * ESP_SLEEP_WAKEUP_TOUCHPAD 时置位。不能直接在主循环轮询
- * esp_sleep_get_wakeup_cause: 该值粘滞 (亮屏期无睡眠不再覆盖, 保持上次
- * 触摸值), 息屏后立刻轮询会误报。回调只在真实睡眠退出时执行, 无假唤醒。
- * 主循环 1s 轮询调用, 读后即清。pad 输出唤醒通道 (诊断, 可能无效值)。 */
-bool power_manager_touch_woke(uint32_t *pad);
-
 /** : 最后一次睡眠退出的唤醒原因码 (esp_sleep_get_wakeup_cause)。
  * 预期恒为 ESP_SLEEP_WAKEUP_TIMER — 定时器唤醒。CSV wk 列。 */
 uint32_t power_manager_get_wake_cause(void);
