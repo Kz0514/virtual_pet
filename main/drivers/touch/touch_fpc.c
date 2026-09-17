@@ -8,10 +8,10 @@
  *   右侧  (6 通道):  GPIO8-13 (触摸通道 8-13) — 垂直滑块
  *
  * 硬件连续扫描(定时器 FSM 驱动, 每通道 50Hz) + 硬件信号链
- * (benchmark IIR / denoise 带 / smooth IIR / 激活滞回 / 去抖)。
- * 亮屏由软件扫描定时器读 smooth 走判定; 息屏停软件定时器, 由独立探针
- * 任务按 esp_timer 节拍探测。
- * 触摸通道号与 GPIO 号一一对应（通道 2-13）。
+ * (benchmark IIR / denoise 带 / smooth IIR)。**比较与去抖在软件做**
+ * (软件 Schmitt + 连续帧计数, 见 TOUCH_REL_DROP_* / TOUCH_DEBOUNCE_N) —
+ * 硬件 mask 只当诊断对照。息屏停软件定时器, 由独立探针任务按 esp_timer
+ * 节拍探测(见 touch_fpc_sleep_probe)。触摸通道号与 GPIO 号一一对应(2-13)。
  */
 
 #include "board.h"
@@ -37,8 +37,10 @@ static const int s_ch_id[TOUCH_CH_COUNT] = {
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
 };
 
-/* 硬件去抖+滞回后的激活位图 (bit n = 通道 n; 硬件是整张快照, 读它不清零,
- * 所以中断被推迟/合并也不丢边沿)。ISR 里只赋值 — 不打印不阻塞不取 tick。
+/* 硬件去抖+滞回后的激活位图 (bit n = 通道 n)。
+ * ⚠ 自 2b 起**不再参与判定**, 只在 CH0 边沿日志里打 hw= 供对账 (见扫描循环)。
+ * 仍然保留中断注册的理由: 它是"硬件怎么看"的唯一观测口, 留一轮实测对比后
+ * 再决定是否连同回调一起摘掉。ISR 里只赋值 — 不打印不阻塞不取 tick。
  * 回调必须 IRAM_ATTR: 本仓会在 cache 冻结期擦 flash, 届时打到 flash 里的
  * 回调即崩 (与 newlib 锁 abort / PSRAM 栈双异常同一根因族)。 */
 static volatile uint32_t s_active_mask = 0;
@@ -60,22 +62,22 @@ static IRAM_ATTR bool touch_on_inactive(touch_sensor_handle_t sens,
 }
 
 /* 检测状态与判定不变式:
- * - ref  (限速基线): 每帧最多吃 RL, 只追环境漂移不追按压
- * - d_sm (delta 慢均值) + jit (噪声抖动 EMA): 自适应阈值 = jit*6,
- *   噪声大的环境自动抬阈 (幻触免疫), 安静环境回落到 MIN 下限
- *   (轻触恢复灵敏)。DC 偏移不进阈值 — 只被限速基线吸收,
- *   否则近场手常驻信号会抬阈误伤真实触摸
- * - touched 带滞回: 按下 d>thr, 释放 d<thr/2 — 边界不抖 */
+ * - touched 的唯一来源 = 软件 Schmitt (d 跨线 + 连续帧计数), 输入是硬件
+ *   信号链吐出的 smooth 与 benchmark。硬件 mask 只做诊断对照
+ * - bm (硬件 benchmark): 判定基准。smooth − bm 就是判定用的那个量,
+ *   本文件的 d、filtered、对外的 raw/baseline 全部同源于它
+ * - ref/d_sm/jit/thr 链只剩息屏探针一个消费者 (touch_fpc_sleep_probe
+ *   独立复判 d>thr)。亮屏判定不碰这条链 */
 typedef struct {
-    int32_t ref[TOUCH_CH_COUNT];      /* 限速基线 */
-    int32_t d_sm[TOUCH_CH_COUNT];     /* delta 慢均值 (抖动基准) */
-    int32_t jit[TOUCH_CH_COUNT];      /* 噪声抖动 |d-d_sm| EMA (dev 钳 ±60) */
-    int32_t thr[TOUCH_CH_COUNT];      /* 当前判定阈值 (jit*6 与 MIN 取大, 诊断用) */
-    uint32_t raw[TOUCH_CH_COUNT];
+    uint32_t bm[TOUCH_CH_COUNT];      /* 硬件 benchmark 快照 (判定基准) */
+    int32_t ref[TOUCH_CH_COUNT];      /* 限速基线 — 仅供息屏探针 */
+    int32_t d_sm[TOUCH_CH_COUNT];     /* delta 慢均值 (抖动基准) — 仅供息屏探针 */
+    int32_t jit[TOUCH_CH_COUNT];      /* 噪声抖动 |d-d_sm| EMA (dev 钳 ±60) — 仅供息屏探针 */
+    int32_t thr[TOUCH_CH_COUNT];      /* 探针判定阈值 (jit*6 与 MIN 取大) — 仅供息屏探针 */
+    uint32_t raw[TOUCH_CH_COUNT];     /* 硬件 smooth 快照 (对外的 "raw") */
     bool touched[TOUCH_CH_COUNT];
     int filtered[TOUCH_CH_COUNT];
     uint32_t release_until[TOUCH_CH_COUNT]; /* 释放保活截止 (tick) — 滑动断续桥接 */
-    int32_t prev_d[TOUCH_CH_COUNT];       /* 上帧 delta — CH0 起跳斜率判据 */
     float smooth_top_pos;
     float smooth_right_pos;
     float raw_top_pos; /* 未平滑顶部质心 — 滑动检测用(平滑系数会低估位移) */
@@ -85,7 +87,52 @@ static touch_state_t s_ts = {0};
 static TimerHandle_t s_scan_timer = NULL;
 static bool s_calibrated = false; /* 首次校准后开启防手指污染守卫 */
 
-/* ── 检测参数 ── */
+/* 实际写进驱动的硬件阈值 (init 回读确认后缓存) — touch_fpc_get_thr 用 */
+static uint32_t s_thr_hw[TOUCH_CH_COUNT] = {0};
+
+/* 标定观测: 本窗口内各通道 smooth−benchmark 峰值 (见 TUNE_PEAK_PERIOD_MS) */
+static int32_t s_peak[TOUCH_CH_COUNT] = {0};
+static uint32_t s_next_peak = 0; /* 下次打印峰值的时刻 (init 里置初值) */
+
+/* ── 判定: 软件 Schmitt + 连续帧去抖 ──
+ * 输入仍是硬件濾波后的 smooth 与 benchmark (IIR_2 / IIR_16 + denoise 带),
+ * 只是把最后一步"比较 + 去抖"从硬件拿回软件。原因 (2b 实测):
+ * 硬件释放下限约 100ms —— 手指已离开、d 早已低于硬件释放线, 仍不报释放,
+ * 两次点击被合并成一次按压 → 单击被吞成长按、双击退化。
+ *   起按线 = 硬件 active_thresh (按通道给), 与硬件同一把尺;
+ *     单帧尖峰凑不齐连续 N 帧, 误激活仍然防住 (插线瞬态单帧越线不成立)。
+ *   释放线 = 起按线 − 该通道滞回量: 实测真抬起时 d 砸得比"指腹在键上滚动"
+ *     的谷底更低 —— 300 落在两者之间, 既不吞真释放也不把滚动当抬起。
+ * 帧间隔: 软件扫描 20ms, 但**硬件每通道 60ms 才出一个新样本** (逐帧轨迹同值帧数
+ * 中位 = 3, 同一读数被读了三次) —— 所以本计数器实际只隔一个硬件样本就够 N 帧,
+ * 真正的单帧瞬态防线是硬件 debounce_cnt + 阈值, 不是这里。 */
+#define TOUCH_REL_DROP_CH0 100 /* 起按线 400 − 100 = 释放线 300: 下探起按端, 释放端不动 */
+#define TOUCH_REL_DROP_BAR 150 /* 起按线 350 − 150 = 释放线 200 (滑条本轮未动) */
+#define TOUCH_DEBOUNCE_N   2   /* 连续帧数到 N 翻按下, 到 0 翻释放 */
+static uint8_t s_deb[TOUCH_CH_COUNT] = {0};
+
+/* ── 硬件判定阈值 (active_thresh, 单位 counts) ──
+ * 语义 = smooth − benchmark 超过此值即判激活; 释放线 = 阈值 − active_hysteresis。
+ * 20s 峰值窗口实测 (smooth−benchmark, 连未激活的帧也计入) 的相对量级:
+ *   CH0: 正常按压 ≈ 阈值的 4~5 倍 | 快速轻点峰 ≈ 3.6 倍
+ *        空载峰 ≈ 阈值的 1/4 | 插线瞬态单帧 ≈ 3 倍
+ *   CH1: 真实触摸 ≈ 阈值的 1.5 倍 | 空载峰高达阈值的 0.7~0.9 倍
+ * 两道防线分工明确: 阈值挡"幅度不够"的, debounce_cnt 挡"只有一帧"的 ——
+ * 插线瞬态峰值明明高于阈值却未激活, 正是因为它只维持一帧。
+ * 故阈值不必贴着幻触定: CH0 取 400, 滑条取 350 (单值阈值会把整条右侧滑条打死,
+ * 必须按通道给)。
+ * CH0 450→400: 逐帧轨迹里按得轻的那几次峰值对 450 只有 1.7~2.6 倍 ——
+ *   再轻再快就有整个峰摸不到线的风险 (手指能否被采到还取决于硬件 60ms 一巡的
+ *   占空, 阈值下探只能救"采到了但没过线"那一半)。降后空载峰仍有近 3 倍余量。
+ *   滞回量同步 150→100, 释放线**仍是 300, 释放端逐位不变** (见 TOUCH_REL_DROP_CH0)。
+ * ⚠ 让出的唯一窗口: 插线瞬态若升级成"连续 2 个硬件样本都在 400~450"就会立案。
+ *   实测未见 (瞬态仍是单样本), 待观测。
+ * ⚠ 滑条余量偏紧: CH1 空载峰距阈值不足 20% —— 实测若出现滑条自触发,
+ *   第一个要抬的就是这里。 */
+#define TOUCH_THR_CH0 400            /* 左键 (CH0/GPIO2, 最大焊盘, USB 耦合最强) */
+#define TOUCH_THR_BAR 350            /* 顶部 CH1-5 与右侧 CH6-11 */
+
+/* ── 检测参数 (仅供息屏探针: 亮屏判定已切硬件, 见 touch_fpc_sleep_probe) ── */
 #define BASELINE_RL_POS 4            /* 正向限速/帧: 追环境漂移不吞按压 (慢按净余仍可触发) */
 #define BASELINE_RL_NEG 64           /* 负向快追: 释放/回落快速归零, 防快速滑动重按 d
                                          从低处起跳丢判定; 负 d 无触发风险, 追快安全 */
@@ -96,21 +143,6 @@ static bool s_calibrated = false; /* 首次校准后开启防手指污染守卫 
                                         jit 只反映环境噪声, 真实按压尖峰不得抬阈
                                         (无钳制单次按压即把通道阈值抬入数秒死区) */
 #define THR_CLAMP 360                /* 阈值整体封顶: jit 稳态 ≤ JIT_MAX_DEV → thr ≤ 360 */
-#define RELEASE_HYSTERESIS 2         /* 滞回: 释放阈值 = 按下阈值 / 2 (仅滑条) */
-
-/* ── 功能键 (CH0) 特判 ──
- * 大焊盘近场/悬停信号实测可达 300~724 计数, 通用判定 (d>thr + 滞回)
- * 会把它当"按住"锁死整段会话 (基线冻结 → d 永不跌回释放线)。CH0 改用
- * 独立两段式:
- *  - 按下: d≥CH0_PRESS_MIN 且 帧间跃升≥CH0_PRESS_SLEW — 真实按压在几十
- *    ms 内完成, 悬停/温漂是缓慢爬升, 永远凑不齐起跳斜率;
- *  - 保持/释放: 水平线 CH0_RELEASE_MIN — 悬停/park 峰值 ~724 之下即视为
- *    松手, 不再被滞回 (thr/2) 拖死。300~750 区间的"持续轻按"物理上与
- *    悬停不可区分, 判为快速点击 (接收边)。
- * 息屏探针 (d>thr 独立复判) 不受此改动影响。 */
-#define CH0_PRESS_MIN 300            /* 按下最小 delta (同 TOUCH_MIN_TOP) */
-#define CH0_PRESS_SLEW 100           /* 按下起跳斜率/帧 (20ms 帧) */
-#define CH0_RELEASE_MIN 750          /* 保持线: 低于即释放 (悬停/park 之上) */
 #define RELEASE_KEEP_MS 60           /* 释放保活: 刚释放 60ms 内仍计 touched —
                                         桥接滑动腾空间隙/压力波动 (按 tick,
                                         50Hz=3帧 / 20Hz 空闲档同样生效)。
@@ -118,6 +150,11 @@ static bool s_calibrated = false; /* 首次校准后开启防手指污染守卫 
                                         (保活拖长单击 hold → 500ms 轻点边界误判长按) */
 #define ENV_SNAP_CHANNELS 11         /* 环境阶跃: >=11 通道同时越阈 (USB/供电瞬态全 12 通跳,
                                        手掌覆盖 ≤10 通道不误伤) → 基线快照+清判定 */
+/* ── 标定观测 (临时仪表, 定标收敛后随 2c 一起删) ──
+ * 判定切硬件后, 误触发不再产生任何日志 —— 幻触消失的直接表现就是"什么都没发生",
+ * 但同时也看不到"离阈值还差多远"。每 20s 打一窗口内 12 通道 smooth−benchmark
+ * 峰值, 作为调 active_thresh 的唯一仪表 (对着 TOUCH_THR_* 看余量)。 */
+#define TUNE_PEAK_PERIOD_MS 20000
 
 /* ── 动态刷新率 (四级档位) ──
  * 活动判定统一: 任一通道 |d| > 80 (近场/手接近) → 立即最高档。
@@ -153,28 +190,34 @@ static void touch_note_activity(void)
 /** 当前息屏探针间隔 (main.c 据此调循环延迟 — 深闲时睡眠窗口 500ms) */
 uint32_t touch_fpc_probe_interval_ms(void) { return s_probe_interval; }
 
-/** 诊断: 当前各通道判定阈值 (jit*6 与 MIN 下限取大) — 排障抬阈/死区 */
-void touch_fpc_get_thr(int *thr_out) { memcpy(thr_out, s_ts.thr, sizeof(s_ts.thr)); }
+/** 诊断: 各通道真实判定阈值 (硬件 active_thresh, init 回读缓存) — 排障看死区 */
+void touch_fpc_get_thr(int *thr_out)
+{
+    for (int i = 0; i < TOUCH_CH_COUNT; i++)
+        thr_out[i] = (int)s_thr_hw[i];
+}
 
-/* ── 自动校准 ── */
+/* ── 软件基线同步 (息屏探针用) ──
+ * 亮屏判定已切硬件, 这个函数不再参与任何触摸结论 — 它只把硬件 benchmark
+ * 抄进软件 ref, 给 touch_fpc_sleep_probe 的独立复判当起点。
+ * 用 benchmark 而不是 raw: benchmark 带 denoise 带, 手指按住时不被污染 */
 static bool touch_auto_calibrate(void)
 {
-    ESP_LOGI(TAG, "正在自动校准触摸基线…");
-
-    /* 基线 = 硬件 benchmark, 直接向驱动要 — 不必自己采 100 轮 (~500ms 阻塞)。
-     * 硬件 benchmark 由 IIR 持续跟踪环境, 比重启时的软件均值更平滑, 且零阻塞 */
     int32_t bm[TOUCH_CH_COUNT] = {0};
-    uint32_t chk = 0;
+    uint32_t chk = 0, vmax = 0;
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
         uint32_t v = 0;
         if (touch_channel_read_data(s_chan[i], TOUCH_CHAN_DATA_TYPE_BENCHMARK, &v) == ESP_OK)
             bm[i] = (int32_t)v;
         chk += v;
+        if (v > vmax) vmax = v;
     }
-    /* 数学保护: benchmark 全 0 时校准会把 0 当基线 → 之后任意微小读数都
-     * 越阈, 判定全 true — 直接放弃, 保持现有基线 */
-    if (chk == 0) {
-        ESP_LOGW(TAG, "校准前检查: benchmark 全 0 — 放弃校准, 保持现有基线");
+    /* 两种"benchmark 不是数"的情形都要挡住, 否则这个垃圾值会变成探针基线:
+     * - 全 0: 之后任意微小读数都越阈, 判定全 true
+     * - 满量程 (0x3FFFFF, 22 位): 复位后尚未落定, 见 touch_fpc_init 的注释 */
+    if (chk == 0 || vmax == 0x3FFFFFu) {
+        ESP_LOGW(TAG, "基准同步前检查: benchmark 不可用 (全 0 或满量程 %u) — 放弃, 保持现有基线",
+                 (unsigned)vmax);
         return false;
     }
 
@@ -198,7 +241,9 @@ static bool touch_auto_calibrate(void)
         s_ts.jit[i] = 0;
     }
     s_calibrated = true;
-    ESP_LOGI(TAG, "校准完成: CH0=%ld CH1=%ld CH2=%ld CH3=%ld CH4=%ld CH5=%ld "
+    /* 这 12 个数就是判定基准本身 (硬件 benchmark), 各通道之间应大致同量级 —
+     * 某个明显偏低即是"基准没爬到位"/"上面有东西" */
+    ESP_LOGI(TAG, "硬件基准: CH0=%ld CH1=%ld CH2=%ld CH3=%ld CH4=%ld CH5=%ld "
                   "CH6=%ld CH7=%ld CH8=%ld CH9=%ld CH10=%ld CH11=%ld",
              (long)s_ts.ref[0], (long)s_ts.ref[1],
              (long)s_ts.ref[2], (long)s_ts.ref[3],
@@ -253,16 +298,26 @@ static void touch_scan_once(bool sleep_path)
     int32_t act_d = -1;
 
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        /* 数据源 = 硬件 smooth (IIR_2 已滤过), 与 raw 同量纲 (都是 counts,
-         * 同一寄存器 touch_pad_data 换 sel 读)。读失败沿用上帧值 —
+        /* 数据源 = 硬件 smooth 与硬件 benchmark (IIR_2 / IIR_16 已滤过),
+         * 同一寄存器 touch_pad_data 换 sel 读, 同量纲。读失败沿用上帧值 —
          * 填 0 会造出巨大负 delta → 误判释放 */
-        uint32_t sm = 0;
+        uint32_t sm = s_ts.raw[i];
+        uint32_t bm = s_ts.bm[i];
         if (touch_channel_read_data(s_chan[i], TOUCH_CHAN_DATA_TYPE_SMOOTH, &sm) == ESP_OK)
             s_ts.raw[i] = sm;
+        if (touch_channel_read_data(s_chan[i], TOUCH_CHAN_DATA_TYPE_BENCHMARK, &bm) == ESP_OK)
+            s_ts.bm[i] = bm;
 
-        /* ESP32-S3: 触摸时 raw 值上升 (delta = raw - ref > 0) */
-        int32_t d = (int32_t)s_ts.raw[i] - s_ts.ref[i];
-        int32_t d_prev = s_ts.prev_d[i]; /* 上帧 delta — CH0 起跳斜率判据 */
+        /* d = smooth − benchmark — 与硬件判定 (active_thresh) 同量纲同符号,
+         * 所以 filtered/质心/活动判定/对外诊断看到的就是硬件拿来比较的那个量。
+         * ESP32-S3: 触摸时该值上升 */
+        int32_t d = (int32_t)s_ts.raw[i] - (int32_t)s_ts.bm[i];
+        if (!sleep_path && d > s_peak[i])
+            s_peak[i] = d; /* 标定仪表 (TUNE_PEAK_PERIOD_MS) */
+
+        /* 下面 ref/d_sm/jit/thr 这条链只剩息屏探针消费 (亮屏判定已切硬件),
+         * 用的是软件限速基线 — 另算一个 d_sw, 两组基线互不干扰 */
+        int32_t d_sw = (int32_t)s_ts.raw[i] - s_ts.ref[i];
 
         /* 漂移跟踪 (按通道门控): 只有本通道空闲才追, 手指按住左键不会
          * 冻结其他通道基线。限速吸收: 环境 DC 偏移 (近场/供电/温湿度)
@@ -271,19 +326,19 @@ static void touch_scan_once(bool sleep_path)
          * 负向快追 (RL_NEG=64): 手指离开/环境回落快速归零, 负 d 无按压风险 —
          * 快速滑动"释放→重按"间隔短, 追不平则重按 d 从低处起跳丢判定 */
         if (!s_ts.touched[i]) {
-            s_ts.d_sm[i] += (d - s_ts.d_sm[i]) >> 4;        /* d 慢均值 */
-            int32_t dev = d - s_ts.d_sm[i];
+            s_ts.d_sm[i] += (d_sw - s_ts.d_sm[i]) >> 4;        /* d 慢均值 */
+            int32_t dev = d_sw - s_ts.d_sm[i];
             if (dev > JIT_MAX_DEV) dev = JIT_MAX_DEV;
             else if (dev < -JIT_MAX_DEV) dev = -JIT_MAX_DEV; /* 尖峰不得抬阈 */
             s_ts.jit[i] += ((dev < 0 ? -dev : dev) - s_ts.jit[i]) >> 3;
             int32_t rl_pos = (int32_t)BASELINE_RL_POS * (int32_t)rl_k;
             int32_t rl_neg = (int32_t)BASELINE_RL_NEG * (int32_t)rl_k;
-            if (d > rl_pos)
+            if (d_sw > rl_pos)
                 s_ts.ref[i] += rl_pos;
-            else if (d < -rl_neg)
+            else if (d_sw < -rl_neg)
                 s_ts.ref[i] -= rl_neg;
             else
-                s_ts.ref[i] += d;
+                s_ts.ref[i] += d_sw;
             if (s_ts.ref[i] < 0)
                 s_ts.ref[i] = 0; /* 安全: raw 不可能为负 */
         }
@@ -299,25 +354,36 @@ static void touch_scan_once(bool sleep_path)
         s_ts.thr[i] = thr;
 
         bool was = s_ts.touched[i];
-        bool active;
-        if (i == 0) {
-            /* 功能键特判 (见 CH0_* 常量注释): 按下须快速起跳, 悬停/漂移
-             * 慢爬不凑齐; 保持须在悬停层顶线上方, 低于即松免死锁 */
-            if (was)
-                active = (d >= CH0_RELEASE_MIN);
-            else
-                active = (d >= CH0_PRESS_MIN) && (d - d_prev >= CH0_PRESS_SLEW);
+        /* 判定 = 软件 Schmitt + 连续帧去抖 (见 TOUCH_REL_DROP_* / TOUCH_DEBOUNCE_N)。
+         * 计数器到 N 才翻按下, 掉到 0 才翻释放 —— 单帧摆动两个方向都过不去。
+         * 按下态用释放线, 释放态用起按线, 中间那条带 (CH0 100 / 滑条 150) 是滞回。
+         * 硬件 mask 只用于诊断对照: 它与软件判定的分歧本身就是要观测的东西 */
+        bool hw = (s_active_mask & (1u << s_ch_id[i])) != 0;
+        bool active = false;
+        if (sleep_path) {
+            /* 息屏期不落盘判定 (唤醒由探针独立复判), 且**必须把计数器归零**:
+             * 否则 2~4s 一波的供电瞬态足以把某通道顶到 N, 唤醒首帧 was=false
+             * 而 s_deb>=N → 凭空一枚按下。归零的代价只是唤醒后头 40ms 不响应 */
+            s_deb[i] = 0;
         } else {
-            active = (d > thr) || (was && d > thr / RELEASE_HYSTERESIS); /* 滞回释放 */
+            int32_t rel = (i == 0) ? TOUCH_REL_DROP_CH0 : TOUCH_REL_DROP_BAR;
+            int32_t line = was ? (int32_t)s_thr_hw[i] - rel : (int32_t)s_thr_hw[i];
+            if (d > line) {
+                if (s_deb[i] < TOUCH_DEBOUNCE_N)
+                    s_deb[i]++;
+            } else if (s_deb[i] > 0) {
+                s_deb[i]--;
+            }
+            active = was ? (s_deb[i] > 0) : (s_deb[i] >= TOUCH_DEBOUNCE_N);
         }
-        if (sleep_path)
-            active = false; /* 息屏期不落盘判定 — 基线恒追速 (见函数头注释) */
 
-        /* 功能键状态翻转诊断: raw/ref/d/阈值留证 (息屏探针不落盘, 不打印) */
+        /* 功能键状态翻转诊断: 附 smooth/benchmark 对账, hw= 是硬件 mask 的同拍值
+         * (息屏探针不落盘, 不打印) */
         if (i == 0 && !sleep_path && (active != was))
-            ESP_LOGI(TAG, "CH0 %s: d=%ld raw=%lu ref=%ld thr=%ld",
+            ESP_LOGI(TAG, "CH0 %s: d=%ld sm=%lu bm=%ld thr=%u hw=%d",
                      active ? "按下" : "释放", (long)d,
-                     (unsigned long)s_ts.raw[i], (long)s_ts.ref[i], (long)thr);
+                     (unsigned long)s_ts.raw[i], (long)s_ts.bm[i],
+                     (unsigned)s_thr_hw[0], (int)hw);
 
         if (active) {
             s_ts.touched[i] = true;
@@ -350,7 +416,6 @@ static void touch_scan_once(bool sleep_path)
                 act_ch = (int8_t)i;
             }
         }
-        s_ts.prev_d[i] = d; /* 帧末记录 — CH0 起跳斜率 (保活 continue 帧跳过, 滑条无碍) */
     }
     if (sleep_path) {
         if (act_ch >= 0 && act_ch == s_act_ch) {
@@ -364,15 +429,16 @@ static void touch_scan_once(bool sleep_path)
     }
 
     /* 环境阶跃快照: >=11 通道同时越阈 = USB 拔插/供电瞬态 (全 12 通跳,
-     * 持续 1-2s), 非触摸 — 基线快照到 raw, 清判定, 短免疫窗。
-     * 手掌覆盖 ≤10 通道不误伤 */
+     * 持续 1-2s), 非触摸 — 软件基线快照到 raw, 短免疫窗。
+     * 手掌覆盖 ≤10 通道不误伤。
+     * 注意: 判定已切硬件, 这里清 touched 只是让质心当帧归零 (下一帧由硬件位图
+     * 重新给出), 真正的幻触防线是 CH0 的 active_thresh 与 debounce_cnt */
     if (n_dev >= ENV_SNAP_CHANNELS) {
         for (int i = 0; i < TOUCH_CH_COUNT; i++) {
             s_ts.ref[i] = (int32_t)s_ts.raw[i];
             s_ts.touched[i] = false;
             s_ts.d_sm[i] = 0;
             s_ts.jit[i] = 0;
-            s_ts.prev_d[i] = 0; /* 快照后 delta 归零 — 起跳斜率须从零起算 */
         }
         s_immune_until = now + pdMS_TO_TICKS(2000);
         touch_note_activity();
@@ -558,6 +624,21 @@ static void touch_scan_timer_cb(TimerHandle_t timer)
 {
     touch_scan_once(false); /* 亮屏路径: 追速 200/s, 保慢滑余量 */
 
+    /* 标定仪表 (TUNE_PEAK_PERIOD_MS): 本窗口 12 通道 smooth−benchmark 峰值。
+     * 对着 TOUCH_THR_* 看余量 — 峰值应稳定低于阈值; 若某个通道常态贴着阈值,
+     * 说明它离误触发只差一次扰动, 该抬阈 (或该查那块焊盘) */
+    {
+        uint32_t now_t = xTaskGetTickCount();
+        if ((int32_t)(now_t - s_next_peak) >= 0) {
+            s_next_peak = now_t + pdMS_TO_TICKS(TUNE_PEAK_PERIOD_MS);
+            ESP_LOGI(TAG, "峰值: %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
+                     (long)s_peak[0], (long)s_peak[1], (long)s_peak[2], (long)s_peak[3],
+                     (long)s_peak[4], (long)s_peak[5], (long)s_peak[6], (long)s_peak[7],
+                     (long)s_peak[8], (long)s_peak[9], (long)s_peak[10], (long)s_peak[11]);
+            memset(s_peak, 0, sizeof(s_peak));
+        }
+    }
+
     uint32_t idle_ms = (xTaskGetTickCount() - s_last_activity) * portTICK_PERIOD_MS;
     TickType_t want = pdMS_TO_TICKS((idle_ms < SCAN_ON_IDLE_AFTER_MS)
                                         ? SCAN_ON_ACTIVE_MS
@@ -585,27 +666,38 @@ esp_err_t touch_fpc_init(void)
         TOUCH_SENSOR_V2_DEFAULT_SAMPLE_CONFIG(500, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V7)
     };
     touch_sensor_config_t sens_cfg = TOUCH_SENSOR_DEFAULT_BASIC_CONFIG(1, s_sample_cfg);
-    sens_cfg.meas_interval_us = 1667; /* 12 通道 ≈ 20ms/轮 = 每通道 50Hz (对上亮屏活动档) */
+    /* meas_interval_us 只是**下限**: 12 通道 × 1.667ms = 20ms/轮。实测硬件每通道
+     * 60ms 才出一个新样本 (逐帧轨迹同值帧数中位 = 3, 而软件扫描 20ms) —— 即每通道
+     * 测量本身要约 5ms, 远大于 1.667ms, 间隔被测量时间吃掉, 实际轮期 ≈ 60ms */
+    sens_cfg.meas_interval_us = 1667;
     ESP_ERROR_CHECK(touch_sensor_new_controller(&sens_cfg, &s_sens));
 
     /* 12 个通道: 通道号 = GPIO 号 (S3), 见 s_ch_id。
-     * active_thresh 是"相对 benchmark 的 counts 阈值"; 本步判定仍走软件, 硬件
-     * 激活位图只观测不消费 — 取 2000 落在近场手 (100~190) 与按压峰 (2800~5000)
-     * 之间, 既不误报也低不到引发中断风暴, 正好用来对照验证硬件链 */
+     * active_thresh 就是判定阈值 (见 TOUCH_THR_* 的分档依据), 按通道给 —
+     * 右侧滑条按压幅度只有 CH0 的一半, 单一阈值会把整条右侧滑条打死 */
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
         touch_channel_config_t ch_cfg = {
-            .active_thresh = {2000},
+            .active_thresh = { (i == 0) ? TOUCH_THR_CH0 : TOUCH_THR_BAR },
             .charge_speed = TOUCH_CHARGE_SPEED_7,
             .init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT,
         };
         ESP_ERROR_CHECK(touch_sensor_new_channel(s_sens, s_ch_id[i], &ch_cfg, &s_chan[i]));
     }
 
-    /* 硬件信号链: benchmark IIR + denoise 带 + smooth IIR + 激活滞回 + 去抖。
-     * debounce_cnt 语义就是"连续越阈 n 次才翻转状态" — 正是 CH0 幻触的正解
-     * (旧代码用两段式特判当它的劣质替代品, 结果特判本身成了幻触发生器) */
+    /* 硬件信号链: benchmark IIR + denoise 带 + smooth 滤波 + 激活滞回 + 去抖。
+     * 硬件自身的比较结果 (mask) 已不参与判定, 只留作诊断对照 (见扫描循环 hw=)。
+     * debounce_cnt 保持驱动默认 2: 实测它同时卡住释放 (手指离开 60ms 仍不报),
+     * 所以释放改由软件判 (TOUCH_REL_DROP_*)。
+     * smooth_filter 关掉 (驱动默认 IIR_2: smooth = 1/2·raw + 1/2·上次):
+     * 逐帧实测它就是"快速双击被判成一次长按"的直接原因 —— 手指抬起时 raw 一步
+     * 回到空载, 但 IIR 只能减半, 于是两次点击之间的谷底被抬到与"按住不动时的
+     * d"同一区间 —— **谷底与按住两个区间重叠**, 任何绝对
+     * 释放线都分不开它们。关掉后谷底直接回空载。
+     * ⚠ 代价: 读数不再被平均, 空载峰升到阈值的 ~1/4 (CH0) 与 0.7~0.9 倍 (CH1)
+     *   —— 滑条那侧余量本来就在临界线上 */
     touch_sensor_filter_config_t filt_cfg = TOUCH_SENSOR_DEFAULT_FILTER_CONFIG();
     filt_cfg.benchmark.filter_mode = TOUCH_BM_IIR_FILTER_16; /* 基线慢跟, 不被按压带走 */
+    filt_cfg.data.smooth_filter = TOUCH_SMOOTH_NO_FILTER;
     ESP_ERROR_CHECK(touch_sensor_config_filter(s_sens, &filt_cfg));
 
     /* 回调只能在未使能时注册 */
@@ -619,9 +711,38 @@ esp_err_t touch_fpc_init(void)
     /* 前两次测量无效 (充电注入未稳), 与官方示例同样丢弃 3 次 */
     for (int k = 0; k < 3; k++)
         ESP_ERROR_CHECK(touch_sensor_trigger_oneshot_scanning(s_sens, 200));
+
+    /* 基准复位 —— 这一步是「开机后某通道整段会话被锁成按住」的正解。
+     * benchmark 由 IIR 从初值爬升, 三次 oneshot 保证的只是充电注入稳, 不是
+     * benchmark 收敛: 同板多次开机里 benchmark 收敛并不一致, 有时停在远低于
+     * raw 的值上 → smooth−benchmark 恒越阈 →
+     * 该通道从开机起就被判成按住, 顶部滑条整条失效 (旧代码里表现为 ref 冻结的
+     * 单向门)。do_reset 把 benchmark 直接置为当前测量值, 让每次开机的初值确定,
+     * 不再是掷骰子。必须在 oneshot 预热之后(读数才有意义)、连续扫描之前。 */
+    for (int i = 0; i < TOUCH_CH_COUNT; i++)
+        ESP_ERROR_CHECK(touch_channel_config_benchmark(
+            s_chan[i], &(touch_chan_benchmark_config_t){ .do_reset = true }));
+
     ESP_ERROR_CHECK(touch_sensor_start_continuous_scanning(s_sens));
 
-    /* 自动校准基线 (读硬件 benchmark, 不再自己采 100 轮) */
+    /* 必须在连续扫描跑起来之后再等一轮才回读 benchmark: do_reset 写的是
+     * touch_channel_clr, benchmark 要等下一次测量才被装成 raw —— 复位后立刻读
+     * 拿到的是 0x3FFFFF (22 位满量程)。实测踩过: 这个垃圾值被抄进软件 ref,
+     * 息屏探针 d_sw 恒为巨额负数 → 整条唤醒链失效。
+     * 12 通道 × 1667us ≈ 20ms 一轮, 100ms 留 5 倍余量 */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* 回读确认阈值真的写进了驱动并缓存给 touch_fpc_get_thr — 运行期不再取
+     * 驱动互斥锁 (get_channel_info 会拿 base->mutex) */
+    for (int i = 0; i < TOUCH_CH_COUNT; i++) {
+        touch_chan_info_t info = {0};
+        if (touch_sensor_get_channel_info(s_chan[i], &info) == ESP_OK)
+            s_thr_hw[i] = info.active_thresh[0];
+    }
+    ESP_LOGI(TAG, "硬件阈值: CH0=%u CH1..11=%u (回读自驱动)",
+             (unsigned)s_thr_hw[0], (unsigned)s_thr_hw[1]);
+
+    /* 同步软件基线 (息屏探针用) + 打印基准 (CH1 那类"基准没爬到位"全靠这行看) */
     touch_auto_calibrate();
 
     /* 创建周期性扫描定时器（亮屏活动 50 Hz, 动态档由回调内切换） */
@@ -636,6 +757,7 @@ esp_err_t touch_fpc_init(void)
         return ESP_ERR_NO_MEM;
     }
     s_last_activity = xTaskGetTickCount(); /* 启动即活动态 (50Hz 起步) */
+    s_next_peak = s_last_activity + pdMS_TO_TICKS(TUNE_PEAK_PERIOD_MS); /* 首窗完整 */
     xTimerStart(s_scan_timer, 0);
 
     /* 独立探针任务 + esp_timer 节拍 (息屏期 20Hz/2Hz, 亮屏期阻塞零开销) */
@@ -676,11 +798,12 @@ void touch_fpc_pause(void)
 
 void touch_fpc_resume(void)
 {
-    /* 亮屏唤醒 = 刷新基线基准: 睡眠期供电/耦合漂移会让软件判定
-     * (smooth vs ref) 失真 — 重校准后首轮扫描即新基线, 判定恢复。
-     * 先停扫描定时器 (防并发读写基线), 校准完再恢复。
-     * 校准源是硬件 benchmark (自身带 denoise 带冻结, 手指按住不会污染
-     * 基线), 起步仍保留原始基准的全 0 保护与手指污染守卫。 */
+    /* 亮屏判定是硬件的, 硬件 benchmark 自己跟环境漂移 → 这里不需要重置基准。
+     * 反而不能重置: 用户多半正是"按着设备"把它唤醒的, do_reset 会把 benchmark
+     * 钉在带手指的读数上, 松手后 smooth−benchmark 恒负 → 该通道装死, 且要等
+     * IIR_16 慢慢爬回来。
+     * 这里只把硬件 benchmark 抄给软件 ref (息屏探针的起点), 带手指污染守卫。
+     * 先停扫描定时器防并发读写。 */
     if (s_scan_timer) xTimerStop(s_scan_timer, 0);
     s_probe_hits = 0;
     s_wake_pending = false;
@@ -719,8 +842,9 @@ bool touch_is_right_pressed(void)
 void touch_get_raw(uint32_t *out) { memcpy(out, s_ts.raw, sizeof(s_ts.raw)); }
 void touch_get_baseline(uint32_t *out)
 {
-    /* 基线 = ref (限速基线, 恒非负 — 见 touch_scan_once 钳位) */
+    /* 基线 = 硬件 benchmark。与 touch_get_raw 的 smooth 同源, 相减就是判定
+     * 用的那个量 → power_log.csv 的 d 列与硬件 active_thresh 可直接对照 */
     for (int i = 0; i < TOUCH_CH_COUNT; i++)
-        out[i] = (uint32_t)s_ts.ref[i];
+        out[i] = s_ts.bm[i];
 }
 void touch_get_filtered(int *out) { memcpy(out, s_ts.filtered, sizeof(s_ts.filtered)); }
