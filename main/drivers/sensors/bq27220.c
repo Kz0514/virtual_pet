@@ -99,6 +99,49 @@ esp_err_t bq27220_read_soc(uint16_t *soc_pct)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ * SOC 失步兜底
+ *
+ * 芯片 SOC = RemainingCapacity/FullChargeCapacity, 两个量都靠库仑计数
+ * 累积。TRM 明确本芯片**没有向上修正通路** — 基准一旦失步, 只能等
+ * 「充电终止同步」(需电流跌到 Taper Current 以下, 本机运行中永不满足)
+ * 或「重新初始化」(POR / BAT_INSERT / OCV_CMD) 才回得来。
+ * 失步时读出的 SOC 与电压自相矛盾 (电压接近满格却报个位数百分比), 会静默
+ * 关掉写盘闸。
+ * 故此处用电压交叉校验, 矛盾时改由电压查表兜底。
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/* 静置 OCV → SOC 粗对照 (锂电, 10% 一档)。仅失步兜底时使用。 */
+static const struct { uint16_t mv; uint8_t pct; } k_ocv_tbl[] = {
+    { 4200, 100 }, { 4100, 90 }, { 4000, 80 }, { 3930, 70 },
+    { 3860,  60 }, { 3800, 50 }, { 3750, 40 }, { 3710, 30 },
+    { 3670,  20 }, { 3600, 10 }, { 3450,  5 }, { 3300,  0 },
+};
+#define OCV_TBL_N ((int)(sizeof(k_ocv_tbl) / sizeof(k_ocv_tbl[0])))
+
+uint16_t bq27220_soc_from_mv(uint16_t mv)
+{
+    if (mv >= k_ocv_tbl[0].mv) return 100;
+    for (int i = 1; i < OCV_TBL_N; i++) {
+        if (mv >= k_ocv_tbl[i].mv) {
+            /* 落在 [i-1, i] 区间 → 线性插值 */
+            uint16_t hi_mv = k_ocv_tbl[i - 1].mv, lo_mv = k_ocv_tbl[i].mv;
+            int hi_p = k_ocv_tbl[i - 1].pct, lo_p = k_ocv_tbl[i].pct;
+            return (uint16_t)(lo_p + (int)(mv - lo_mv) * (hi_p - lo_p) /
+                                         (int)(hi_mv - lo_mv));
+        }
+    }
+    return 0;
+}
+
+bool bq27220_soc_plausible(uint16_t soc_pct, uint16_t mv)
+{
+    if (mv < 3000) return true; /* 无电池/读不到 → 不参与判断, 交回芯片值 */
+    if (mv >= 3900 && soc_pct <= 10) return false; /* 低向失步 */
+    if (mv <= 3500 && soc_pct >= 90) return false; /* 高向失步 */
+    return true;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  * 调试: BQ27220 全寄存器扫描 (按手册命令集)
  * ══════════════════════════════════════════════════════════════════════ */
 void bq27220_debug_scan(void)

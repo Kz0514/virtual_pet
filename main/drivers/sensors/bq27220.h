@@ -7,6 +7,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -27,6 +28,15 @@ typedef struct {
 esp_err_t bq27220_init(void);
 esp_err_t bq27220_read(bq27220_data_t *out);
 esp_err_t bq27220_read_soc(uint16_t *soc_pct);
+
+/** 芯片 SOC 与电压是否自洽 (失步检测)。
+ *  两条经验判据: 电压 ≥3.9V 却报 ≤10% (低向失步, 实测过);
+ *  电压 ≤3.5V 却报 ≥90% (高向失步)。电压 ≈0 (无电池) 时不参与判断。 */
+bool bq27220_soc_plausible(uint16_t soc_pct, uint16_t mv);
+
+/** 电压法 SOC 估计 (0~100) — 失步期兜底用。
+ *  查的是静置 OCV 粗对照表; 充放电大电流会抬升/压低读数, 故不作精确依据。 */
+uint16_t bq27220_soc_from_mv(uint16_t mv);
 
 /** 扫描 SBS 寄存器 (0x00-0x3F), 打印所有有效读数到日志 */
 void bq27220_debug_scan(void);

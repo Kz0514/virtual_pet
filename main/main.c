@@ -183,10 +183,23 @@ void app_main(void)
 
             hdc1080_data_t env;
             float lux = 0;
-            bq27220_data_t bat;
+            /* 零初始化: bq27220_read 在未初始化时提前返回且不填 out,
+             * 而下面的 SOC 兜底与闸门判据在 have_bat 为假时也会读它 */
+            bq27220_data_t bat = {0};
             bool have_env = (hdc1080_read(&env) == ESP_OK);
             bool have_bat = (bq27220_read(&bat) == ESP_OK);
             opt3001_read_lux(&lux);
+
+            /* SOC 失步兜底 (判据见 bq27220_soc_plausible): 芯片 SOC 与电压
+             * 自相矛盾时 (电压接近满格却报个位数百分比) 改用电压查表。该芯片 TRM 明确
+             * 无向上修正通路, 失步后只能等充电终止同步或重新初始化。
+             * 显示与决策一律用 soc_use; CSV 与 ⚡ 行仍记芯片原值 (留证据)。 */
+            uint16_t soc_use = bat.soc_pct;
+            bool soc_desync = false;
+            if (have_bat && !bq27220_soc_plausible(bat.soc_pct, bat.voltage_mv)) {
+                soc_use = bq27220_soc_from_mv(bat.voltage_mv);
+                soc_desync = true;
+            }
 
             /* 🌡/⚡ 每 30s 打一次 (原 2s — USB-JTAG TX 压力卡主循环) */
             static uint8_t env_log_cnt = 0;
@@ -195,10 +208,11 @@ void app_main(void)
             if (have_env && env_log_now)
                 ESP_LOGI(TAG, "🌡 %.1f°C %.0f%%", env.temperature, env.humidity);
             if (have_bat) {
-                status_bar_set_battery(bat.soc_pct, bat.voltage_mv);
+                status_bar_set_battery(soc_use, bat.voltage_mv);
                 if (env_log_now)
-                    ESP_LOGI(TAG, "⚡ %umV %u%% %dmA",
-                             bat.voltage_mv, bat.soc_pct, bat.current_ma);
+                    ESP_LOGI(TAG, "⚡ %umV %u%% %dmA%s",
+                             bat.voltage_mv, bat.soc_pct, bat.current_ma,
+                             soc_desync ? " ⚠SOC失步(显示按电压)" : "");
                 power_diag_log_append(&bat, power_manager_screen_state());
                 power_diag_seg_tick(&bat); /* power_seg.csv 段统计 */
                 /* 充电状态翻转 = USB 拔/插 → 供电链路瞬态 (VBUS 消失/恢复 +
@@ -224,8 +238,10 @@ void app_main(void)
                  * 满电停充期电池放电电流 -30~-60mA, 纯电流阈值会误判拔线
                  * → 插着电脑满电掉盘; 满电 SOC 恒 100% → SOC≥100 恒视为
                  * 插线禁睡, 非满电看电流 (阈值 -5mA)。拔线 (非满电放电)
-                 * 30s 宽限后释放锁 → 平时恢复轻睡。读失败不改变状态 */
-                usb_storage_set_charging(bat.soc_pct >= 100 ||
+                 * 30s 宽限后释放锁 → 平时恢复轻睡。读失败不改变状态。
+                 * 用 soc_use 而非芯片原值 — 失步时 SOC 报低会让 "SOC≥100"
+                 * 恒假, 退回纯电流阈值, 正好踩中上面那个掉盘坑 */
+                usb_storage_set_charging(soc_use >= 100 ||
                                          bat.current_ma >= -5);
                 /* 息屏诊断 (轻睡计数 + 锁/timer dump + tasks.txt)。节拍 90s,
                  * 由 power_diag 内部计数 — 早期是 14s, 为压擦除量整体放慢,
@@ -239,7 +255,16 @@ void app_main(void)
              * 欠压重启, 每次重启都重擦同一批扇区, 闸住这段时间即闸住
              * 损坏窗口。读失败保持 fail-open (闸开可写) */
             bool writes_ok = (!have_bat ||
-                              bat.soc_pct > BATTERY_CRITICAL_THRESHOLD_PCT);
+                              soc_use > BATTERY_CRITICAL_THRESHOLD_PCT);
+            /* 闸门翻转必打日志 — 这条路径原先完全静默, 失步把闸门关掉时
+             * 表现为 /cfg 与 /data 无声停写, 只能靠 CSV 断流倒查 */
+            static bool s_gate_last = true;
+            if (writes_ok != s_gate_last) {
+                s_gate_last = writes_ok;
+                ESP_LOGW(TAG, "写盘闸 %s — SOC=%u%% %umV%s",
+                         writes_ok ? "开" : "关", bat.soc_pct, bat.voltage_mv,
+                         soc_desync ? " (SOC 失步, 按电压兜底)" : "");
+            }
             memory_store_set_writes_safe(writes_ok);
             data_writer_set_gate(writes_ok);
             data_writer_tick(); /* 到点的 /data 攒批在此落盘 (各文件周期见 data_writer.c) */
@@ -284,7 +309,7 @@ void app_main(void)
                              have_env ? env.temperature : -99.0f,
                              have_env ? env.humidity : 0.0f,
                              lux,
-                             have_bat ? bat.soc_pct : -1,
+                             have_bat ? soc_use : -1, /* 上报按 display 口径 */
                              noise_detector_get_level(),
                              noise_ctx);
                     ws_client_send_json(sjson);
