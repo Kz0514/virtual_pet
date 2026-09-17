@@ -14,7 +14,6 @@
 
 #include "board.h"
 #include "touch_fpc.h"
-#define CONFIG_TOUCH_SUPPRESS_LEGACY_WARNING 1
 #include "driver/touch_sensor.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -57,10 +56,8 @@ typedef struct {
     uint32_t raw[TOUCH_CH_COUNT];
     bool touched[TOUCH_CH_COUNT];
     int filtered[TOUCH_CH_COUNT];
-    uint32_t touch_start_tick[TOUCH_CH_COUNT];
     uint32_t release_until[TOUCH_CH_COUNT]; /* 释放保活截止 (tick) — 滑动断续桥接 */
     int32_t prev_d[TOUCH_CH_COUNT];       /* 上帧 delta — CH0 起跳斜率判据 */
-    float smooth_left;
     float smooth_top_pos;
     float smooth_right_pos;
     float raw_top_pos; /* 未平滑顶部质心 — 滑动检测用(平滑系数会低估位移) */
@@ -308,8 +305,6 @@ static void touch_scan_once(bool sleep_path)
         if (active) {
             s_ts.touched[i] = true;
             n_dev++;
-            if (!was)
-                s_ts.touch_start_tick[i] = now;
             s_ts.release_until[i] = now + pdMS_TO_TICKS(RELEASE_KEEP_MS); /* 每次激活续期保活 */
         } else {
             /* 释放保活: 滑条通道最近激活后 60ms 内仍维持 touched — 桥接滑动中
@@ -318,9 +313,7 @@ static void touch_scan_once(bool sleep_path)
              * 12 通道同归释放, 计数会误判为环境阶跃触发快照) */
             bool keep = (i > 0) && was && (int32_t)(now - s_ts.release_until[i]) < 0;
             s_ts.touched[i] = keep;
-            if (!keep)
-                s_ts.touch_start_tick[i] = 0;
-            else
+            if (keep)
                 continue; /* 保活帧: filtered/质心权重沿用离开前值 → 位置保持该通道
                               (保活期手指已在途中, 刷新会稀释权重导致质心漂移) */
         }
@@ -360,7 +353,6 @@ static void touch_scan_once(bool sleep_path)
         for (int i = 0; i < TOUCH_CH_COUNT; i++) {
             s_ts.ref[i] = (int32_t)s_ts.raw[i];
             s_ts.touched[i] = false;
-            s_ts.touch_start_tick[i] = 0;
             s_ts.d_sm[i] = 0;
             s_ts.jit[i] = 0;
             s_ts.prev_d[i] = 0; /* 快照后 delta 归零 — 起跳斜率须从零起算 */
@@ -395,9 +387,6 @@ static void touch_scan_once(bool sleep_path)
     float rp = (r_s > 0) ? (r_w / r_s) / (TOUCH_RIGHT_CH_COUNT - 1) : -1.0f;
     rp = rp * 2.0f - 1.0f;
     s_ts.smooth_right_pos = s_ts.smooth_right_pos * 0.3f + rp * 0.7f; /* faster response */
-
-    /* 左侧按钮（通道 0） */
-    s_ts.smooth_left = s_ts.smooth_left * 0.7f + (s_ts.touched[0] ? 1.0f : 0.0f) * 0.3f;
 }
 
 /* ── 息屏期唤醒探针 ──
@@ -573,8 +562,6 @@ esp_err_t touch_fpc_init(void)
     /* 配置每个通道 */
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
         touch_pad_config(s_pads[i]);
-        /* 设置电压阈值：参考电压的 2/3 = 中等灵敏度 */
-        touch_pad_set_thresh(s_pads[i], 800);
     }
 
     /* 自动校准基线 */
@@ -608,12 +595,6 @@ esp_err_t touch_fpc_init(void)
 
     ESP_LOGI(TAG, "触摸 FPC 已初始化（12 通道, 动态刷新率 50/20Hz 亮屏 + 20/2Hz 息屏, 探针独立任务）");
     return ESP_OK;
-}
-
-void touch_fpc_scan(void)
-{
-    /* 空操作：扫描在定时器回调中完成。
-     * 此函数保留以保持 API 兼容性。 */
 }
 
 /* ── 睡眠节电 ── */
@@ -653,23 +634,8 @@ void touch_fpc_resume(void)
     }
 }
 
-bool touch_fpc_read(lv_indev_t *indev, lv_indev_data_t *data)
-{
-    lv_coord_t x = (lv_coord_t)((s_ts.smooth_top_pos + 1.0f) / 2.0f * DISPLAY_WIDTH);
-    lv_coord_t y = (lv_coord_t)((s_ts.smooth_right_pos + 1.0f) / 2.0f * DISPLAY_HEIGHT);
-
-    data->point.x = x;
-    data->point.y = y;
-    data->state = (s_ts.touched[0] || (fabsf(s_ts.smooth_top_pos) > 0.1f) || (fabsf(s_ts.smooth_right_pos) > 0.1f))
-                      ? LV_INDEV_STATE_PRESSED
-                      : LV_INDEV_STATE_RELEASED;
-    return false;
-}
-
 /* ── 公开查询接口 ── */
 bool touch_is_left_pressed(void) { return s_ts.touched[0]; }
-uint32_t touch_left_hold_ms(void) { return s_ts.touched[0] ? (xTaskGetTickCount() - s_ts.touch_start_tick[0]) * portTICK_PERIOD_MS : 0; }
-float touch_top_position(void) { return s_ts.smooth_top_pos; }
 float touch_top_position_raw(void) { return s_ts.raw_top_pos; }
 float touch_right_position(void) { return s_ts.smooth_right_pos; }
 
