@@ -175,3 +175,12 @@ CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
 
 # 触摸扫描定时器回调 (Tmr Svc) 吃栈: 含诊断打印, 默认 2048 会爆栈 (实测复现)
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=3072
+
+# 触摸 v2 驱动 (driver/touch_sens.h):
+# legacy 在两代以内芯片上无条件编入 driver 组件, 其 __attribute__((constructor))
+# 冲突检查发现 v2 驱动已链接就在 app_main 之前 abort — 必须跳过
+CONFIG_TOUCH_SKIP_LEGACY_CONFLICT_CHECK=y
+# ISR 入 IRAM: 本仓会在 cache 冻结期擦 flash, 非 IRAM 的触摸中断届时被让位推迟。
+# 开了之后驱动强制校验用户回调在 IRAM (touch_fpc.c 的 on_active/on_inactive
+# 已加 IRAM_ATTR, 只置位不打印) — 顺序不可颠倒, 否则 init 返回 ESP_ERR_INVALID_ARG
+CONFIG_TOUCH_ISR_IRAM_SAFE=y

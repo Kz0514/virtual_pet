@@ -1,21 +1,24 @@
 /**
  * @file touch_fpc.c
- * @brief 12 通道 FPC 电容触摸传感器驱动（ESP32-S3 旧版 API）
+ * @brief 12 通道 FPC 电容触摸传感器驱动（ESP32-S3, driver/touch_sens.h v2 驱动）
  *
  * 布局：
  *   左侧  (1 通道):  GPIO2  (触摸通道 2)  — 功能键
  *   顶部  (5 通道):  GPIO3-7 (触摸通道 3-7) — 水平滑块
  *   右侧  (6 通道):  GPIO8-13 (触摸通道 8-13) — 垂直滑块
  *
- * 使用 ESP32-S3 触摸传感器，定时器驱动扫描（亮屏动态 50/20Hz，
- * 息屏由独立探针任务按 esp_timer 节拍探测）。
- * 触摸通道与 GPIO 编号一一对应（通道 0-13）。
+ * 硬件连续扫描(定时器 FSM 驱动, 每通道 50Hz) + 硬件信号链
+ * (benchmark IIR / denoise 带 / smooth IIR / 激活滞回 / 去抖)。
+ * 亮屏由软件扫描定时器读 smooth 走判定; 息屏停软件定时器, 由独立探针
+ * 任务按 esp_timer 节拍探测。
+ * 触摸通道号与 GPIO 号一一对应（通道 2-13）。
  */
 
 #include "board.h"
 #include "touch_fpc.h"
-#include "driver/touch_sensor.h"
+#include "driver/touch_sens.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,21 +28,36 @@
 
 static const char *TAG = "touch_fpc";
 
-/* 通道映射：索引 → touch_pad_t */
-static const touch_pad_t s_pads[TOUCH_CH_COUNT] = {
-    TOUCH_PAD_NUM2,  /* 0: GPIO2  — 左侧 */
-    TOUCH_PAD_NUM3,  /* 1: GPIO3  — 顶部 0 */
-    TOUCH_PAD_NUM4,  /* 2: GPIO4  — 顶部 1 */
-    TOUCH_PAD_NUM5,  /* 3: GPIO5  — 顶部 2 */
-    TOUCH_PAD_NUM6,  /* 4: GPIO6  — 顶部 3 */
-    TOUCH_PAD_NUM7,  /* 5: GPIO7  — 顶部 4 */
-    TOUCH_PAD_NUM8,  /* 6: GPIO8  — 右侧 0 */
-    TOUCH_PAD_NUM9,  /* 7: GPIO9  — 右侧 1 */
-    TOUCH_PAD_NUM10, /* 8: GPIO10 — 右侧 2 */
-    TOUCH_PAD_NUM11, /* 9: GPIO11 — 右侧 3 */
-    TOUCH_PAD_NUM12, /* 10: GPIO12 — 右侧 4 */
-    TOUCH_PAD_NUM13, /* 11: GPIO13 — 右侧 5 */
+/* v2 驱动句柄 */
+static touch_sensor_handle_t  s_sens = NULL;
+static touch_channel_handle_t s_chan[TOUCH_CH_COUNT] = {0};
+
+/* 通道索引 → 触摸通道号。S3 上通道号 = GPIO 号, 故 = 索引 + 2 */
+static const int s_ch_id[TOUCH_CH_COUNT] = {
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
 };
+
+/* 硬件去抖+滞回后的激活位图 (bit n = 通道 n; 硬件是整张快照, 读它不清零,
+ * 所以中断被推迟/合并也不丢边沿)。ISR 里只赋值 — 不打印不阻塞不取 tick。
+ * 回调必须 IRAM_ATTR: 本仓会在 cache 冻结期擦 flash, 届时打到 flash 里的
+ * 回调即崩 (与 newlib 锁 abort / PSRAM 栈双异常同一根因族)。 */
+static volatile uint32_t s_active_mask = 0;
+
+static IRAM_ATTR bool touch_on_active(touch_sensor_handle_t sens,
+                                      const touch_active_event_data_t *e, void *ctx)
+{
+    (void)sens; (void)ctx;
+    s_active_mask = e->status_mask;
+    return false;
+}
+
+static IRAM_ATTR bool touch_on_inactive(touch_sensor_handle_t sens,
+                                        const touch_inactive_event_data_t *e, void *ctx)
+{
+    (void)sens; (void)ctx;
+    s_active_mask = e->status_mask;
+    return false;
+}
 
 /* 检测状态与判定不变式:
  * - ref  (限速基线): 每帧最多吃 RL, 只追环境漂移不追按压
@@ -142,32 +160,26 @@ void touch_fpc_get_thr(int *thr_out) { memcpy(thr_out, s_ts.thr, sizeof(s_ts.thr
 static bool touch_auto_calibrate(void)
 {
     ESP_LOGI(TAG, "正在自动校准触摸基线…");
-    uint64_t sum[TOUCH_CH_COUNT] = {0};
 
-    /* 数学保护: raw 全 0 时校准会把 0 当基线 → 之后任意微小读数都
-     * 越阈, 判定全 true — 首轮全 0 直接放弃, 保持现有基线 */
+    /* 基线 = 硬件 benchmark, 直接向驱动要 — 不必自己采 100 轮 (~500ms 阻塞)。
+     * 硬件 benchmark 由 IIR 持续跟踪环境, 比重启时的软件均值更平滑, 且零阻塞 */
+    int32_t bm[TOUCH_CH_COUNT] = {0};
     uint32_t chk = 0;
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
         uint32_t v = 0;
-        touch_pad_read_raw_data(s_pads[i], &v);
+        if (touch_channel_read_data(s_chan[i], TOUCH_CHAN_DATA_TYPE_BENCHMARK, &v) == ESP_OK)
+            bm[i] = (int32_t)v;
         chk += v;
     }
+    /* 数学保护: benchmark 全 0 时校准会把 0 当基线 → 之后任意微小读数都
+     * 越阈, 判定全 true — 直接放弃, 保持现有基线 */
     if (chk == 0) {
-        ESP_LOGW(TAG, "校准前检查: raw 全 0 — 放弃校准, 保持现有基线");
+        ESP_LOGW(TAG, "校准前检查: benchmark 全 0 — 放弃校准, 保持现有基线");
         return false;
     }
 
-    for (int round = 0; round < 100; round++) {
-        for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-            uint32_t val = 0;
-            touch_pad_read_raw_data(s_pads[i], &val);
-            sum[i] += val;
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        int32_t mean = (int32_t)(sum[i] / 100);
+        int32_t mean = bm[i];
         /* 防手指污染: 重校准时用户若按着设备, 平均被手指抬高, 直接覆盖
          * 基线 → 释放后 delta 恒负 → 触摸失灵。偏离超 2*MIN 的通道保留
          * 旧 ref, 靠限速基线自愈; 首次校准 (ref 全 0) 不适用此守卫。 */
@@ -241,7 +253,12 @@ static void touch_scan_once(bool sleep_path)
     int32_t act_d = -1;
 
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        touch_pad_read_raw_data(s_pads[i], &s_ts.raw[i]);
+        /* 数据源 = 硬件 smooth (IIR_2 已滤过), 与 raw 同量纲 (都是 counts,
+         * 同一寄存器 touch_pad_data 换 sel 读)。读失败沿用上帧值 —
+         * 填 0 会造出巨大负 delta → 误判释放 */
+        uint32_t sm = 0;
+        if (touch_channel_read_data(s_chan[i], TOUCH_CHAN_DATA_TYPE_SMOOTH, &sm) == ESP_OK)
+            s_ts.raw[i] = sm;
 
         /* ESP32-S3: 触摸时 raw 值上升 (delta = raw - ref > 0) */
         int32_t d = (int32_t)s_ts.raw[i] - s_ts.ref[i];
@@ -552,19 +569,59 @@ static void touch_scan_timer_cb(TimerHandle_t timer)
 /* ── 公开 API ── */
 esp_err_t touch_fpc_init(void)
 {
-    ESP_LOGI(TAG, "正在初始化 12 通道 FPC 触摸传感器（旧版 API）…");
+    ESP_LOGI(TAG, "正在初始化 12 通道 FPC 触摸传感器（v2 驱动）…");
 
-    /* 初始化触摸外设: 硬件定时器自动触发测量 */
-    touch_pad_init();
-    touch_pad_set_fsm_mode(TOUCH_FSM_MODE_TIMER); /* 硬件自动触发 */
-    touch_pad_fsm_start();
+    /* 轻睡必须显式保触摸域: legacy 靠 FSM 定时器恒开把 RTC_PERIPH 隐式保电
+     * (sleep_modes.c 读 touch_slp_timer_en 决定 keep_rtc_power_on), 这条隐式
+     * 依赖随 legacy 一起没了 → 轻睡会清掉触摸寄存器/benchmark (官方注释原文:
+     * "otherwise the touch sensor FSM will be cleared, causing touch sensor
+     * false triggering")。只补电源域, 不调 touch_sensor_config_sleep_wakeup —
+     * 那个顺带开硬件触摸唤醒 (RTC_TOUCH_TRIG_EN), 与软件探针架构冲突。 */
+    ESP_ERROR_CHECK(esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON));
 
-    /* 配置每个通道 */
+    /* 采样参数对齐 legacy 默认 (S3: TOUCH_PAD_MEASURE_CYCLE_DEFAULT=500 /
+     * 2V7 / 0V5 / idle 接 GND) → 读数尺度与迁移前逐计数可比 */
+    static touch_sensor_sample_config_t s_sample_cfg[TOUCH_SAMPLE_CFG_NUM] = {
+        TOUCH_SENSOR_V2_DEFAULT_SAMPLE_CONFIG(500, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V7)
+    };
+    touch_sensor_config_t sens_cfg = TOUCH_SENSOR_DEFAULT_BASIC_CONFIG(1, s_sample_cfg);
+    sens_cfg.meas_interval_us = 1667; /* 12 通道 ≈ 20ms/轮 = 每通道 50Hz (对上亮屏活动档) */
+    ESP_ERROR_CHECK(touch_sensor_new_controller(&sens_cfg, &s_sens));
+
+    /* 12 个通道: 通道号 = GPIO 号 (S3), 见 s_ch_id。
+     * active_thresh 是"相对 benchmark 的 counts 阈值"; 本步判定仍走软件, 硬件
+     * 激活位图只观测不消费 — 取 2000 落在近场手 (100~190) 与按压峰 (2800~5000)
+     * 之间, 既不误报也低不到引发中断风暴, 正好用来对照验证硬件链 */
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        touch_pad_config(s_pads[i]);
+        touch_channel_config_t ch_cfg = {
+            .active_thresh = {2000},
+            .charge_speed = TOUCH_CHARGE_SPEED_7,
+            .init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT,
+        };
+        ESP_ERROR_CHECK(touch_sensor_new_channel(s_sens, s_ch_id[i], &ch_cfg, &s_chan[i]));
     }
 
-    /* 自动校准基线 */
+    /* 硬件信号链: benchmark IIR + denoise 带 + smooth IIR + 激活滞回 + 去抖。
+     * debounce_cnt 语义就是"连续越阈 n 次才翻转状态" — 正是 CH0 幻触的正解
+     * (旧代码用两段式特判当它的劣质替代品, 结果特判本身成了幻触发生器) */
+    touch_sensor_filter_config_t filt_cfg = TOUCH_SENSOR_DEFAULT_FILTER_CONFIG();
+    filt_cfg.benchmark.filter_mode = TOUCH_BM_IIR_FILTER_16; /* 基线慢跟, 不被按压带走 */
+    ESP_ERROR_CHECK(touch_sensor_config_filter(s_sens, &filt_cfg));
+
+    /* 回调只能在未使能时注册 */
+    touch_event_callbacks_t cbs = {
+        .on_active = touch_on_active,
+        .on_inactive = touch_on_inactive,
+    };
+    ESP_ERROR_CHECK(touch_sensor_register_callbacks(s_sens, &cbs, NULL));
+
+    ESP_ERROR_CHECK(touch_sensor_enable(s_sens));
+    /* 前两次测量无效 (充电注入未稳), 与官方示例同样丢弃 3 次 */
+    for (int k = 0; k < 3; k++)
+        ESP_ERROR_CHECK(touch_sensor_trigger_oneshot_scanning(s_sens, 200));
+    ESP_ERROR_CHECK(touch_sensor_start_continuous_scanning(s_sens));
+
+    /* 自动校准基线 (读硬件 benchmark, 不再自己采 100 轮) */
     touch_auto_calibrate();
 
     /* 创建周期性扫描定时器（亮屏活动 50 Hz, 动态档由回调内切换） */
@@ -593,7 +650,7 @@ esp_err_t touch_fpc_init(void)
         != pdPASS)
         ESP_LOGE(TAG, "创建探针任务失败");
 
-    ESP_LOGI(TAG, "触摸 FPC 已初始化（12 通道, 动态刷新率 50/20Hz 亮屏 + 20/2Hz 息屏, 探针独立任务）");
+    ESP_LOGI(TAG, "触摸 FPC 已初始化（12 通道 v2 驱动 + 硬件链, 亮屏 50/20Hz + 息屏 20/2Hz, 探针独立任务）");
     return ESP_OK;
 }
 
@@ -601,6 +658,8 @@ esp_err_t touch_fpc_init(void)
 
 void touch_fpc_pause(void)
 {
+    /* 本步只停软件扫描定时器 — 硬件连续扫描照跑 (legacy 的 FSM 定时器那时也
+     * 照跑, 行为不变)。停硬件扫描 + oneshot 探针是后续步的事 */
     if (s_scan_timer) xTimerStop(s_scan_timer, 0);
     s_probe_hits = 0;
     s_wake_pending = false;
@@ -618,10 +677,10 @@ void touch_fpc_pause(void)
 void touch_fpc_resume(void)
 {
     /* 亮屏唤醒 = 刷新基线基准: 睡眠期供电/耦合漂移会让软件判定
-     * (raw vs ref) 失真 — 重校准后首轮扫描即新基线, 判定恢复。
-     * 校准 500ms 期间先停扫描定时器 (防并发读写基线), 校准完再
-     * 恢复扫描。校准内置 raw 全 0 保护 + 手指污染守卫 (手指压着的
-     * 通道保留旧基线, 靠限速基线自愈 — 唤醒触摸不得污染基线) */
+     * (smooth vs ref) 失真 — 重校准后首轮扫描即新基线, 判定恢复。
+     * 先停扫描定时器 (防并发读写基线), 校准完再恢复。
+     * 校准源是硬件 benchmark (自身带 denoise 带冻结, 手指按住不会污染
+     * 基线), 起步仍保留原始基准的全 0 保护与手指污染守卫。 */
     if (s_scan_timer) xTimerStop(s_scan_timer, 0);
     s_probe_hits = 0;
     s_wake_pending = false;

@@ -102,6 +102,7 @@ idf_component_register(
 
     REQUIRES
         driver
+        esp_driver_touch_sens
         esp_lcd
         esp_timer
         esp_netif
