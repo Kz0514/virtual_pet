@@ -66,14 +66,11 @@ static IRAM_ATTR bool touch_on_inactive(touch_sensor_handle_t sens,
  *   信号链吐出的 smooth 与 benchmark。硬件 mask 只做诊断对照
  * - bm (硬件 benchmark): 判定基准。smooth − bm 就是判定用的那个量,
  *   本文件的 d、filtered、对外的 raw/baseline 全部同源于它
- * - ref/d_sm/jit/thr 链**已无消费者** (息屏探针切到 smooth−benchmark 后)。
- *   留着是为让本步的 diff 只含行为改动, 删除是下一步 (纯删除, 行为零变化) */
+ * - 软件基线链 (限速 ref / 抖动 jit / 自适应 thr) 已随 2c 删除: 亮屏判定与息屏
+ *   探针现在共用同一把尺子 (smooth − 硬件 benchmark 对 active_thresh), 两组
+ *   基线的量纲差异本就是"息屏/亮屏灵敏度对不上"的来源 */
 typedef struct {
     uint32_t bm[TOUCH_CH_COUNT];      /* 硬件 benchmark 快照 (判定基准) */
-    int32_t ref[TOUCH_CH_COUNT];      /* 限速基线 — 待删 */
-    int32_t d_sm[TOUCH_CH_COUNT];     /* delta 慢均值 (抖动基准) — 待删 */
-    int32_t jit[TOUCH_CH_COUNT];      /* 噪声抖动 |d-d_sm| EMA (dev 钳 ±60) — 待删 */
-    int32_t thr[TOUCH_CH_COUNT];      /* 探针判定阈值 (jit*6 与 MIN 取大) — 待删 */
     uint32_t raw[TOUCH_CH_COUNT];     /* 硬件 smooth 快照 (对外的 "raw") */
     bool touched[TOUCH_CH_COUNT];
     int filtered[TOUCH_CH_COUNT];
@@ -85,7 +82,6 @@ typedef struct {
 
 static touch_state_t s_ts = {0};
 static TimerHandle_t s_scan_timer = NULL;
-static bool s_calibrated = false; /* 首次校准后开启防手指污染守卫 */
 
 /* 实际写进驱动的硬件阈值 (init 回读确认后缓存) — touch_fpc_get_thr 用 */
 static uint32_t s_thr_hw[TOUCH_CH_COUNT] = {0};
@@ -132,47 +128,38 @@ static uint8_t s_deb[TOUCH_CH_COUNT] = {0};
 #define TOUCH_THR_CH0 400            /* 左键 (CH0/GPIO2, 最大焊盘, USB 耦合最强) */
 #define TOUCH_THR_BAR 350            /* 顶部 CH1-5 与右侧 CH6-11 */
 
-/* ── 检测参数 (已无消费者, 待删 — 息屏探针已切 smooth−benchmark) ── */
-#define BASELINE_RL_POS 4            /* 正向限速/帧: 追环境漂移不吞按压 (慢按净余仍可触发) */
-#define BASELINE_RL_NEG 64           /* 负向快追: 释放/回落快速归零, 防快速滑动重按 d
-                                         从低处起跳丢判定; 负 d 无触发风险, 追快安全 */
-#define TOUCH_MIN_TOP 300            /* 顶部/左键阈值下限 (须盖过近场手信号) */
-#define TOUCH_MIN_RIGHT 220          /* 右侧阈值下限 (抖动自适应兜底) */
-#define TOUCH_JIT_K 6                /* 抖动倍数: 抖动大环境自动抬阈盖过环境噪声峰值, 幻触免疫 */
-#define JIT_MAX_DEV 60               /* 抖动输入钳制: dev=|d-d_sm| 超 60 截断 —
-                                        jit 只反映环境噪声, 真实按压尖峰不得抬阈
-                                        (无钳制单次按压即把通道阈值抬入数秒死区) */
-#define THR_CLAMP 360                /* 阈值整体封顶: jit 稳态 ≤ JIT_MAX_DEV → thr ≤ 360 */
 #define RELEASE_KEEP_MS 60           /* 释放保活: 刚释放 60ms 内仍计 touched —
                                         桥接滑动腾空间隙/压力波动 (按 tick,
                                         50Hz=3帧 / 20Hz 空闲档同样生效)。
                                         只作用于滑条通道 (CH1-11), 左键不保活
                                         (保活拖长单击 hold → 500ms 轻点边界误判长按) */
-#define ENV_SNAP_CHANNELS 11         /* 环境阶跃: >=11 通道同时越阈 (USB/供电瞬态全 12 通跳,
-                                       手掌覆盖 ≤10 通道不误伤) → 基线快照+清判定 */
+#define ENV_SNAP_CHANNELS 11         /* 环境阶跃: >=11 通道同时激活 → 清判定 + 2s 免疫窗。
+                                       手掌覆盖 ≤10 通道不误伤。软件基线快照已随 2c 删,
+                                       但清 touched 与免疫窗仍是活的 (探针直读免疫窗) */
 /* ── 标定观测 (临时仪表, 定标收敛后随 2c 一起删) ──
  * 判定切硬件后, 误触发不再产生任何日志 —— 幻触消失的直接表现就是"什么都没发生",
  * 但同时也看不到"离阈值还差多远"。每 20s 打一窗口内 12 通道 smooth−benchmark
  * 峰值, 作为调 active_thresh 的唯一仪表 (对着 TOUCH_THR_* 看余量)。 */
 #define TUNE_PEAK_PERIOD_MS 20000
 
-/* ── 动态刷新率 (四级档位) ──
- * 活动判定统一: 任一通道 |d| > 80 (近场/手接近) → 立即最高档。
- * - 亮屏活动 50Hz: 手势状态机消费端上限 (20ms LVGL 定时器驱动)
- * - 亮屏空闲 20Hz: 亮屏持 PM 锁禁睡, 只省定时器唤醒 + 扫描 CPU
+/* ── 刷新率 ──
+ * 亮屏恒 50Hz (软件定时器, 与硬件连续扫描同节拍)。
+ * 息屏两档由探针自己的 esp_timer 节拍承担, 与亮屏无关:
  * - 息屏快探 20Hz: 100ms 轻掠需 ≥2 采样帧凑齐 2 连击去抖
- * - 息屏深闲 2Hz: 无活动 15s → 睡眠窗口 500ms, 主功耗收益点 */
+ * - 息屏深闲 2Hz: 无活动 15s → 睡眠窗口 500ms, 主功耗收益点
+ * 亮屏侧原有"空闲 20Hz"一档已随 2c 删除: 它改不到硬件扫描周期
+ * (meas_interval_us 运行期不可改), 省不到功耗大头 (亮屏持 PM 锁本就不睡),
+ * 却把去抖时间 (TOUCH_DEBOUNCE_N 帧) 与 filtered IIR 时间常数 (4 帧) 绑在
+ * "用户多久没摸"上 —— 空闲 30s 后按压迟滞 40→100ms、滑条跟手钝 2.5x。
+ * 活动判定: 任一通道 |d| > 80 (近场/手接近) → touch_note_activity */
 #define PROBE_ACT_THR 80             /* 活动判定阈值 (近场/手接近) */
-#define SCAN_ON_ACTIVE_MS 20         /* 亮屏活动 50Hz */
-#define SCAN_ON_IDLE_MS 50           /* 亮屏空闲 20Hz */
-#define SCAN_ON_IDLE_AFTER_MS 30000  /* 亮屏无活动多久降档 */
+#define SCAN_ON_MS 20                /* 亮屏扫描节拍 50Hz */
 #define PROBE_FAST_MS 50             /* 息屏快探 20Hz */
 #define PROBE_SLOW_MS 500            /* 息屏深闲 2Hz */
 #define PROBE_SLOW_AFTER_MS 15000    /* 息屏无活动多久降档 */
 
 static uint32_t s_last_activity = 0;       /* 最近活动时刻 (tick) */
 static uint32_t s_probe_interval = PROBE_FAST_MS; /* 当前息屏探针间隔 */
-static uint32_t s_last_scan = 0;           /* 上帧扫描时刻 — 限速频率补偿基准 */
 
 /* 独立探针任务: 息屏期由周期 esp_timer (RTC 闹钟) 驱动 —
  * 硬性绑定轻睡唤醒节拍, 探针频率 = probe_interval, 与主循环负载解耦 */
@@ -204,61 +191,33 @@ void touch_fpc_get_thr(int *thr_out)
         thr_out[i] = (int)s_thr_hw[i];
 }
 
-/* ── 软件基线同步 (息屏探针用) ──
- * 亮屏判定已切硬件, 这个函数不再参与任何触摸结论 — 它只把硬件 benchmark
- * 抄进软件 ref, 给 touch_fpc_sleep_probe 的独立复判当起点。
- * 用 benchmark 而不是 raw: benchmark 带 denoise 带, 手指按住时不被污染 */
-static bool touch_auto_calibrate(void)
+/* ── 硬件基准读数 (诊断仪表) ──
+ * 只读 + 打印, 不写任何状态、不参与任何判定。
+ * 注意打印的是**直读值**: 2c 之前这里先把 benchmark 抄进软件 ref 再打印, 被防手指
+ * 守卫跳过时打出来的其实是上一轮的旧值 —— 会把"基准跑了"误读成"基准正常" */
+static void touch_log_hw_baseline(void)
 {
-    int32_t bm[TOUCH_CH_COUNT] = {0};
+    uint32_t bm[TOUCH_CH_COUNT] = {0};
     uint32_t chk = 0, vmax = 0;
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
         uint32_t v = 0;
         if (touch_channel_read_data(s_chan[i], TOUCH_CHAN_DATA_TYPE_BENCHMARK, &v) == ESP_OK)
-            bm[i] = (int32_t)v;
+            bm[i] = v;
         chk += v;
         if (v > vmax) vmax = v;
     }
-    /* 两种"benchmark 不是数"的情形都要挡住, 否则这个垃圾值会变成探针基线:
-     * - 全 0: 之后任意微小读数都越阈, 判定全 true
-     * - 满量程 (0x3FFFFF, 22 位): 复位后尚未落定, 见 touch_fpc_init 的注释 */
-    if (chk == 0 || vmax == 0x3FFFFFu) {
-        ESP_LOGW(TAG, "基准同步前检查: benchmark 不可用 (全 0 或满量程 %u) — 放弃, 保持现有基线",
-                 (unsigned)vmax);
-        return false;
-    }
+    /* 两种"benchmark 不是数"的情形: 全 0 / 满量程 (0x3FFFFF, 22 位, 复位后尚未
+     * 落定, 见 touch_fpc_init 的注释)。只标注不吞掉 —— 仪表就该显示实况 */
+    if (chk == 0 || vmax == 0x3FFFFFu)
+        ESP_LOGW(TAG, "基准读数异常 (全 0 或满量程 %u)", (unsigned)vmax);
 
-    for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        int32_t mean = bm[i];
-        /* 防手指污染: 重校准时用户若按着设备, 平均被手指抬高, 直接覆盖
-         * 基线 → 释放后 delta 恒负 → 触摸失灵。偏离超 2*MIN 的通道保留
-         * 旧 ref, 靠限速基线自愈; 首次校准 (ref 全 0) 不适用此守卫。 */
-        if (s_calibrated) {
-            int32_t min_thr = (i > TOUCH_TOP_CH_COUNT) ? TOUCH_MIN_RIGHT : TOUCH_MIN_TOP;
-            int32_t dev = mean - s_ts.ref[i];
-            if (dev < 0) dev = -dev;
-            if (dev > 2 * min_thr) {
-                ESP_LOGW(TAG, "CH%d 校准跳过 (手指/偏移 %ld > %d)",
-                         i, (long)dev, 2 * min_thr);
-                continue;
-            }
-        }
-        s_ts.ref[i] = mean;
-        s_ts.d_sm[i] = 0;
-        s_ts.jit[i] = 0;
-    }
-    s_calibrated = true;
     /* 这 12 个数就是判定基准本身 (硬件 benchmark), 各通道之间应大致同量级 —
      * 某个明显偏低即是"基准没爬到位"/"上面有东西" */
     ESP_LOGI(TAG, "硬件基准: CH0=%ld CH1=%ld CH2=%ld CH3=%ld CH4=%ld CH5=%ld "
                   "CH6=%ld CH7=%ld CH8=%ld CH9=%ld CH10=%ld CH11=%ld",
-             (long)s_ts.ref[0], (long)s_ts.ref[1],
-             (long)s_ts.ref[2], (long)s_ts.ref[3],
-             (long)s_ts.ref[4], (long)s_ts.ref[5],
-             (long)s_ts.ref[6], (long)s_ts.ref[7],
-             (long)s_ts.ref[8], (long)s_ts.ref[9],
-             (long)s_ts.ref[10], (long)s_ts.ref[11]);
-    return true;
+             (long)bm[0], (long)bm[1], (long)bm[2], (long)bm[3],
+             (long)bm[4], (long)bm[5], (long)bm[6], (long)bm[7],
+             (long)bm[8], (long)bm[9], (long)bm[10], (long)bm[11]);
 }
 
 /* ── 息屏唤醒探针 (独立任务 + esp_timer 节拍) ──
@@ -277,30 +236,17 @@ static bool s_oneshot_failed = false; /* oneshot 失败沿 — 只报一次, 免
 #define PROBE_HIT_WINDOW_MS 150   /* 两命中必须在此窗内 — 漂移越阈(间隔秒级)凑不齐 */
 #define PROBE_MAX_CHANNELS 10
 
-/* ── 单发扫描 (定时器回调与息屏探针共用; 亮屏 50Hz / 息屏 20Hz-2Hz 动态) ──
- * sleep_path: 息屏探针路径 — 息屏后 PA 关断/面板睡眠的电磁耦合漂移
- * ~330/s, 追速必须盖过漂移率, 否则 d 净涨破阈假唤醒。
- * 亮屏路径保持 200/s (RL 加大会吞慢滑)。 */
+/* ── 单次扫描 (亮屏定时器回调与息屏探针共用; 亮屏固定 50Hz, 息屏由探针自定节拍) ──
+ * sleep_path: 息屏探针路径 — 该路径不落盘判定 (见下方 s_deb 归零),
+ * 唤醒与否全由探针独立复判 */
 static void touch_scan_once(bool sleep_path)
 {
     uint32_t now = xTaskGetTickCount();
     int n_dev = 0;
     bool near = false;
-    /* 息屏期判定不落盘: touched 一旦置位 → 限速追速冻结 → d 死锁高位 →
-     * 假唤醒连击。唤醒判定由探针独立复判 (d>thr, 无保活) 承担, scan 只
-     * 维护基线/抖动/阈值; 全息屏期追速恒执行 — 平台漂移被吃光, 尖峰当帧
-     * 自回, 真按压速度远大于追速, 唤醒不受影响 */
-    /* 免疫窗由探针端裁决 (touch_fpc_sleep_probe), 扫描侧不施加窗口 */
-
-    /* 限速频率补偿: 基线 RL 是"每帧"限速, 低频下同一漂移追得慢 → d 逐帧
-     * 净涨。rate_k = 距上帧 ms / 20ms (封顶 25), 亮屏追速恒 ≈200/s;
-     * 息屏路径再 ×2 盖过息屏漂移 */
-    uint32_t dt = (now >= s_last_scan) ? (now - s_last_scan) : 0;
-    s_last_scan = now;
-    uint32_t rate_k = dt / 20 + 1;
-    if (rate_k > 25) rate_k = 25;
-    uint32_t rl_k = rate_k * (sleep_path ? 2 : 1); /* 息屏 ×2: 追速盖过漂移不破阈;
-                                                      再大吞揉搓, 破坏缓慢按压唤醒 */
+    /* 息屏期判定不落盘 — 唤醒判定由探针独立复判 (smooth−benchmark 对
+     * active_thresh, 无保活) 承担, scan 侧只维护 touched/filtered/质心。
+     * 免疫窗由探针端裁决 (touch_fpc_sleep_probe), 扫描侧不施加窗口 */
 
     int8_t act_ch = -1; /* 息屏活动判定: |d| 最大通道 (跨 2 帧必须同通道) */
     int32_t act_d = -1;
@@ -322,44 +268,6 @@ static void touch_scan_once(bool sleep_path)
         int32_t d = (int32_t)s_ts.raw[i] - (int32_t)s_ts.bm[i];
         if (!sleep_path && d > s_peak[i])
             s_peak[i] = d; /* 标定仪表 (TUNE_PEAK_PERIOD_MS) */
-
-        /* 下面 ref/d_sm/jit/thr 这条链只剩息屏探针消费 (亮屏判定已切硬件),
-         * 用的是软件限速基线 — 另算一个 d_sw, 两组基线互不干扰 */
-        int32_t d_sw = (int32_t)s_ts.raw[i] - s_ts.ref[i];
-
-        /* 漂移跟踪 (按通道门控): 只有本通道空闲才追, 手指按住左键不会
-         * 冻结其他通道基线。限速吸收: 环境 DC 偏移 (近场/供电/温湿度)
-         * 被限速吞掉, 按压 delta 突变净余量仍够触发; |d|<=RL 完全跟随
-         * (亚 RL 漂移零滞后)。
-         * 负向快追 (RL_NEG=64): 手指离开/环境回落快速归零, 负 d 无按压风险 —
-         * 快速滑动"释放→重按"间隔短, 追不平则重按 d 从低处起跳丢判定 */
-        if (!s_ts.touched[i]) {
-            s_ts.d_sm[i] += (d_sw - s_ts.d_sm[i]) >> 4;        /* d 慢均值 */
-            int32_t dev = d_sw - s_ts.d_sm[i];
-            if (dev > JIT_MAX_DEV) dev = JIT_MAX_DEV;
-            else if (dev < -JIT_MAX_DEV) dev = -JIT_MAX_DEV; /* 尖峰不得抬阈 */
-            s_ts.jit[i] += ((dev < 0 ? -dev : dev) - s_ts.jit[i]) >> 3;
-            int32_t rl_pos = (int32_t)BASELINE_RL_POS * (int32_t)rl_k;
-            int32_t rl_neg = (int32_t)BASELINE_RL_NEG * (int32_t)rl_k;
-            if (d_sw > rl_pos)
-                s_ts.ref[i] += rl_pos;
-            else if (d_sw < -rl_neg)
-                s_ts.ref[i] -= rl_neg;
-            else
-                s_ts.ref[i] += d_sw;
-            if (s_ts.ref[i] < 0)
-                s_ts.ref[i] = 0; /* 安全: raw 不可能为负 */
-        }
-
-        /* 自适应阈值: 抖动大环境自动抬阈免疫幻触, 安静环境回落 MIN 下限
-         * 恢复轻触灵敏 — 阈值跟着环境噪声走 */
-        int32_t thr = s_ts.jit[i] * TOUCH_JIT_K;
-        int32_t min_thr = (i > TOUCH_TOP_CH_COUNT) ? TOUCH_MIN_RIGHT : TOUCH_MIN_TOP;
-        if (thr < min_thr)
-            thr = min_thr;
-        if (thr > THR_CLAMP)
-            thr = THR_CLAMP; /* 抖动抬阈封顶 (防按压污染 + 保滑动可用) */
-        s_ts.thr[i] = thr;
 
         bool was = s_ts.touched[i];
         /* 判定 = 软件 Schmitt + 连续帧去抖 (见 TOUCH_REL_DROP_* / TOUCH_DEBOUNCE_N)。
@@ -436,18 +344,13 @@ static void touch_scan_once(bool sleep_path)
         touch_note_activity();
     }
 
-    /* 环境阶跃快照: >=11 通道同时越阈 = USB 拔插/供电瞬态 (全 12 通跳,
-     * 持续 1-2s), 非触摸 — 软件基线快照到 raw, 短免疫窗。
-     * 手掌覆盖 ≤10 通道不误伤。
-     * 注意: 判定已切硬件, 这里清 touched 只是让质心当帧归零 (下一帧由硬件位图
-     * 重新给出), 真正的幻触防线是 CH0 的 active_thresh 与 debounce_cnt */
+    /* 环境阶跃: >=11 通道同时激活 = 手掌全覆盖/供电瞬态, 非单点触摸 —
+     * 清判定 + 2s 免疫窗。手掌覆盖 ≤10 通道不误伤。
+     * 注意: 这里清 touched 只是让质心当帧归零 (下一帧由软件 Schmitt 重新给出),
+     * 真正的幻触防线是 CH0 的 active_thresh 与 debounce_cnt */
     if (n_dev >= ENV_SNAP_CHANNELS) {
-        for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-            s_ts.ref[i] = (int32_t)s_ts.raw[i];
+        for (int i = 0; i < TOUCH_CH_COUNT; i++)
             s_ts.touched[i] = false;
-            s_ts.d_sm[i] = 0;
-            s_ts.jit[i] = 0;
-        }
         s_immune_until = now + pdMS_TO_TICKS(2000);
         touch_note_activity();
     }
@@ -674,12 +577,6 @@ static void touch_scan_timer_cb(TimerHandle_t timer)
         }
     }
 
-    uint32_t idle_ms = (xTaskGetTickCount() - s_last_activity) * portTICK_PERIOD_MS;
-    TickType_t want = pdMS_TO_TICKS((idle_ms < SCAN_ON_IDLE_AFTER_MS)
-                                        ? SCAN_ON_ACTIVE_MS
-                                        : SCAN_ON_IDLE_MS);
-    if (xTimerGetPeriod(s_scan_timer) != want)
-        xTimerChangePeriod(s_scan_timer, want, 0); /* 回调内改周期: 队列延迟 1 tick, 安全 */
 }
 
 /* ── 公开 API ── */
@@ -762,8 +659,8 @@ esp_err_t touch_fpc_init(void)
 
     /* 必须在连续扫描跑起来之后再等一轮才回读 benchmark: do_reset 写的是
      * touch_channel_clr, benchmark 要等下一次测量才被装成 raw —— 复位后立刻读
-     * 拿到的是 0x3FFFFF (22 位满量程)。实测踩过: 这个垃圾值被抄进软件 ref,
-     * 息屏探针 d_sw 恒为巨额负数 → 整条唤醒链失效。
+     * 拿到的是 0x3FFFFF (22 位满量程)。实测踩过: 这个垃圾值被当成有效读数,
+     * 整条判定链失效 (touch_log_hw_baseline 对它专门告警)。
      * 12 通道 × 1667us ≈ 20ms 一轮, 100ms 留 5 倍余量 */
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -778,12 +675,12 @@ esp_err_t touch_fpc_init(void)
              (unsigned)s_thr_hw[0], (unsigned)s_thr_hw[1]);
 
     /* 同步软件基线 (息屏探针用) + 打印基准 (CH1 那类"基准没爬到位"全靠这行看) */
-    touch_auto_calibrate();
+    touch_log_hw_baseline();
 
-    /* 创建周期性扫描定时器（亮屏活动 50 Hz, 动态档由回调内切换） */
+    /* 创建周期性扫描定时器 (亮屏固定 50Hz, 不再动态降档 — 见 SCAN_ON_MS 注释) */
     s_scan_timer = xTimerCreate(
         "touch_scan",
-        pdMS_TO_TICKS(SCAN_ON_ACTIVE_MS),
+        pdMS_TO_TICKS(SCAN_ON_MS),
         pdTRUE, /* 自动重载 */
         NULL,
         touch_scan_timer_cb);
@@ -813,7 +710,7 @@ esp_err_t touch_fpc_init(void)
         != pdPASS)
         ESP_LOGE(TAG, "创建探针任务失败");
 
-    ESP_LOGI(TAG, "触摸 FPC 已初始化（12 通道 v2 驱动 + 硬件链, 亮屏 50/20Hz + 息屏 20/2Hz, 探针独立任务）");
+    ESP_LOGI(TAG, "触摸 FPC 已初始化（12 通道 v2 驱动 + 硬件链, 亮屏恒 50Hz + 息屏 20/2Hz, 探针独立任务）");
     return ESP_OK;
 }
 
@@ -884,10 +781,10 @@ void touch_fpc_resume(void)
     if (err != ESP_OK)
         ESP_LOGW(TAG, "恢复硬件扫描失败 (%s) — 亮屏触摸会失灵", esp_err_to_name(err));
 
-    touch_auto_calibrate();
+    touch_log_hw_baseline();
     touch_note_activity();
     if (s_scan_timer) {
-        xTimerChangePeriod(s_scan_timer, pdMS_TO_TICKS(SCAN_ON_ACTIVE_MS), 0);
+        xTimerChangePeriod(s_scan_timer, pdMS_TO_TICKS(SCAN_ON_MS), 0);
         xTimerStart(s_scan_timer, 0);
     }
 }
