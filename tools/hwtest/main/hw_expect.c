@@ -58,6 +58,10 @@ const hw_es_reg_exp_t HW_EXP_ES_SEQ[] = {
     {0x15, 0x40, "ADC_15"},
     {0x37, 0x08, "DAC_37"},
     {0x45, 0x00, "GP_45"},
+    /* ★ 主工程在 esp_codec_dev_open 之后手动覆盖的一条 (es8311_drv.c:205):
+     * 库给 0x0D=0x01, 主工程改成 0x06 (VREF=1, VMID=normal)。
+     * 这是 hwtest 与主工程 codec 终态**唯一**的已知差异 (12 个 DAC 侧寄存器实测比对过) */
+    {0x0D, 0x06, "SYS_0D VREF/VMID (主工程覆盖)"},
 };
 const int HW_EXP_ES_SEQ_N = sizeof(HW_EXP_ES_SEQ) / sizeof(HW_EXP_ES_SEQ[0]);
 
@@ -74,7 +78,7 @@ const hw_es_reg_exp_t HW_EXP_ES_CMP[] = {
     {0x08, 0xFF, "CLK_08"},
     {0x0B, 0x00, "SYS_0B"},
     {0x0C, 0x00, "SYS_0C"},
-    {0x0D, 0x01, "SYS_0D"},
+    {0x0D, 0x06, "SYS_0D"},
     {0x0E, 0x02, "SYS_0E"},
     {0x10, 0x1F, "SYS_10"},
     {0x11, 0x7F, "SYS_11"},

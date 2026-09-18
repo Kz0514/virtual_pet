@@ -4,7 +4,7 @@
  *
  * 判定语义 (见 hw_report.h):
  *   PASS = 实测与期望一致      FAIL = 不一致 / 器件不应答
- *   SKIP = 条件不满足(无电池/未烧 assets/被开关关掉) —— 不算错
+ *   SKIP = 条件不满足(未烧 assets / 被开关关掉 / 通道没起来) —— 不算错
  *   WARN = 器件活着但数值不符预期(需人看一眼, 不判死)
  */
 #ifndef HW_EXPECT_H
@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-#define HW_FW_VERSION "hwtest-1.0"
+#define HW_FW_VERSION "hwtest-1.1"
 
 /* ═══ A. 系统 ═══ */
 #define HW_EXP_FLASH_BYTES (32u * 1024 * 1024) /* W25Q256 */
@@ -83,10 +83,17 @@ extern const int HW_EXP_PARTS_N;
 #define HW_EXP_QMC_ID 0x90
 #define HW_EXP_QMC_WIA_REG 0x0D /* 主工程驱动声称 0x31, 本硬件读回 0x00 → 只记录不判定 */
 
-/* BQ27220 合理性区间 (无电池时电压≈0 → SKIP) */
+/* ═══ C2. 加速度读数 (震动) ═══ */
+/* 静止时 |a| 必须就是重力 1g —— 这条同时验了"传感器在产出物理上说得通的数据"。
+ * 抖动只记录不判定: 手晃板子时它会抬起来, 静止时是本底噪声, 两者都正常。 */
+#define HW_EXP_ACCEL_SAMPLES 50   /* 采样笔数 (间隔 10ms → 500ms 窗口) */
+#define HW_EXP_ACCEL_MIN_G 0.70f  /* |a| 均值下/上限 */
+#define HW_EXP_ACCEL_MAX_G 1.30f
+
+/* BQ27220 合理性区间 (电压≈0 → FAIL: 电池是必需件) */
 #define HW_EXP_BAT_VOLT_MIN_MV 3000
 #define HW_EXP_BAT_VOLT_MAX_MV 4400
-#define HW_EXP_BAT_NOPACK_MV 1000 /* 低于此值判定"无电池" */
+#define HW_EXP_BAT_NOPACK_MV 1000 /* 低于此值算"读不到" */
 #define HW_EXP_BAT_TEMP_MIN_K 2400 /* 温度(0.1K) 合理区间: -33~87°C */
 #define HW_EXP_BAT_TEMP_MAX_K 3600
 
@@ -107,7 +114,10 @@ extern const int HW_EXP_MPU_REGS_N;
  *   {12288000,48000, pre_div=1, mult=1, adc_div=1, dac_div=1, fs=0, lrck_h=0, lrck_l=0xff,
  *    bclk_div=4, adc_osr=0x10, dac_osr=0x10}
  * ES8311 没有固定 ID 寄存器 (0xFD/0xFE/0xFF 是 CHIP ID/VERSION, 无文档值),
- * 所以身份判据 = 寄存器写进去能读回来 + ID 三连读稳定非全 0/全 FF。 */
+ * 所以身份判据 = 寄存器写进去能读回来 + ID 三连读稳定非全 0/全 FF。
+ * ★ 终点**不是**库的默认值: 主工程在 open 之后还手动覆盖了一条 0x0D=0x06 —
+ *   main/drivers/audio/es8311_drv.c:205, 注释 "VREF=1, VMID=normal"。
+ *   库给的是 0x01。复现主工程终态就必须照写这一条。 */
 typedef struct {
     uint8_t reg;
     uint8_t val;
@@ -129,6 +139,19 @@ extern const int HW_EXP_ES_CMP_N;
 #define HW_EXP_TOUCH_MIN_RAW 2000  /* 低于此值 = 通道没读数 (断线/未焊接) */
 #define HW_EXP_TOUCH_MAX_RAW 64000 /* 高于此值 = 打满/异常 */
 #define HW_EXP_TOUCH_SAMPLES 8
+
+/* ═══ F. 音频读数 ═══ */
+/* 麦克风挂在编解码器 ADC 侧。判定不能用宽带 RMS —— 室温噪声/人声/空调都会抬高它,
+ * 唯一确定的是"整窗一个样"(min==max) = ADC 没在采样。电平只报不判。 */
+#define HW_EXP_MIC_MS 300 /* 采一窗的时长 */
+
+/* 扬声器回采: 板子上喇叭和麦克风挨着 → "有没有出声"可以用声学回路自动判。
+ * 判据取 **单频** 而不是宽带电平: 房间噪声/说话/空调都抬高宽带能量,
+ * 只有这一个频点是**我们自己发出来的**。 */
+#define HW_EXP_SPK_TONE_HZ 440.0f     /* 播放/回采的单音频率 */
+#define HW_EXP_SPK_AMP 5000           /* 单音幅度 (LSB, 满 32767) ≈ -16dBFS */
+#define HW_EXP_SPK_VOL_REG 0xCC       /* ES8311 0x32 = DAC 音量; app 播 TTS 时写的就是这个值 */
+#define HW_EXP_SPK_LOOP_GAIN_MIN 4.0f /* 回采相对底噪的提升倍数下限 (先验值, 照结果回调没意义) */
 
 /* ═══ G. 马达 ═══ */
 #define HW_EXP_HAPTIC_DUTY_PCT 50

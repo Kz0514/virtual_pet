@@ -8,15 +8,18 @@
  * 已知测试假象 (i2c-bus-dead-board-2026-09 记录, 别当器件故障):
  *   ① HDC1080: i2c_master_transmit_receive(0x40, 0x00, 2) 在**两块板**上都 100% INVALID
  *      ⇒ 该读法本身不合法; 正确读法 = 写指针 → 延时 → 纯 receive (hdc1080.c:60-72)。
- *   ② BQ27220: 无电池时电压≈0mV 是测试台常态 ⇒ 不判 FAIL 只 SKIP。
+ *   ② BQ27220: 电压≈0mV 判 FAIL (电池是必需件, 不是"台上没插电池")。
  */
 #include "hw_devices.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "board.h"
+#include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
@@ -343,7 +346,7 @@ static void dev_opt3001(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * BQ27220 (0x55): DeviceType + 电池读数 (无电池 → SKIP)
+ * BQ27220 (0x55): DeviceType + 电池读数 (电压≈0 → FAIL)
  * ══════════════════════════════════════════════════════════════════════ */
 static esp_err_t bq_word(i2c_master_dev_handle_t dev, uint8_t cmd, uint16_t *out)
 {
@@ -390,7 +393,7 @@ static void dev_bq27220(void)
         hw_set(it, "标准命令读失败");
         hw_note(it, "0x55 应答但读数不通 → 总线/器件半死");
         hw_end(it, HW_ST_FAIL);
-        hw_skip("dev.bat", "电池读数", "读数不通");
+        hw_bad("dev.bat", "电池读数", "读数不通");
         return;
     }
 
@@ -405,7 +408,7 @@ static void dev_bq27220(void)
         hw_note(it, "数值不合理 (温度%u 需 %u~%u, 电压%u, SOC%u SOH%u) → 应答者不是活电量计",
                 tmp, HW_EXP_BAT_TEMP_MIN_K, HW_EXP_BAT_TEMP_MAX_K, volt, soc, soh);
         hw_end(it, HW_ST_FAIL);
-        hw_skip("dev.bat", "电池读数", "身份未确认");
+        hw_bad("dev.bat", "电池读数", "身份未确认");
         return;
     }
     hw_end(it, HW_ST_PASS);
@@ -415,9 +418,9 @@ static void dev_bq27220(void)
     hw_set(it, "电压=%umV SOC=%u%% SOH=%u%% 电流=%dmA 温度=%.1fC", volt, soc, soh, (int16_t)cur,
            (float)tmp / 10.0f - 273.15f);
     if (volt < HW_EXP_BAT_NOPACK_MV) {
-        /* 测试台常态: 没插电池; 也可能是 BGA 电压采样脚虚焊 → 先当 SKIP */
-        hw_note(it, "电压≈0 → 测试台上没有电池 (或 BAT/SRN 虚焊) — 不判 FAIL");
-        hw_end(it, HW_ST_SKIP);
+        /* 电池是必需件 → 读不到电芯电压就是故障 (BAT/SRN 没接上) */
+        hw_note(it, "电压≈0 (%umV < %umV) → BAT/SRN 没接上", volt, HW_EXP_BAT_NOPACK_MV);
+        hw_end(it, HW_ST_FAIL);
     } else if (volt < HW_EXP_BAT_VOLT_MIN_MV || volt > HW_EXP_BAT_VOLT_MAX_MV) {
         hw_note(it, "电压超出 %u~%umV", HW_EXP_BAT_VOLT_MIN_MV, HW_EXP_BAT_VOLT_MAX_MV);
         hw_end(it, HW_ST_FAIL);
@@ -503,11 +506,112 @@ static void dev_mpu6500(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ * MPU6500 加速度原始读数 (震动) —— dev.mpu6500 只验配置寄存器能回读,
+ * 从没读过一帧加速度: 器件半死/量程错/走线虚焊都能蒙过去。这里补上读数。
+ *
+ * 量程由 ACCEL_CONFIG(0x1C)[4:3] **现场决定**, 不写死 —— dev.mpu6500 写的是
+ * 0x08 (±4g, 8192 LSB/g), 但 app 启动后 DMP 会把它改成 ±2g/16384
+ * (inv_mpu.c:633 mpu_set_accel_fsr(2)); 本工程不跑 DMP, 但两套固件都会烧到这块板上,
+ * 照寄存器实际值算才不会被上一靴的残留带偏。
+ *
+ * 判定 = "静止时 |a| 就是重力 1g" —— 物理上说得通才算读数可信。
+ * ══════════════════════════════════════════════════════════════════════ */
+static float accel_lsb_per_g(uint8_t cfg)
+{
+    switch ((cfg >> 3) & 0x03) {
+    case 0: return 16384.0f; /* ±2g */
+    case 1: return 8192.0f;  /* ±4g ← dev.mpu6500 写的 0x08 */
+    case 2: return 4096.0f;  /* ±8g */
+    default: return 2048.0f; /* ±16g */
+    }
+}
+
+static int16_t be16(const uint8_t *p)
+{
+    return (int16_t)((uint16_t)(p[0] << 8) | p[1]);
+}
+
+static void dev_accel(void)
+{
+    hw_item_t *it = hw_begin("dev.accel", "加速度读数 (震动)");
+    if (!probe_at(MPU6500_I2C_ADDR)) {
+        hw_set(it, "0x%02X NACK", MPU6500_I2C_ADDR);
+        hw_note(it, "0x68 不在总线上 → 读不到加速度");
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+    i2c_master_dev_handle_t dev = open_at(MPU6500_I2C_ADDR, 400);
+    uint8_t cfg = 0;
+    if (!dev || rd_rr(dev, 0x1C, &cfg, 1) != ESP_OK) {
+        if (dev) close_at(dev);
+        hw_note(it, "ACCEL_CONFIG(0x1C) 读失败");
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+    float lsb = accel_lsb_per_g(cfg);
+
+    /* 500ms 窗口: CONFIG(0x1A)=0x04 → DLPF 21Hz, SMPLRT_DIV(0x19)=0x04 → 5ms 出新样本,
+     * 所以 10ms 一笔彼此独立 */
+    float buf[HW_EXP_ACCEL_SAMPLES][3];
+    int n = 0, rd_fail = 0, same = 1;
+    uint8_t prev[6] = {0};
+    float sx = 0, sy = 0, sz = 0;
+    for (int s = 0; s < HW_EXP_ACCEL_SAMPLES; s++) {
+        uint8_t r[6];
+        if (rd_rr(dev, 0x3B, r, 6) == ESP_OK) { /* ACCEL_XOUT_H .. ZOUT_L */
+            if (n && memcmp(r, prev, 6) != 0) same = 0;
+            memcpy(prev, r, 6);
+            buf[n][0] = (float)be16(r + 0) / lsb;
+            buf[n][1] = (float)be16(r + 2) / lsb;
+            buf[n][2] = (float)be16(r + 4) / lsb;
+            sx += buf[n][0];
+            sy += buf[n][1];
+            sz += buf[n][2];
+            n++;
+        } else {
+            rd_fail++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    close_at(dev);
+    if (n < HW_EXP_ACCEL_SAMPLES / 2) {
+        hw_set(it, "只读到 %d/%d 笔 (读失败 %d)", n, HW_EXP_ACCEL_SAMPLES, rd_fail);
+        hw_note(it, "加速度寄存器反复读失败 → 器件半死/走线");
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+
+    float mx = sx / (float)n, my = sy / (float)n, mz = sz / (float)n;
+    float mag = sqrtf(mx * mx + my * my + mz * mz);
+    /* 去重力后的峰值 = "震动幅度": 静止时只剩本底噪声, 手晃板子立刻抬起来
+     * (主工程 shake_detector.c:17 的起振门限是 0.18g, 可作对照) */
+    float peak = 0;
+    for (int i = 0; i < n; i++) {
+        float dx = buf[i][0] - mx, dy = buf[i][1] - my, dz = buf[i][2] - mz;
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d > peak) peak = d;
+    }
+    hw_set(it, "x=%+.2f y=%+.2f z=%+.2f |a|=%.2f g, 峰值抖动 %.3f g (%d 笔, %.0f LSB/g)",
+           mx, my, mz, mag, peak, n, lsb);
+
+    if (n > 1 && same) {
+        hw_note(it, "%d 笔原始值逐字节相同 → 读数冻结 (传感器没在更新)", n);
+        hw_end(it, HW_ST_FAIL);
+    } else if (mag < HW_EXP_ACCEL_MIN_G || mag > HW_EXP_ACCEL_MAX_G) {
+        hw_note(it, "|a|=%.2f g 偏离重力 1g (期望 %.2f~%.2f) → 量程/器件不对", mag,
+                HW_EXP_ACCEL_MIN_G, HW_EXP_ACCEL_MAX_G);
+        hw_end(it, HW_ST_FAIL);
+    } else {
+        hw_end(it, HW_ST_PASS);
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  * QMC6309 地磁: 挂 MPU6500 的 AUX, 靠 INT_PIN_CFG.BYPASS_EN 桥到主总线
  *
  * 贴装因板而异: 贴了 → 旁路打开后 **0x0C 应答** (reg 0x00 = 0x90, reg 0x0D = 0x00),
  *   主工程那个 0x2C 从不应答 (那一处驱动从没被调用过); 没贴 → 0x0C 与 0x2C 都 NACK。
- * → 两个地址都 NACK 判 SKIP (本板没装是正常的), 0x0C 应答才去读 ID。
+ * → 两个地址都 NACK 判 FAIL, 0x0C 应答才去读 ID。
  * (曾把"0x2C 有应答"当结论 —— 那是 add_device 不探总线造成的假象。)
  * ══════════════════════════════════════════════════════════════════════ */
 static void dev_qmc6309(void)
@@ -542,10 +646,9 @@ static void dev_qmc6309(void)
     if (!a_p && !a_alt) {
         hw_set(it, "INT_PIN_CFG=0x%02X(BYPASS_EN ✓), 0x%02X 与 0x%02X 均 NACK", cfg,
                HW_EXP_QMC_ADDR, HW_EXP_QMC_ADDR_ALT);
-        /* 贴装因板而异: 没贴的板两个地址都 NACK, app 也从不调 qmc6309_init
-         * → "不在总线上"不算错, 判 SKIP。真焊上了就该走下面的 ID 分支。 */
-        hw_note(it, "本板未贴装 6309; 若本板应贴装则人工确认");
-        hw_end(it, HW_ST_SKIP);
+        /* 检测不到 = 硬件错误 (未贴装 / 虚焊 / 旁路未接通) */
+        hw_note(it, "两个地址都 NACK → 总线上找不到 6309");
+        hw_end(it, HW_ST_FAIL);
         return;
     }
     uint8_t addr = a_p ? HW_EXP_QMC_ADDR : HW_EXP_QMC_ADDR_ALT;
@@ -587,14 +690,364 @@ void hw_devices_run(void)
     dev_opt3001();
     dev_bq27220();
     dev_mpu6500();
+    dev_accel();
     dev_qmc6309();
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * F 段: 音频通路 (不出声)
- *   ① I2S 通道建立 + 使能 → MCLK 12.288MHz 真的跑起来 (app 6.45s 干的就是这件事)
- *   ② 时钟上电后编解码器寄存器是否仍一致 (半死 codec 在这里最容易露)
- *   ③ 麦克风侧只读"有无采样在流动", 不判音量
+ * F 段 · 麦克风读数
+ *
+ * 麦克风的数据挂在编解码器 ADC 侧, 从 I2S DIN(GPIO16) 回来。采样是**交错立体声**
+ * (本段建的是 STEREO, 不是主工程播放用的 MONO) → 两个槽分别统计, 判在响的那个,
+ * 因为"哪个槽装麦克风"取决于 codec 侧寄存器, 不写死。
+ *
+ * 判定只认"整窗 min==max"= ADC 没在采样 (静音/未贴装/半死)。**电平不参与判定**:
+ * 房间噪声、人声、空调都能把 RMS 抬起来, 拿绝对电平卡阈值会把环境当故障。
+ * ══════════════════════════════════════════════════════════════════════ */
+#define MIC_CHUNK_FRAMES 480 /* 10ms 一块: 一块一收, 不撑爆 RX 那 30ms 的 DMA 深度 */
+#define MIC_FRAMES (AUDIO_SAMPLE_RATE * HW_EXP_MIC_MS / 1000)
+#define MIC_BYTES (MIC_FRAMES * 4) /* 2 槽 × 16bit */
+#define TWO_PI 6.283185307179586f  /* 不倚赖 M_PI (newlib 要看特性开关) */
+
+/* 单频检波 (Goertzel): 只算一个频点, 比整段 FFT 便宜得多。
+ * 整窗 14400 帧 @48kHz 时 440Hz 正好 132 个周期 —— **整数周期 → 该格无频谱泄漏**,
+ * 归一化后的幅度可以直接和采样幅度 (LSB) 比。 */
+typedef struct {
+    float cw, s1, s2;
+} goertzel_t;
+
+static void go_init(goertzel_t *g, float freq, float fs)
+{
+    g->cw = 2.0f * cosf(TWO_PI * freq / fs);
+    g->s1 = 0.0f;
+    g->s2 = 0.0f;
+}
+
+static void go_step(goertzel_t *g, float x)
+{
+    float s0 = x + g->cw * g->s1 - g->s2;
+    g->s2 = g->s1;
+    g->s1 = s0;
+}
+
+/* 归一成"振幅 (LSB)": 整数周期窗上纯音的 mag = A·N/2 */
+static float go_amp(const goertzel_t *g, int n)
+{
+    float m2 = g->s1 * g->s1 + g->s2 * g->s2 - g->cw * g->s1 * g->s2;
+    return (m2 > 0.0f && n > 0) ? sqrtf(m2) / ((float)n * 0.5f) : 0.0f;
+}
+
+typedef struct {
+    int frames;
+    float rms[2], peak[2], dc[2]; /* 交流 RMS / 峰值 / 直流偏置 (LSB) */
+    float tone[2];                /* 单音频点处的振幅 (LSB), 整数周期归一 */
+    int frozen[2];                /* 该槽整窗 min==max */
+} mic_win_t;
+
+static void mic_analyze(const uint8_t *buf, int frames, mic_win_t *w)
+{
+    double sum[2] = {0, 0}, sq[2] = {0, 0};
+    int mn[2] = {32767, 32767}, mx[2] = {-32768, -32768};
+    goertzel_t g[2];
+    for (int c = 0; c < 2; c++) go_init(&g[c], HW_EXP_SPK_TONE_HZ, (float)AUDIO_SAMPLE_RATE);
+    for (int i = 0; i < frames; i++) {
+        for (int c = 0; c < 2; c++) {
+            int16_t v = (int16_t)((uint16_t)buf[i * 4 + c * 2] |
+                                  ((uint16_t)buf[i * 4 + c * 2 + 1] << 8));
+            sum[c] += v;
+            sq[c] += (double)v * (double)v;
+            if (v < mn[c]) mn[c] = v;
+            if (v > mx[c]) mx[c] = v;
+            go_step(&g[c], (float)v);
+        }
+    }
+    w->frames = frames;
+    for (int c = 0; c < 2; c++) {
+        double dc = sum[c] / (double)frames;
+        double ac = sq[c] / (double)frames - dc * dc;
+        w->dc[c] = (float)dc;
+        w->rms[c] = (ac > 0.0) ? (float)sqrt(ac) : 0.0f;
+        w->peak[c] = (float)((mx[c] > -mn[c]) ? mx[c] : -mn[c]);
+        w->frozen[c] = (mn[c] == mx[c]);
+        w->tone[c] = go_amp(&g[c], frames);
+    }
+}
+
+/* 采一窗 (不播放时用), 返回实际收到的帧数 */
+static int mic_fill_quiet(i2s_chan_handle_t rx, uint8_t *buf, int frames)
+{
+    int got_frames = 0;
+    while (got_frames < frames) {
+        int want = frames - got_frames;
+        if (want > MIC_CHUNK_FRAMES) want = MIC_CHUNK_FRAMES;
+        size_t got = 0;
+        if (i2s_channel_read(rx, buf + (size_t)got_frames * 4, (size_t)want * 4, &got, 300) !=
+            ESP_OK)
+            break;
+        if (got == 0) break;
+        got_frames += (int)(got / 4);
+    }
+    return got_frames;
+}
+
+static void audio_mic(i2s_chan_handle_t rx)
+{
+    hw_item_t *it = hw_begin("audio.mic", "麦克风读数");
+    uint8_t *buf = heap_caps_malloc(MIC_BYTES, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        hw_note(it, "采样缓冲分配失败 (PSRAM)");
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+    int n = mic_fill_quiet(rx, buf, MIC_FRAMES);
+    if (n < MIC_FRAMES / 2) {
+        hw_set(it, "只收到 %d/%d 帧", n, MIC_FRAMES);
+        hw_note(it, "I2S 读不到采样 → 编解码器 ADC 侧没出数");
+        hw_end(it, HW_ST_FAIL);
+        heap_caps_free(buf);
+        return;
+    }
+    mic_win_t w;
+    mic_analyze(buf, n, &w);
+    heap_caps_free(buf);
+    hw_set(it, "左 RMS %.1f 峰 %.0f DC %+.0f | 右 RMS %.1f 峰 %.0f DC %+.0f (%.0fms)", w.rms[0],
+           w.peak[0], w.dc[0], w.rms[1], w.peak[1], w.dc[1],
+           (float)n * 1000.0f / (float)AUDIO_SAMPLE_RATE);
+    if (w.frozen[0] && w.frozen[1]) {
+        hw_note(it, "两个槽整窗恒定 → ADC 没在采样 (麦克风未贴装/静音/半死)");
+        hw_end(it, HW_ST_FAIL);
+    } else {
+        hw_end(it, HW_ST_PASS);
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * F 段 · 扬声器回采 —— 本工程**唯一出声**的地方 (300ms 一声), 其余全程静音。
+ *
+ * 喇叭和麦克风挨着 → "有没有出声"可以用声学回路自动判, 不必等人耳。
+ * 判据 = 播放前后**自己比自己** (静音底噪 vs 播放中) 在同一单音频点上的提升倍数,
+ * 所以房间本来多吵不影响结论, 也不需要事先标定麦克风灵敏度。
+ *
+ * ⚠️ DAC 音量/静音 (0x31/0x32) 本段之前从没写过 —— 缺省值不可控, 不写就可能是静音。
+ *    音量取 app 播 TTS 时用的那个寄存器值, 验的就是真实播放配置。
+ * ══════════════════════════════════════════════════════════════════════ */
+static void amp_enable(bool on)
+{
+    static bool cfg_done = false;
+    if (!cfg_done) {
+        gpio_config_t pc = {
+            .pin_bit_mask = 1ULL << (int)AUDIO_AMP_EN_IO,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_ENABLE, /* 同 es8311_drv.c:58 */
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&pc);
+        cfg_done = true;
+    }
+    gpio_set_level(AUDIO_AMP_EN_IO, on ? 1 : 0);
+}
+
+/* 把 RX DMA 里积压的旧数据读掉: RX 有 30ms 深, 不清的话回采窗口开头
+ * 混进播放前的静音, 把提升倍数拉低 */
+static void mic_drain(i2s_chan_handle_t rx, uint8_t *buf)
+{
+    for (int i = 0; i < 4; i++) {
+        size_t got = 0;
+        if (i2s_channel_read(rx, buf, MIC_CHUNK_FRAMES * 4, &got, 100) != ESP_OK) break;
+    }
+}
+
+/* DAC 侧寄存器实况 —— 只读, 不判死。
+ * 这 12 个是主工程 es8311_drv.c 会写、HW_EXP_ES_SEQ 不写的 (0x09/0x0A 串口格式、
+ * 0x0D VREF/VMID 等), 看初始化把片子留在什么状态。
+ * ★ 结果走 hw_set 报出 —— 复位后前段串口的日志收不到 (见 run.py)。 */
+static void audio_dacreg(void)
+{
+    hw_item_t *it = hw_begin("audio.dacreg", "ES8311 DAC 侧寄存器");
+    i2c_master_dev_handle_t dev = open_at(ES8311_I2C_ADDR, 400);
+    if (!dev) {
+        hw_set(it, "0x18 打不开");
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+    uint8_t dr[12];
+    int bad = 0;
+    static const uint8_t dbg[12] = {0x09, 0x0A, 0x0D, 0x12, 0x13,
+                                    0x14, 0x1B, 0x1C, 0x31, 0x32, 0x37, 0x44};
+    for (int i = 0; i < 12; i++) {
+        if (rd_rr(dev, dbg[i], &dr[i], 1) != ESP_OK) {
+            dr[i] = 0;
+            bad++;
+        }
+    }
+    close_at(dev);
+    hw_set(it, "09=%02X 0A=%02X 0D=%02X 12=%02X 13=%02X 14=%02X "
+               "1B=%02X 1C=%02X 31=%02X 32=%02X 37=%02X 44=%02X",
+           dr[0], dr[1], dr[2], dr[3], dr[4], dr[5], dr[6], dr[7], dr[8], dr[9], dr[10], dr[11]);
+    if (bad) {
+        hw_note(it, "%d 个寄存器读失败", bad);
+        hw_end(it, HW_ST_FAIL);
+    } else {
+        hw_end(it, HW_ST_PASS);
+    }
+}
+
+/* 功放使能脚 (TPA2011D1, 高有效) —— 只验 MCU 侧驱动得起这根脚, 不验功放芯片。
+ * 读法照 haptic.en: 驱动低/高各读回一次, 再当输入看悬空电位。 */
+static void audio_pa(void)
+{
+    hw_item_t *it = hw_begin("audio.pa", "功放使能脚");
+    /* ★ 要读回就得 INPUT_OUTPUT: GPIO_MODE_OUTPUT 关掉了输入通路,
+     * gpio_get_level() 恒返回 0 (看着像脚被钉死在低电平)。 */
+    gpio_config_t oc = {.pin_bit_mask = 1ULL << (int)AUDIO_AMP_EN_IO,
+                        .mode = GPIO_MODE_INPUT_OUTPUT,
+                        .pull_up_en = GPIO_PULLUP_DISABLE,
+                        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+                        .intr_type = GPIO_INTR_DISABLE};
+    gpio_config(&oc);
+    gpio_set_level(AUDIO_AMP_EN_IO, 0);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    int lo = gpio_get_level(AUDIO_AMP_EN_IO);
+    gpio_set_level(AUDIO_AMP_EN_IO, 1);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    int hi = gpio_get_level(AUDIO_AMP_EN_IO);
+
+    /* 悬空电位: 当输入, 内部上拉/下拉各读一次 —— 分辨线被外部拉死还是 pad 自己的问题 */
+    gpio_config_t ic = oc;
+    ic.mode = GPIO_MODE_INPUT;
+    ic.pull_up_en = GPIO_PULLUP_ENABLE;
+    ic.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&ic);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    int pu = gpio_get_level(AUDIO_AMP_EN_IO);
+    ic.pull_up_en = GPIO_PULLUP_DISABLE;
+    ic.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    gpio_config(&ic);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    int pd = gpio_get_level(AUDIO_AMP_EN_IO);
+
+    gpio_config(&oc); /* 还原成输出: 后面 audio_spk 还要拉它 */
+    gpio_set_level(AUDIO_AMP_EN_IO, 0);
+
+    hw_set(it, "GPIO%d 驱动 低=%d 高=%d | 悬空 上拉=%d 下拉=%d (期望 0/1 | 1/0)",
+           (int)AUDIO_AMP_EN_IO, lo, hi, pu, pd);
+    /* 只报实测, 不替硬件下结论 */
+    if (lo == 0 && hi == 1) {
+        hw_end(it, HW_ST_PASS);
+    } else if (lo == 1 && hi == 1) {
+        hw_note(it, "驱动低也读回 1 = 线上一直有高电平, 软件控不住这根脚");
+        hw_end(it, HW_ST_FAIL);
+    } else {
+        hw_note(it, "驱动跟读回对不上 (悬空时 上拉=%d 下拉=%d)", pu, pd);
+        hw_end(it, HW_ST_FAIL);
+    }
+}
+
+static void audio_spk(i2s_chan_handle_t tx, i2s_chan_handle_t rx)
+{
+    hw_item_t *it = hw_begin("audio.spk", "扬声器回采");
+    uint8_t *buf = heap_caps_malloc(MIC_BYTES, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        hw_note(it, "采样缓冲分配失败 (PSRAM)");
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+
+    /* ① 静音底噪 */
+    amp_enable(false);
+    mic_drain(rx, buf);
+    int n0 = mic_fill_quiet(rx, buf, MIC_FRAMES);
+    if (n0 < MIC_FRAMES / 2) {
+        hw_set(it, "静音段只收到 %d/%d 帧", n0, MIC_FRAMES);
+        hw_note(it, "还没播放就收不到采样 → 先修麦克风那一项");
+        hw_end(it, HW_ST_FAIL);
+        heap_caps_free(buf);
+        return;
+    }
+    mic_win_t q;
+    mic_analyze(buf, n0, &q);
+
+    /* ② 写 DAC 音量 + 解静音 (0x31 = 静音, 0x32 = 音量) */
+    i2c_master_dev_handle_t dev = open_at(ES8311_I2C_ADDR, 400);
+    uint8_t mt = 0;
+    bool dac_ok = (dev != NULL);
+    if (dev) {
+        dac_ok &= (rd_rr(dev, 0x31, &mt, 1) == ESP_OK);
+        dac_ok &= (wr_r(dev, 0x31, (uint8_t)(mt & 0x9F)) == ESP_OK); /* 清 bit5/bit6 */
+        dac_ok &= (wr_r(dev, 0x32, HW_EXP_SPK_VOL_REG) == ESP_OK);
+        close_at(dev);
+    }
+
+    /* ③ 边推边收 —— RX 的 DMA 只有 30ms 深, 不边收必然溢出丢数据 */
+    amp_enable(true);
+    vTaskDelay(pdMS_TO_TICKS(30)); /* 等功放上电稳住 */
+    const float step = TWO_PI * HW_EXP_SPK_TONE_HZ / (float)AUDIO_SAMPLE_RATE;
+    float phase = 0.0f;
+    int n1 = 0, chunks = MIC_FRAMES / MIC_CHUNK_FRAMES;
+    bool wr_ok = true;
+    size_t pushed = 0;
+    for (int c = 0; c < chunks; c++) {
+        int16_t pcm[MIC_CHUNK_FRAMES * 2];
+        for (int i = 0; i < MIC_CHUNK_FRAMES; i++) {
+            int idx = c * MIC_CHUNK_FRAMES + i;
+            /* 头 20ms 淡入: 直接起音会在功放上打出一个爆音 */
+            float env = (idx < 960) ? ((float)idx / 960.0f) : 1.0f;
+            int16_t v = (int16_t)(sinf(phase) * (float)HW_EXP_SPK_AMP * env);
+            pcm[i * 2] = v;
+            pcm[i * 2 + 1] = v; /* 两槽同数据: app 的 MONO 槽模式硬件也是这么复制的 */
+            phase += step;
+            if (phase > TWO_PI) phase -= TWO_PI;
+        }
+        size_t w = 0;
+        if (i2s_channel_write(tx, pcm, sizeof(pcm), &w, 500) != ESP_OK || w != sizeof(pcm))
+            wr_ok = false;
+        pushed += w;
+        size_t r = 0;
+        if (i2s_channel_read(rx, buf + (size_t)n1 * 4, MIC_CHUNK_FRAMES * 4, &r, 500) == ESP_OK)
+            n1 += (int)(r / 4);
+    }
+    amp_enable(false); /* 交出去时功放必须是关的 */
+
+    mic_win_t p;
+    mic_analyze(buf, (n1 > 0) ? n1 : 1, &p);
+    heap_caps_free(buf);
+
+    int ci = (p.tone[1] > p.tone[0]) ? 1 : 0; /* 判在响的那个槽 */
+    float base = q.tone[ci], got = p.tone[ci];
+    /* +1 平滑: 底噪可能恰好为 0, 直接相除会爆 */
+    float gain = (got + 1.0f) / (base + 1.0f);
+    /* 宽带 RMS 一并报: 单频不动而宽带抬 = 在响但不是这个频点; 两个都不动 = 没出声 */
+    float rq = (q.rms[0] + q.rms[1]) * 0.5f, rp = (p.rms[0] + p.rms[1]) * 0.5f;
+    hw_set(it, "440Hz 底噪 %.1f → 播放中 %.1f (%.1f 倍); 宽带RMS %.1f → %.1f, 推 %u 字节 %s",
+           base, got, gain, rq, rp, (unsigned)pushed, dac_ok ? "" : "[DAC 寄存器写失败]");
+
+    if (!dac_ok) {
+        hw_note(it, "0x18 的 DAC 音量/静音寄存器写不进去 → 播放通路配置失败");
+        hw_end(it, HW_ST_FAIL);
+    } else if (!wr_ok) {
+        hw_note(it, "I2S TX 没推完 (%u 字节) → 播放通路不通", (unsigned)pushed);
+        hw_end(it, HW_ST_FAIL);
+    } else if (n1 < MIC_FRAMES / 2) {
+        hw_note(it, "回采只收到 %d/%d 帧 → 麦克风没在收", n1, MIC_FRAMES);
+        hw_end(it, HW_ST_FAIL);
+    } else if (gain < HW_EXP_SPK_LOOP_GAIN_MIN) {
+        hw_note(it, "回采无提升 (<%.1f 倍) → 功放/喇叭没响 (或麦克风收不到)",
+                HW_EXP_SPK_LOOP_GAIN_MIN);
+        hw_end(it, HW_ST_FAIL);
+    } else {
+        hw_end(it, HW_ST_PASS);
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * F 段: 音频通路
+ *   ① I2S 通道建立 + 使能 → MCLK 12.288MHz 真的跑起来
+ *   ② 麦克风读数 — 判定只认"没在采样", 电平只报不判
+ *   ③ DAC 侧寄存器实况 — 只读
+ *   ④ 功放使能脚 — 只验 MCU 侧推得动这根脚, 不验功放芯片
+ *   ⑤ 扬声器回采 — 放一声 440Hz, 用麦克风验"真出声了"
+ *   ⑥ 编解码器寄存器是否仍一致 (半死 codec 在这里最容易露)
  * ══════════════════════════════════════════════════════════════════════ */
 void hw_audio_run(void)
 {
@@ -628,14 +1081,15 @@ void hw_audio_run(void)
     esp_err_t e2 = i2s_channel_init_std_mode(rx, &std_cfg);
     esp_err_t e3 = i2s_channel_enable(tx);
     esp_err_t e4 = i2s_channel_enable(rx);
+    bool i2s_up = (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK && e4 == ESP_OK);
     hw_set(it, "%dHz 全双工 init=%s/%s en=%s/%s", AUDIO_SAMPLE_RATE, esp_err_to_name(e1),
            esp_err_to_name(e2), esp_err_to_name(e3), esp_err_to_name(e4));
-    if (e1 != ESP_OK || e2 != ESP_OK || e3 != ESP_OK || e4 != ESP_OK) {
+    if (!i2s_up) {
         hw_note(it, "I2S 通道建立/使能失败");
         hw_end(it, HW_ST_FAIL);
     } else {
-        /* 读 200ms 采样: 只要有数据流回来即证明 MCLK/BCLK/LRCK/DIN 通路在跑;
-         * 全 0 也可能是"没焊麦克风", 只记录不判 */
+        /* 通道起来的粗验: 有数据流回来即证明 MCLK/BCLK/LRCK/DIN 通路在跑。
+         * 电平/冻结的细判在 audio.mic (读法太糙, 放这儿会把"没焊麦克风"混进来) */
         size_t want = 4096;
         static uint8_t buf[4096];
         size_t got = 0;
@@ -652,7 +1106,22 @@ void hw_audio_run(void)
         }
     }
 
-    /* ② 时钟跑着的时候复读编解码器寄存器 */
+    /* 功放使能脚和 I2S 无关, 先单独验 */
+    audio_pa();
+
+    /* ②③④ 麦克风读数 / DAC 侧寄存器实况 / 扬声器回采
+     * (通道没起来就别重复报 FAIL, 记 SKIP) */
+    if (i2s_up) {
+        audio_mic(rx);
+        audio_dacreg(); /* 播放之前的状态: audio.spk 会改 0x31/0x32, 得先读 */
+        audio_spk(tx, rx);
+    } else {
+        hw_skip("audio.mic", "麦克风读数", "I2S 通道没起来");
+        hw_skip("audio.dacreg", "ES8311 DAC 侧寄存器", "I2S 通道没起来");
+        hw_skip("audio.spk", "扬声器回采", "I2S 通道没起来");
+    }
+
+    /* ④ 时钟跑着的时候复读编解码器寄存器 */
     hw_item_t *it2 = hw_begin("audio.codec", "MCLK 下的 ES8311 回读");
     bool ok = hw_devices_es_verify("audio.codec");
     hw_set(it2, "回读 %s (MCLK %uHz 在跑)", ok ? "全部一致" : "有偏差", (unsigned)AUDIO_MCLK_HZ);
