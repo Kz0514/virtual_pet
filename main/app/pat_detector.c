@@ -53,6 +53,7 @@ static uint32_t s_last_engine_tick; /* 最近一次 pet_engine 触发时刻 */
 static void pat_begin(uint32_t now)
 {
     s_active = true;
+    touch_fpc_set_pat_active(true); /* 冻住抑制回路 — 摸头期间顶条是真动作 */
     ESP_LOGI(TAG, "滑动摸头 — motou 循环");
     pet_avatar_set_hold(true);
     pet_avatar_play_fast(PET_ANIM_PATHEAD);
@@ -67,6 +68,7 @@ static void pat_begin(uint32_t now)
 static void pat_end(const char *why)
 {
     s_active = false;
+    touch_fpc_set_pat_active(false); /* 松开抑制闸 — 含设置页 set_enabled(false) 路径 */
     ESP_LOGI(TAG, "%s — motou 结束", why);
     pet_avatar_set_hold(false);
     pet_avatar_play_fast(PET_ANIM_IDLE);

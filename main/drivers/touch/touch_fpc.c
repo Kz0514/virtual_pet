@@ -90,6 +90,78 @@ static uint32_t s_thr_hw[TOUCH_CH_COUNT] = {0};
 static int32_t s_peak[TOUCH_CH_COUNT] = {0};
 static uint32_t s_next_peak = 0; /* 下次打印峰值的时刻 (init 里置初值) */
 
+/* ── 噪声平均数抑制 (抑制回路) ──
+ * 症状: 环境近场 (手/导体停在设备左侧) 把 CH1 顶到阈值上下, 越阈 → 滑条自
+ * 触发; 同时 filtered > 250 让 main.c 的 contacted 恒真 → 屏幕不熄。它不是
+ * 全局噪声 (12 通道一起动), 是**局部偏置**: CH1 的 d 有近半的帧落在 0 以下,
+ * 均值却明显为正, 而且是双峰不是零均值单峰 —— 有一个"抬起来就没落下"
+ * 的直流分量, 那正是可以吸收掉的部分。
+ *
+ * 做法: 每通道维护一个慢 EMA (s_supp), 判定改用 d = draw − supp。
+ *
+ * ── 闸: 谁的动作不许被吸收 ──
+ * 判定层已认定是动作的通道当帧就冻住 supp: 左键 (touched[0])、右滑条
+ * (touched[6..11])、摸头 (pat_detector_is_active)。**被闸的动作不参与下面
+ * 那条余量约束** —— 判定层翻 touched 只要 2 帧, 一个硬件样本 (60ms) 就跑完,
+ * 闸合上前吸收量可忽略。所以 τ 能取到 3s 而不伤 CH0 的 10s 长按 (无闸时
+ * τ=3s 会把 10s 长按的吸收量推过余量线, 有闸就不成立)。
+ * 顶部滑条不能按 touched 闸 —— 近场本身就把 CH1 顶成 touched, 闸上就是永久
+ * 锁死, 抑制再没有机会吸收它自己。摸头闸走的是"手指在有规律地来回动"这个
+ * 语义, 与近场 (手停在旁边、单通道直流) 不重合, 所以可以加; 它同时覆盖顶条
+ * 滑动 —— SWIPE_THRESHOLD 0.3 > PAT_MIN_STROKE 0.20, 任何够得上滑动的位移
+ * 都已先把摸头点亮。唯一的缝在**第一笔** (摸头要等第一段行程完成才 pat_begin)
+ * 与设置页 (那里 pat_detector_set_enabled(false) 主动关掉摸头, 闸跟着关) ——
+ * 两处的单通道驻留都是百毫秒级, 见下。
+ *
+ * ── τ: 约束只剩没被闸住的顶条短动作 ──
+ * travel = (S − supp)(1−e^(−T/τ)) < 余量 = 按压峰 − 阈值。
+ * 实测顶条按压峰对阈值的余量约四成:
+ *   顶条轻点 (tap 上限 500ms) : T=0.5  → travel 吃掉余量的 ~1/2  ✓
+ *   滑动单通道驻留            : T=0.15 → travel ~1/6            ✓
+ *   顶条停住 ≥1.1s            : travel 吃掉整个余量 — 但顶条没有长按 (SWIPE 在
+ *                               位移当帧就发, TAP 只在 release 且 hold<500ms),
+ *                               这个动作不产生任何手势, 绷紧不兑现成误判
+ * τ=10s 时这三条余量大得多, 代价是**回路跟不上近场自己的脉冲**: 近场是
+ * 0.2~0.8s 高/低相位交替的脉冲串, τ ≫ 脉宽时 supp 只能停在全窗均值 (DC) 上,
+ * 峰的过冲原样放过去 —— 实测原始峰仍压在阈值线上, 抑制只削掉了直流那一份。
+ * τ=3s 是要让 supp 跟得上单个脉冲, 把过冲
+ * 也吃掉; 这一条是**本轮要验证的假设**, 不是已证结论 (若波形其实是占空比很低的
+ * 稀疏脉冲, 低相位会把 supp 拽回去, τ=3s 的收益会远小于按阶跃估的值)。
+ *
+ * 单向不对称: "压过头"的回收不跟"升"共用曲线。近场是 20% 占空比的脉冲
+ * (高相位 0.12~0.8s, 低相位更长), 回收若直接加快, supp 会在低相位里被清空
+ * → supp 停在 0 而不是停在偏置上, 抑制全废 (回收时间常数至少要覆盖脉冲串
+ * 低相位的典型长度才站得住)。
+ * 故回收分两支:
+ *   慢支 (默认): 对称 EMA, 覆盖 Δ ≤ 120 这一段 —— 它保证 supp 收敛到 mean
+ *               本身, 而不是停在某个量化台阶上
+ *   快支 (Δ > 120 且连续 ≥10 帧): 只有"搭手抬起"这类真事件够得着 (搭手时
+ *               Δ 远超 120 且**持续**; 近场的低相位最深也只擦到 120 附近,
+ *               且出现得稀疏, 凑不齐 10 连帧)。快支速率**正比于 Δ** —— 差得
+ *               多就走得快, 快到位就自己慢下来, 不过头 (过头 = 抑制丢多了,
+ *               滑条又自触发)。
+ *
+ * 尺度自洽: supp 收敛到各通道自己的均值, 各花各的余量, 不需要按通道调参。
+ * 实测稳态呈左高右低的梯度 (大焊盘吸得多, 边缘通道趋近 0)。
+ * **CH11 例外: 稳态吸收量长期不回落** —— 它被闸 (右滑条) 从不参与判定,
+ * 所以闸合不上也退不掉, 是真偏置不是手指。量级已到该通道阈值的四成, 一旦
+ * 扩散到 CH10 就会把右滑条削钝, 留观。
+ *
+ * 回滚杆: TOUCH_SUPP_ENABLE 置 0 → 判定退回 d = draw, 与加回路前逐位一致。 */
+#define TOUCH_SUPP_ENABLE      1
+#define TOUCH_SUPP_Q           256 /* 定点: 256 = 1 count (纯整数除法会把慢支截断成 0) */
+#define TOUCH_SUPP_RISE_N      150 /* 慢支 N: τ = N / 50Hz = 3s (下限由顶条约束定, 见上) */
+#define TOUCH_SUPP_FALL_N      50  /* 快支 N: τ = 1s (再乘 Δ 的比例 → 自限) */
+#define TOUCH_SUPP_DROP_THR    120 /* 幅度门: Δ = supp − draw 超过此值才算"压过头" */
+#define TOUCH_SUPP_DROP_FRAMES 10  /* 时间门: 连续满足幅度门的帧数 (0.2s @50Hz)。
+                                      不能更长 —— 近场 burst 每约 0.4s 把低相位
+                                      打断一次, 门比它长就永远触发不了 */
+static int32_t s_supp_q8[TOUCH_CH_COUNT] = {0};  /* 已吸收的偏置 (Q8 定点, ≥0) */
+static uint8_t s_drop_run[TOUCH_CH_COUNT] = {0}; /* 快支时间门计数 */
+/* 摸头闸 (pat_detector 置位, 见上「闸」段)。volatile: 写方在 LVGL 任务
+ * (pat_detector 的 20ms 轮询), 读方在扫描定时器上下文, 两边都不持锁 */
+static volatile bool s_supp_gate_pat = false;
+
 /* ── 判定: 软件 Schmitt + 连续帧去抖 ──
  * 输入仍是硬件濾波后的 smooth 与 benchmark (IIR_2 / IIR_16 + denoise 带),
  * 只是把最后一步"比较 + 去抖"从硬件拿回软件。原因 (2b 实测):
@@ -236,6 +308,20 @@ static bool s_oneshot_failed = false; /* oneshot 失败沿 — 只报一次, 免
 #define PROBE_HIT_WINDOW_MS 150   /* 两命中必须在此窗内 — 漂移越阈(间隔秒级)凑不齐 */
 #define PROBE_MAX_CHANNELS 10
 
+/** 摸头活动状态 (pat_detector 在进入/退出摸头时通知) — 顶条往返滑动期间
+ * 冻住抑制回路。app → driver 单向通知, 避免 driver #include app 的反向依赖。 */
+void touch_fpc_set_pat_active(bool on) { s_supp_gate_pat = on; }
+
+/* 判定用 d = smooth − benchmark − 已吸收偏置。亮屏判定 / 息屏探针复判 / 抑制
+ * 回路必须共用同一把尺子 —— 两边各写一份是"息屏与亮屏灵敏度对不上"的老病根。
+ * 息屏期 s_supp_q8 是冻结的 (回路只走亮屏路径推它), 即"入睡那一刻吸收了多少
+ * 就扣多少" —— 近场偏置不会因为睡着就假装不存在, 也不会在睡眠里被继续吃掉。
+ * ⚠ 扫描循环里是展开写的 (它还要拿 draw 和 supp 各自去推回路), 改这里要同步改那里 */
+static inline int32_t touch_d_supp(int i)
+{
+    return (int32_t)s_ts.raw[i] - (int32_t)s_ts.bm[i] - s_supp_q8[i] / TOUCH_SUPP_Q;
+}
+
 /* ── 单次扫描 (亮屏定时器回调与息屏探针共用; 亮屏固定 50Hz, 息屏由探针自定节拍) ──
  * sleep_path: 息屏探针路径 — 该路径不落盘判定 (见下方 s_deb 归零),
  * 唤醒与否全由探针独立复判 */
@@ -244,6 +330,13 @@ static void touch_scan_once(bool sleep_path)
     uint32_t now = xTaskGetTickCount();
     int n_dev = 0;
     bool near = false;
+
+    /* 抑制闸: 判定层已认定是动作的通道不让回路吸收 (理由见 TOUCH_SUPP_* 注释块)。
+     * 取的是**上一帧**的 touched —— 跨 12 通道用同一份快照, 免得循环走到一半
+     * 混进本帧刚翻过来的状态; 20ms 陈旧对本回路无影响 */
+    bool supp_gate = s_supp_gate_pat || s_ts.touched[0];
+    for (int i = TOUCH_TOP_CH_COUNT + 1; i < TOUCH_CH_COUNT; i++)
+        supp_gate |= s_ts.touched[i];
     /* 息屏期判定不落盘 — 唤醒判定由探针独立复判 (smooth−benchmark 对
      * active_thresh, 无保活) 承担, scan 侧只维护 touched/filtered/质心。
      * 免疫窗由探针端裁决 (touch_fpc_sleep_probe), 扫描侧不施加窗口 */
@@ -262,12 +355,41 @@ static void touch_scan_once(bool sleep_path)
         if (touch_channel_read_data(s_chan[i], TOUCH_CHAN_DATA_TYPE_BENCHMARK, &bm) == ESP_OK)
             s_ts.bm[i] = bm;
 
-        /* d = smooth − benchmark — 与硬件判定 (active_thresh) 同量纲同符号,
-         * 所以 filtered/质心/活动判定/对外诊断看到的就是硬件拿来比较的那个量。
+        /* draw = smooth − benchmark — 与硬件判定 (active_thresh) 同量纲同符号。
          * ESP32-S3: 触摸时该值上升 */
-        int32_t d = (int32_t)s_ts.raw[i] - (int32_t)s_ts.bm[i];
+        int32_t draw = (int32_t)s_ts.raw[i] - (int32_t)s_ts.bm[i];
+
+        /* ── 抑制回路 (见 TOUCH_SUPP_* 注释块) ──
+         * 喂进去的是**未抑制的** draw: 喂 d 会让 supp 收敛到 mean/2 (自反馈
+         * 每轮再砍一半)。只走亮屏路径 —— 息屏探针 2~20Hz, 时间常数会和亮屏
+         * 差一个量级, 两条路径共用 s_supp 但只有亮屏推它 */
+        int32_t supp = s_supp_q8[i] / TOUCH_SUPP_Q;
+#if TOUCH_SUPP_ENABLE
+        if (!sleep_path && !supp_gate) {
+            int32_t delta = supp - draw; /* >0 = 压过头了 */
+            if (delta <= TOUCH_SUPP_DROP_THR) {
+                /* 慢支: 对称 EMA, Δ ≤ 120 全走这里 (含升与慢降) */
+                if (s_drop_run[i]) s_drop_run[i] = 0;
+                s_supp_q8[i] += (draw * TOUCH_SUPP_Q - s_supp_q8[i]) / TOUCH_SUPP_RISE_N;
+            } else {
+                /* 计数器封顶只封自己, 不封触发 —— 封在一起的话持续 >5s 的
+                 * 过压会在第 255 帧后静默停止回收 */
+                if (s_drop_run[i] < 255) s_drop_run[i]++;
+                if (s_drop_run[i] >= TOUCH_SUPP_DROP_FRAMES) {
+                    /* 快支: 幅度门 + 时间门都过 → 正比于 Δ 地还回去 */
+                    s_supp_q8[i] -= delta * TOUCH_SUPP_Q / TOUCH_SUPP_FALL_N;
+                }
+            }
+            if (s_supp_q8[i] < 0) s_supp_q8[i] = 0;
+            /* 上限 = 该通道阈值: 吸收量超过阈值等于把该通道打死 */
+            else if (s_supp_q8[i] > (int32_t)s_thr_hw[i] * TOUCH_SUPP_Q)
+                s_supp_q8[i] = (int32_t)s_thr_hw[i] * TOUCH_SUPP_Q;
+        }
+#endif
+        int32_t d = draw - supp;
+
         if (!sleep_path && d > s_peak[i])
-            s_peak[i] = d; /* 标定仪表 (TUNE_PEAK_PERIOD_MS) */
+            s_peak[i] = d; /* 标定仪表 (TUNE_PEAK_PERIOD_MS) — 记的是抑制后的 d */
 
         bool was = s_ts.touched[i];
         /* 判定 = 软件 Schmitt + 连续帧去抖 (见 TOUCH_REL_DROP_* / TOUCH_DEBOUNCE_N)。
@@ -296,8 +418,8 @@ static void touch_scan_once(bool sleep_path)
         /* 功能键状态翻转诊断: 附 smooth/benchmark 对账, hw= 是硬件 mask 的同拍值
          * (息屏探针不落盘, 不打印) */
         if (i == 0 && !sleep_path && (active != was))
-            ESP_LOGI(TAG, "CH0 %s: d=%ld sm=%lu bm=%ld thr=%u hw=%d",
-                     active ? "按下" : "释放", (long)d,
+            ESP_LOGI(TAG, "CH0 %s: d=%ld (raw=%ld sm=%lu bm=%ld) thr=%u hw=%d",
+                     active ? "按下" : "释放", (long)d, (long)draw,
                      (unsigned long)s_ts.raw[i], (long)s_ts.bm[i],
                      (unsigned)s_thr_hw[0], (int)hw);
 
@@ -438,8 +560,7 @@ bool touch_fpc_sleep_probe(void)
      * 两组基线的量纲差异本身就是息屏/亮屏灵敏度对不上的来源 */
     int n_act = 0;
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        int32_t d = (int32_t)s_ts.raw[i] - (int32_t)s_ts.bm[i];
-        if (d > (int32_t)s_thr_hw[i])
+        if (touch_d_supp(i) > (int32_t)s_thr_hw[i])
             n_act++;
     }
     if (n_act == 0 || n_act > PROBE_MAX_CHANNELS) {
@@ -453,7 +574,7 @@ bool touch_fpc_sleep_probe(void)
     int8_t best_ch = -1;
     int32_t best_d = -INT32_MAX;
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        int32_t d = (int32_t)s_ts.raw[i] - (int32_t)s_ts.bm[i];
+        int32_t d = touch_d_supp(i);
         if (d > (int32_t)s_thr_hw[i] && d > best_d) {
             best_d = d;
             best_ch = (int8_t)i;
@@ -574,6 +695,18 @@ static void touch_scan_timer_cb(TimerHandle_t timer)
                      (long)s_peak[4], (long)s_peak[5], (long)s_peak[6], (long)s_peak[7],
                      (long)s_peak[8], (long)s_peak[9], (long)s_peak[10], (long)s_peak[11]);
             memset(s_peak, 0, sizeof(s_peak));
+
+#if TOUCH_SUPP_ENABLE
+            /* 抑制量本身 — 回路的**唯一**存在证明。它若贴在 0 附近, 说明回路
+             * 压根没吸进去 (而"峰值:"看起来正常只是因为本来就没超阈) */
+            ESP_LOGI(TAG, "均值: %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
+                     (long)(s_supp_q8[0] / TOUCH_SUPP_Q), (long)(s_supp_q8[1] / TOUCH_SUPP_Q),
+                     (long)(s_supp_q8[2] / TOUCH_SUPP_Q), (long)(s_supp_q8[3] / TOUCH_SUPP_Q),
+                     (long)(s_supp_q8[4] / TOUCH_SUPP_Q), (long)(s_supp_q8[5] / TOUCH_SUPP_Q),
+                     (long)(s_supp_q8[6] / TOUCH_SUPP_Q), (long)(s_supp_q8[7] / TOUCH_SUPP_Q),
+                     (long)(s_supp_q8[8] / TOUCH_SUPP_Q), (long)(s_supp_q8[9] / TOUCH_SUPP_Q),
+                     (long)(s_supp_q8[10] / TOUCH_SUPP_Q), (long)(s_supp_q8[11] / TOUCH_SUPP_Q));
+#endif
         }
     }
 

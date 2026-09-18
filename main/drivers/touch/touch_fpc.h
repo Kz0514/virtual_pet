@@ -41,6 +41,11 @@ void touch_get_filtered(int *filtered_out);
 /** 获取当前各通道判定阈值 (诊断: 观察抬阈/死区) */
 void touch_fpc_get_thr(int *thr_out);
 
+/** 摸头活动状态 — 由 pat_detector 在进入/退出摸头时通知。顶条的往返滑动
+ * 是**真动作**, 期间冻住抑制回路 (免被慢慢吸收掉)。app → driver 单向,
+ * 不引入 driver 依赖 app 的反向边。 */
+void touch_fpc_set_pat_active(bool on);
+
 /** 息屏暂停扫描定时器 — FreeRTOS 软件定时器 20ms 周期会限死轻睡
  * 窗口 (睡眠窗口 20ms→500ms)。息屏唤醒由模块内独立探针任务负责
  * (esp_timer 节拍, 20Hz 快探 / 2Hz 深闲, 见 probe_task_fn)。 */
