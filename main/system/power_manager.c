@@ -266,16 +266,18 @@ void power_manager_screen_off(void)
 
     /* 真轻睡 — 解除 5ms/20ms 窗口限制。触摸唤醒全走软件路径 (硬件
      * 比较器基准在触摸态冻结不更新, 入睡瞬间即误触发, 且基准不可写):
-     * 1. 动态频率探针 (main.c 主循环, touch_fpc_sleep_probe: 限速
-     * 基线 + 抖动自适应阈值, 2 连击去抖): 快探 20Hz (近场/触摸活动) /
-     * 深闲 2Hz (无活动 15s) → 唤醒响应 ≤300ms 快探, ≤800ms 深闲
+     * 1. 动态频率探针 (touch_fpc_sleep_probe, 独立任务): 每次触发一轮
+     * oneshot 扫描, 逐通道 smooth−benchmark > active_thresh 独立复判, 2 连击
+     * 去抖。快探 20Hz (近场/触摸活动) / 深闲 2Hz (无活动 15s) → 唤醒响应
+     * ≤300ms 快探, ≤800ms 深闲
      * 2. 摇动唤醒: dmp_bg 每 50ms 读 FIFO, 摇动检测亮屏
      * 睡眠窗口 (深闲) = min(main 500ms, dmp 500ms) ≈ 500ms → CPU 断电
      * ~99%, 电流大头剩外设 (WiFi/DMP/DAC)。快探期窗口 ~50ms, 功耗代价
      * 有界 (正是用户试图唤醒的时刻)。
      * 顺序: 释放锁允许入睡 → 停 LVGL tick (esp_timer 5ms 窗口限制) →
-     * 停 50Hz 扫描 (FreeRTOS 定时器 20ms 限制; 硬件 FSM 继续采样,
-     * 探针直读最新 raw)。 */
+     * 停 50Hz 扫描 + **停硬件连续扫描** (FreeRTOS 定时器 20ms 限制; 息屏期
+     * 硬件 FSM 不再常开采样, 改由探针按档位 oneshot 触发 —— 这是息屏功耗的
+     * 主要杠杆, 连续扫描是 12 通道每 ~60ms 一巡且常开)。 */
     pm_set_light_sleep(true); /* 画面静止: 开轻睡拿息屏电流大头 */
     touch_fpc_pause();        /* 停 50Hz 扫描 (窗口 20ms→50ms) */
     dmp_mpu_set_off(true);    /* DMP 轮询降频至 250ms — 息屏消费者 (shake/tap) 已 gate,
@@ -305,7 +307,7 @@ void power_manager_screen_on(void)
      * 旧画面, 全屏重绘覆盖, 无闪烁 */
     st7789_panel_sleep(false);
     lvgl_port_resume();     /* 恢复 LVGL tick + lv_timers (窗口回 5ms, 动画恢复) */
-    touch_fpc_resume();     /* 恢复 50Hz 扫描 (读数缓存 → 手势/滑动正常) */
+    touch_fpc_resume();     /* 恢复 50Hz 扫描 + 重启硬件连续扫描 (与探针互斥) */
     dmp_mpu_set_off(false); /* DMP 轮询回 50ms — 敲击/摇晃检测恢复全速 */
     es8311_drv_mute(false); /* 先解除 DAC 静音, 输出稳定后再上电 PA — 防上电 POP */
     es8311_drv_pa_set(true); /* : 恢复 PA — 与息屏关断配对 (见 screen_off) */

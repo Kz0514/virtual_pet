@@ -66,14 +66,14 @@ static IRAM_ATTR bool touch_on_inactive(touch_sensor_handle_t sens,
  *   信号链吐出的 smooth 与 benchmark。硬件 mask 只做诊断对照
  * - bm (硬件 benchmark): 判定基准。smooth − bm 就是判定用的那个量,
  *   本文件的 d、filtered、对外的 raw/baseline 全部同源于它
- * - ref/d_sm/jit/thr 链只剩息屏探针一个消费者 (touch_fpc_sleep_probe
- *   独立复判 d>thr)。亮屏判定不碰这条链 */
+ * - ref/d_sm/jit/thr 链**已无消费者** (息屏探针切到 smooth−benchmark 后)。
+ *   留着是为让本步的 diff 只含行为改动, 删除是下一步 (纯删除, 行为零变化) */
 typedef struct {
     uint32_t bm[TOUCH_CH_COUNT];      /* 硬件 benchmark 快照 (判定基准) */
-    int32_t ref[TOUCH_CH_COUNT];      /* 限速基线 — 仅供息屏探针 */
-    int32_t d_sm[TOUCH_CH_COUNT];     /* delta 慢均值 (抖动基准) — 仅供息屏探针 */
-    int32_t jit[TOUCH_CH_COUNT];      /* 噪声抖动 |d-d_sm| EMA (dev 钳 ±60) — 仅供息屏探针 */
-    int32_t thr[TOUCH_CH_COUNT];      /* 探针判定阈值 (jit*6 与 MIN 取大) — 仅供息屏探针 */
+    int32_t ref[TOUCH_CH_COUNT];      /* 限速基线 — 待删 */
+    int32_t d_sm[TOUCH_CH_COUNT];     /* delta 慢均值 (抖动基准) — 待删 */
+    int32_t jit[TOUCH_CH_COUNT];      /* 噪声抖动 |d-d_sm| EMA (dev 钳 ±60) — 待删 */
+    int32_t thr[TOUCH_CH_COUNT];      /* 探针判定阈值 (jit*6 与 MIN 取大) — 待删 */
     uint32_t raw[TOUCH_CH_COUNT];     /* 硬件 smooth 快照 (对外的 "raw") */
     bool touched[TOUCH_CH_COUNT];
     int filtered[TOUCH_CH_COUNT];
@@ -132,7 +132,7 @@ static uint8_t s_deb[TOUCH_CH_COUNT] = {0};
 #define TOUCH_THR_CH0 400            /* 左键 (CH0/GPIO2, 最大焊盘, USB 耦合最强) */
 #define TOUCH_THR_BAR 350            /* 顶部 CH1-5 与右侧 CH6-11 */
 
-/* ── 检测参数 (仅供息屏探针: 亮屏判定已切硬件, 见 touch_fpc_sleep_probe) ── */
+/* ── 检测参数 (已无消费者, 待删 — 息屏探针已切 smooth−benchmark) ── */
 #define BASELINE_RL_POS 4            /* 正向限速/帧: 追环境漂移不吞按压 (慢按净余仍可触发) */
 #define BASELINE_RL_NEG 64           /* 负向快追: 释放/回落快速归零, 防快速滑动重按 d
                                          从低处起跳丢判定; 负 d 无触发风险, 追快安全 */
@@ -180,6 +180,13 @@ static TaskHandle_t s_probe_task = NULL;
 static esp_timer_handle_t s_probe_timer = NULL;
 static volatile bool s_probe_enabled = false;
 static volatile bool s_wake_pending = false;
+/* 互斥 oneshot 扫描与 start/stop continuous —— 必须的, 不是保险:
+ * trigger_oneshot_scanning 全程把 is_started 置 true (驱动
+ * touch_sens_common.c:373 置位 / :422 复位), 而 start_continuous_scanning
+ * 要求 !is_started (:323)。息屏转亮屏时探针任务多半正卡在 oneshot 里, 直接
+ * start 会 ESP_ERR_INVALID_STATE —— 实测 100% 复现, 后果是唤醒后硬件扫描
+ * 再也没起来 (亮屏全程摸不动, 峰值读数冻结) */
+static SemaphoreHandle_t s_probe_mtx = NULL;
 
 static void touch_note_activity(void)
 {
@@ -265,6 +272,7 @@ static uint32_t s_hit_tick = 0;   /* 末次命中时刻 — 连击 150ms 时序�
 static int8_t s_hit_ch = -1;      /* 末次命中主通道 — 连击必须同通道 */
 static int8_t s_act_ch = -1;      /* 息屏活动主通道累积: 同通道 2 帧才活动 */
 static TickType_t s_immune_until = 0; /* USB/供电事件免疫窗 */
+static bool s_oneshot_failed = false; /* oneshot 失败沿 — 只报一次, 免 20Hz 刷屏 */
 #define PROBE_HIT_REQUIRED 2
 #define PROBE_HIT_WINDOW_MS 150   /* 两命中必须在此窗内 — 漂移越阈(间隔秒级)凑不齐 */
 #define PROBE_MAX_CHANNELS 10
@@ -473,12 +481,32 @@ static void touch_scan_once(bool sleep_path)
 }
 
 /* ── 息屏期唤醒探针 ──
- * 复用扫描侧更新的基线/抖动阈值数据, 连击判定独立复判 (逐通道
- * d > thr, 无滞回无保活); USB/供电瞬态由免疫窗 (5s) 覆盖,
- * scan 侧环境快照服务亮屏期瞬态 */
+ * 每次先触发一轮 oneshot 扫描取数, 连击判定独立复判 (逐通道
+ * smooth − benchmark > active_thresh, 无滞回无保活); USB/供电瞬态由
+ * 免疫窗 (5s) 覆盖, scan 侧环境快照服务亮屏期瞬态 */
 
 bool touch_fpc_sleep_probe(void)
 {
+    /* 息屏期硬件连续扫描已停 (见 touch_fpc_pause) — 先触发一轮 oneshot 把 12
+     * 通道各测一次, 再让 touch_scan_once 去读结果。这是息屏功耗的主要杠杆:
+     * 连续扫描是 12 通道每 ~60ms 一巡且常开, 这里改成按档位 (快探 / 深闲)
+     * 一巡。硬件 benchmark 在 oneshot 下同样自追踪 → 漂移补偿不用另写。
+     * ⚠ 它是**逐通道阻塞**的 (每通道 vTaskDelay(1) 等本通道测完) —— 只能在
+     *   任务上下文调。本函数唯一调用点是 probe_task_fn, 满足; 绝不可从
+     *   LVGL 定时器 / esp_timer 回调 / ISR 进。
+     * timeout 传 200: 驱动里先判 `timeout_ms > 0` 才换算 tick, 传 0 会
+     *   end_tick = now 当场超时 (负值才是不限时); 200ms 对 12 通道绰绰有余。 */
+    esp_err_t os_err = touch_sensor_trigger_oneshot_scanning(s_sens, 200);
+    if (os_err != ESP_OK) {
+        if (!s_oneshot_failed) { /* 失败沿只报一次 */
+            s_oneshot_failed = true;
+            ESP_LOGW(TAG, "oneshot 扫描失败 (%s) — 探针读数停在上轮, 唤醒会变迟钝",
+                     esp_err_to_name(os_err));
+        }
+    } else {
+        s_oneshot_failed = false;
+    }
+
     touch_scan_once(true); /* 息屏路径: 追速 ×2 盖过 PA 关/面睡漂移源 */
 
     /* 动态刷新率 (息屏档): 距上次活动 >15s → 深闲 2Hz (睡眠窗口
@@ -498,15 +526,17 @@ bool touch_fpc_sleep_probe(void)
         return false;
     }
 
-    /* 连击判定独立复判 d > thr, 不用 s_ts.touched — touched 含 60ms 释放
-     * 保活, 会把单帧环境尖峰撑成多帧计数在窗内凑齐连击 → 假唤醒。
+    /* 连击判定独立复判 d > active_thresh, 不用 s_ts.touched — touched 含 60ms
+     * 释放保活, 会把单帧环境尖峰撑成多帧计数在窗内凑齐连击 → 假唤醒。
      * 独立复判 (无滞回无保活): 尖峰单帧越阈只计 1 次, 真实按压 ≥100ms
-     * 在 20Hz 下 ≥2 帧连续越阈必齐。通道数沿用 PROBE_MAX_CHANNELS
-     * (手掌覆盖整体越阈不判) */
+     * 在快探档下 ≥2 帧连续越阈必齐。通道数沿用 PROBE_MAX_CHANNELS
+     * (手掌覆盖整体越阈不判)。
+     * 尺子与亮屏判定同一把 (smooth − benchmark 对 s_thr_hw), 不再另起软件基线 —
+     * 两组基线的量纲差异本身就是息屏/亮屏灵敏度对不上的来源 */
     int n_act = 0;
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        int32_t d = (int32_t)s_ts.raw[i] - s_ts.ref[i];
-        if (d > s_ts.thr[i])
+        int32_t d = (int32_t)s_ts.raw[i] - (int32_t)s_ts.bm[i];
+        if (d > (int32_t)s_thr_hw[i])
             n_act++;
     }
     if (n_act == 0 || n_act > PROBE_MAX_CHANNELS) {
@@ -520,8 +550,8 @@ bool touch_fpc_sleep_probe(void)
     int8_t best_ch = -1;
     int32_t best_d = -INT32_MAX;
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        int32_t d = (int32_t)s_ts.raw[i] - s_ts.ref[i];
-        if (d > s_ts.thr[i] && d > best_d) {
+        int32_t d = (int32_t)s_ts.raw[i] - (int32_t)s_ts.bm[i];
+        if (d > (int32_t)s_thr_hw[i] && d > best_d) {
             best_d = d;
             best_ch = (int8_t)i;
         }
@@ -574,7 +604,12 @@ static void probe_task_fn(void *arg)
             BaseType_t rc = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(600));
             (void)rc;
             if (!s_probe_enabled) break;
-            touch_fpc_sleep_probe(); /* 内部按活动/深闲更新 s_probe_interval */
+            xSemaphoreTake(s_probe_mtx, portMAX_DELAY);
+            /* 取锁后复检: resume 可能在我们等锁的这几微秒里把标志清了, 那时
+             * 硬件连续扫描已经起来, 再跑 oneshot 只会撞 INVALID_STATE */
+            if (s_probe_enabled)
+                touch_fpc_sleep_probe(); /* 内部按活动/深闲更新 s_probe_interval */
+            xSemaphoreGive(s_probe_mtx);
             uint32_t iv = s_probe_interval * 1000;
             if (iv != cur_iv_us) {  /* 快探↔深闲 档位切换 → 重设周期 */
                 esp_timer_stop(s_probe_timer);
@@ -768,6 +803,12 @@ esp_err_t touch_fpc_init(void)
     };
     if (esp_timer_create(&targs, &s_probe_timer) != ESP_OK)
         ESP_LOGE(TAG, "创建探针 esp_timer 失败");
+    /* 互斥量必须先于任务创建 —— 任务一启动就会 take */
+    s_probe_mtx = xSemaphoreCreateMutex();
+    if (!s_probe_mtx) {
+        ESP_LOGE(TAG, "创建探针互斥量失败");
+        return ESP_ERR_NO_MEM;
+    }
     if (xTaskCreate(probe_task_fn, "touch_prb", 4096, NULL, 6, &s_probe_task)
         != pdPASS)
         ESP_LOGE(TAG, "创建探针任务失败");
@@ -780,9 +821,26 @@ esp_err_t touch_fpc_init(void)
 
 void touch_fpc_pause(void)
 {
-    /* 本步只停软件扫描定时器 — 硬件连续扫描照跑 (legacy 的 FSM 定时器那时也
-     * 照跑, 行为不变)。停硬件扫描 + oneshot 探针是后续步的事 */
     if (s_scan_timer) xTimerStop(s_scan_timer, 0);
+
+    /* 停硬件连续扫描 (FSM 定时器真停, 不是只停软件读取) — 息屏期改由探针
+     * 按档位触发 oneshot (见 touch_fpc_sleep_probe)。这是息屏功耗的主要来源:
+     * 连续扫描 12 通道每 ~60ms 一巡且常开。
+     * ⚠ 副作用: legacy 靠 FSM 定时器恒开把 RTC_PERIPH 隐式保电, 停扫后这层
+     *   保障消失 → 靠 touch_fpc_init 里补的 esp_sleep_pd_config(RTC_PERIPH, ON)
+     *   顶上。缺了它轻睡会清掉触摸寄存器/benchmark。
+     * 失败只告警不 abort: pause 是关屏路径, 在这里 abort 等于关屏即死机。
+     * 与探针互斥 (见 s_probe_mtx): 上一轮息屏的 oneshot 可能还没收尾。等待有界,
+     * 同 touch_fpc_resume 的说明 */
+    esp_err_t err = ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(s_probe_mtx, pdMS_TO_TICKS(250)) == pdTRUE) {
+        err = touch_sensor_stop_continuous_scanning(s_sens);
+        xSemaphoreGive(s_probe_mtx);
+    }
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "停硬件扫描失败 (%s) — 息屏功耗会偏高", esp_err_to_name(err));
+
+    s_oneshot_failed = false; /* 新一轮息屏, 让 oneshot 告警重新可见 */
     s_probe_hits = 0;
     s_wake_pending = false;
     /* 息屏瞬态免疫窗 (1500ms): PA 关断/面板睡眠/电源整定引起的瞬态
@@ -808,6 +866,24 @@ void touch_fpc_resume(void)
     s_probe_hits = 0;
     s_wake_pending = false;
     s_probe_enabled = false; /* 停独立探针任务 (任务内 ≤600ms 收尾停 esp_timer) */
+
+    /* 恢复硬件连续扫描 (pause 停的)。**必须与探针互斥** (见 s_probe_mtx):
+     * 息屏转亮屏的这一刻探针任务多半正卡在 oneshot 里 (is_started=true), 直接
+     * start 会 ESP_ERR_INVALID_STATE —— 那个失败是永久的 (再也没有别的地方
+     * start), 亮屏触摸全程失灵。
+     * 等锁 250ms 而**不是** portMAX_DELAY: 等待量有界 (oneshot 十几 ms, 且驱动
+     * 自己按 timeout 给整轮扫描兜了 200ms 硬上限, 见 touch_sens_common.c:385-404),
+     * 超过就说明探针任务真卡死了 —— 那时告警比死等有用。本路径不在 LVGL 定时器
+     * 上下文 (屏灭期间 lv_timers 已停), 不会被这里的等待卡住 UI。
+     * 失败仍只告警不 abort —— 后者会变成"一唤醒就重启"死循环 */
+    esp_err_t err = ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(s_probe_mtx, pdMS_TO_TICKS(250)) == pdTRUE) {
+        err = touch_sensor_start_continuous_scanning(s_sens);
+        xSemaphoreGive(s_probe_mtx);
+    }
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "恢复硬件扫描失败 (%s) — 亮屏触摸会失灵", esp_err_to_name(err));
+
     touch_auto_calibrate();
     touch_note_activity();
     if (s_scan_timer) {
