@@ -322,6 +322,49 @@ static inline int32_t touch_d_supp(int i)
     return (int32_t)s_ts.raw[i] - (int32_t)s_ts.bm[i] - s_supp_q8[i] / TOUCH_SUPP_Q;
 }
 
+/* ── 息屏基准快照 ──
+ * 面板睡下时靠它最近的通道会被抬起一个常量偏置, 而息屏的 oneshot 扫描下
+ * 硬件 benchmark 不追它 → 探针只看得见这个偏置, 只抬阈值会连着真实按压
+ * 一起挡掉。息屏后 [OPEN, CLOSE] 逐帧取每通道最小值当零点, 探针判 d − ref。
+ * OPEN 留出偏置建立时间 (取太早等于没取); 取最小值是躲掉一次噪声尖峰。 */
+#define SLEEP_REF_OPEN_MS  1000
+#define SLEEP_REF_CLOSE_MS 1500
+#define SLEEP_REF_NONE     INT32_MAX
+
+static int32_t s_sleep_ref[TOUCH_CH_COUNT] = {0};
+static bool s_ref_armed = false;
+static uint32_t s_ref_open_at = 0, s_ref_close_at = 0;
+
+/* 探针判据 = d − 息屏快照 (亮屏判定不用 — 那个偏置只在息屏期存在) */
+static inline int32_t touch_d_probe(int i)
+{
+    return touch_d_supp(i) - s_sleep_ref[i];
+}
+
+/* 快照窗口推进: [OPEN, CLOSE) 逐帧取最小, 到 CLOSE 收口 */
+static void touch_sleep_ref_tick(uint32_t now)
+{
+    if (!s_ref_armed) return;
+    if ((int32_t)(now - s_ref_open_at) < 0) return;
+
+    if ((int32_t)(now - s_ref_close_at) < 0) {
+        for (int i = 0; i < TOUCH_CH_COUNT; i++) {
+            int32_t d = touch_d_supp(i);
+            if (d < s_sleep_ref[i]) s_sleep_ref[i] = d;
+        }
+        return;
+    }
+
+    for (int i = 0; i < TOUCH_CH_COUNT; i++) {
+        int32_t v = s_sleep_ref[i];
+        /* 只补正偏置 (负零点会把通道变敏感); 快照期该通道正被按着 (最小
+         * 值都 ≥ 阈值) 就整个不补 — 息屏期没有别的唤醒路径, 装死等于卡死 */
+        if (v < 0 || v >= (int32_t)s_thr_hw[i]) v = 0;
+        s_sleep_ref[i] = v;
+    }
+    s_ref_armed = false;
+}
+
 /* ── 单次扫描 (亮屏定时器回调与息屏探针共用; 亮屏固定 50Hz, 息屏由探针自定节拍) ──
  * sleep_path: 息屏探针路径 — 该路径不落盘判定 (见下方 s_deb 归零),
  * 唤醒与否全由探针独立复判 */
@@ -543,6 +586,13 @@ bool touch_fpc_sleep_probe(void)
     else
         s_probe_interval = PROBE_FAST_MS;
 
+    /* 息屏基准快照推进 — 收口前不判唤醒 (ref 还是哨兵值) */
+    touch_sleep_ref_tick(xTaskGetTickCount());
+    if (s_ref_armed) {
+        s_probe_hits = 0;
+        return false;
+    }
+
     /* 免疫窗: USB 拔插/模式切换后 5s 内不判唤醒 — 瞬态 (VBUS
      * 消失/恢复, PHY 电源域切换) 使 raw 持续跳变 1-2s。
      * 手动唤醒路径独立, 不在此窗内 */
@@ -560,7 +610,7 @@ bool touch_fpc_sleep_probe(void)
      * 两组基线的量纲差异本身就是息屏/亮屏灵敏度对不上的来源 */
     int n_act = 0;
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        if (touch_d_supp(i) > (int32_t)s_thr_hw[i])
+        if (touch_d_probe(i) > (int32_t)s_thr_hw[i])
             n_act++;
     }
     if (n_act == 0 || n_act > PROBE_MAX_CHANNELS) {
@@ -574,7 +624,7 @@ bool touch_fpc_sleep_probe(void)
     int8_t best_ch = -1;
     int32_t best_d = -INT32_MAX;
     for (int i = 0; i < TOUCH_CH_COUNT; i++) {
-        int32_t d = touch_d_supp(i);
+        int32_t d = touch_d_probe(i);
         if (d > (int32_t)s_thr_hw[i] && d > best_d) {
             best_d = d;
             best_ch = (int8_t)i;
@@ -873,10 +923,16 @@ void touch_fpc_pause(void)
     s_oneshot_failed = false; /* 新一轮息屏, 让 oneshot 告警重新可见 */
     s_probe_hits = 0;
     s_wake_pending = false;
-    /* 息屏瞬态免疫窗 (1500ms): PA 关断/面板睡眠/电源整定引起的瞬态
-     * ~900ms 内衰尽, 窗口留 2× 余量, 窗内不判唤醒。手动唤醒 (左键/
-     * 摇动/硬件触摸退出回调) 不经过探针免疫窗, 息屏即摸不受影响 */
-    s_immune_until = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
+    /* 息屏瞬态免疫窗 = 快照收口时刻: PA 关断/面板睡眠/电源整定引起的瞬态
+     * 在窗内衰尽, 窗内不判唤醒。手动唤醒 (左键/摇动/硬件触摸退出回调)
+     * 不经过探针免疫窗, 息屏即摸不受影响 */
+    uint32_t now = xTaskGetTickCount();
+    s_immune_until = now + pdMS_TO_TICKS(SLEEP_REF_CLOSE_MS);
+    /* 武装息屏基准快照 (判据见 touch_d_probe) */
+    for (int i = 0; i < TOUCH_CH_COUNT; i++) s_sleep_ref[i] = SLEEP_REF_NONE;
+    s_ref_open_at = now + pdMS_TO_TICKS(SLEEP_REF_OPEN_MS);
+    s_ref_close_at = now + pdMS_TO_TICKS(SLEEP_REF_CLOSE_MS);
+    s_ref_armed = true;
     touch_note_activity(); /* 屏刚灭 = 快探档起步, 15s 无活动才降深闲 */
 
     /* 启动独立探针任务 (esp_timer 20Hz 节拍 — 见 probe_task_fn) */
