@@ -654,12 +654,12 @@ bool touch_fpc_wake_pending(void)
     return true;
 }
 
-/* USB/供电事件 → 5s 免疫窗 (见 touch_fpc.h 注释) */
+/* USB/供电事件 → 掐掉半截连击 + 复位快探档。
+ * 不开免疫窗 (与息屏那一刻的窗口互相覆盖, 见 .h) */
 void touch_fpc_note_usb_event(void)
 {
-    s_immune_until = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
     s_probe_hits = 0;
-    touch_note_activity(); /* 免疫期仍保持快探档 (瞬态结束后立即恢复响应) */
+    touch_note_activity();
 }
 
 /* 诊断: 去抖命中数 — power_log.csv ph 列 */

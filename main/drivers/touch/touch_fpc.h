@@ -74,9 +74,10 @@ uint32_t touch_fpc_probe_interval_ms(void);
 
 /** : USB/供电事件通知 — 拔插 USB (充电状态翻转)、U盘模式切换会
  * 引起供电链路瞬态 (VBUS 消失/恢复、PHY 电源域切换), raw 可跳几千且
- * 持续 1-2s, 探针 2 连击去抖会被穿透 → 假唤醒。调用后探针进入 5s 免疫窗
- * (不判唤醒) + 复位到快探档。手动唤醒路径 (左键/摇动/1s 兜底接触轮询)
- * 不受影响。由 usb_storage (模式切换) 与 main.c (充电翻转) 调用。 */
+ * 持续 1-2s, 探针 2 连击去抖会被穿透 → 假唤醒。这里只掐掉已攒到一半的
+ * 连击 + 复位到快探档, **不开免疫窗** — 开了会和息屏那一刻
+ * (touch_fpc_pause) 的窗口互相覆盖, 谁后写谁说了算。
+ * 由 usb_storage (模式切换) 与 main.c (充电翻转) 调用。 */
 void touch_fpc_note_usb_event(void);
 
 /** 诊断: 探针去抖命中数 (0..PROBE_HIT_REQUIRED-1) — CSV ph 列 */
