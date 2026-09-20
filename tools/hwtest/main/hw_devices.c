@@ -13,6 +13,7 @@
 #include "hw_devices.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "board.h"
@@ -775,6 +776,25 @@ static void dev_accel_buzz(void)
  * → 两个地址都 NACK 判 FAIL, 0x0C 应答才去读 ID。
  * (曾把"0x2C 有应答"当结论 —— 那是 add_device 不探总线造成的假象。)
  * ══════════════════════════════════════════════════════════════════════ */
+
+/* 全地址扫描。B3 的 i2c.scan 跑在旁路打开**之前**, 看不到 AUX 上的东西;
+ * 这里必须在 BYPASS_EN 置上之后调。超时压短: 器件不在是立即 NACK, 只有线被钳住才吃满。 */
+static int scan_aux(char *list, size_t cap)
+{
+    i2c_master_bus_handle_t bus = hw_i2c_bus();
+    if (!bus) return -1;
+    size_t used = 0;
+    int n = 0;
+    for (uint16_t a = 0x08; a <= 0x77; a++) {
+        if (i2c_master_probe(bus, a, 20) != ESP_OK) continue;
+        n++;
+        if (used + 6 < cap)
+            used += (size_t)snprintf(list + used, cap - used, "0x%02X ", (unsigned)a);
+    }
+    if (used) list[used - 1] = '\0'; /* 去掉末尾空格 */
+    return n;
+}
+
 static void dev_qmc6309(void)
 {
     hw_item_t *it = hw_begin("dev.qmc6309", "QMC6309 地磁(AUX)");
@@ -805,10 +825,17 @@ static void dev_qmc6309(void)
     bool a_p = probe_at(HW_EXP_QMC_ADDR);     /* 0x0C: 旁路开后应答的地址 */
     bool a_alt = probe_at(HW_EXP_QMC_ADDR_ALT); /* 0x2C: 主工程常量, 本硬件无应答 */
     if (!a_p && !a_alt) {
-        hw_set(it, "INT_PIN_CFG=0x%02X(BYPASS_EN ✓), 0x%02X 与 0x%02X 均 NACK", cfg,
-               HW_EXP_QMC_ADDR, HW_EXP_QMC_ADDR_ALT);
+        char list[96] = "", got[112];
+        int n = scan_aux(list, sizeof(list));
+        if (n < 0) snprintf(got, sizeof(got), "未跑 (拿不到 I2C 总线句柄)");
+        else if (n == 0) snprintf(got, sizeof(got), "无应答 (总线一片死寂)");
+        else snprintf(got, sizeof(got), "%d 个: %s", n, list);
+        hw_set(it, "0x37=0x%02X(BYPASS_EN ✓), 0x%02X/0x%02X 均 NACK; 旁路开后全扫 → %s", cfg,
+               HW_EXP_QMC_ADDR, HW_EXP_QMC_ADDR_ALT, got);
+        if (n < 0) hw_note(it, "本项无效: 总线句柄都没拿到");
+        else if (n == 0) hw_note(it, "旁路已开仍无人应答 → 芯片不在总线上 (未贴装/虚焊/AUX 走线断)");
+        else hw_note(it, "对照 i2c.scan 清单: 一样 → AUX 段没东西 (非地址问题); 多出别的 → 地址要重查");
         /* 检测不到 = 硬件错误 (未贴装 / 虚焊 / 旁路未接通) */
-        hw_note(it, "两个地址都 NACK → 总线上找不到 6309");
         hw_end(it, HW_ST_FAIL);
         return;
     }
