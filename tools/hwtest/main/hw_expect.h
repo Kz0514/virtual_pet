@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-#define HW_FW_VERSION "hwtest-1.1"
+#define HW_FW_VERSION "hwtest-1.2"
 
 /* ═══ A. 系统 ═══ */
 #define HW_EXP_FLASH_BYTES (32u * 1024 * 1024) /* W25Q256 */
@@ -155,6 +155,14 @@ extern const int HW_EXP_ES_CMP_N;
 
 /* ═══ G. 马达 ═══ */
 #define HW_EXP_HAPTIC_DUTY_PCT 50
+/* 回环短震: 真通电震一下, 拿加速度计的峰抖动当"震没震"的判据。
+ * 采样率要盖过线性马达的谐振频率 (通常 170~235Hz), 所以临时把 IMU 开到
+ * 1kHz 输出 + 260Hz 带宽, 测完还原 —— 用默认的 21Hz 带宽会把谐振滤掉。 */
+#define HW_EXP_BUZZ_DUTY_PCT 60
+#define HW_EXP_BUZZ_SAMPLES 200  /* 每窗采样笔数 (1ms 一笔 → 约 200ms) */
+#define HW_EXP_BUZZ_GAIN_MIN 3.0f /* 震中峰抖动 / 静止峰抖动 的下限 */
+#define HW_EXP_BUZZ_MIN_G 0.03f   /* 峰抖动的绝对下限 (基线太平时的兜底) */
+#define HW_EXP_BUZZ_BUSY_G 0.05f  /* 静止峰抖动高于此值 → 板子当时在被搬动 */
 
 /* ═══ H. 存储 ═══ */
 #define HW_EXP_CFG_SIZE 0x80000  /* 512KB */

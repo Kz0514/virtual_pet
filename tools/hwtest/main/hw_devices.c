@@ -607,6 +607,167 @@ static void dev_accel(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ * 马达回环 —— dev.accel 只证明"传感器在读数", haptic.* 只验到 EN 脚和 LEDC 通道,
+ * 中间那段"电真通到马达、马达真震了"没人管。这里通电短震一下, 看加速度计认不认账。
+ *
+ * 采一窗加速度, 返回去均值后的峰抖动 (g) 与 |a| 均值。1ms 一笔: pdMS_TO_TICKS(1)
+ * 在 100Hz tick 下是 0, 只能忙等。
+ * ══════════════════════════════════════════════════════════════════════ */
+static void buzz_window(i2c_master_dev_handle_t dev, float lsb, float *peak, float *mag, int *got)
+{
+    static float buf[HW_EXP_BUZZ_SAMPLES][3]; /* 2.4KB, 放静态不占任务栈 */
+    float sx = 0, sy = 0, sz = 0;
+    int n = 0;
+    for (int s = 0; s < HW_EXP_BUZZ_SAMPLES; s++) {
+        uint8_t r[6];
+        if (rd_rr(dev, 0x3B, r, 6) == ESP_OK) { /* ACCEL_XOUT_H .. ZOUT_L */
+            buf[n][0] = (float)be16(r + 0) / lsb;
+            buf[n][1] = (float)be16(r + 2) / lsb;
+            buf[n][2] = (float)be16(r + 4) / lsb;
+            sx += buf[n][0];
+            sy += buf[n][1];
+            sz += buf[n][2];
+            n++;
+        }
+        esp_rom_delay_us(1000);
+    }
+    *got = n;
+    if (n == 0) {
+        *peak = *mag = 0;
+        return;
+    }
+    float mx = sx / n, my = sy / n, mz = sz / n;
+    *mag = sqrtf(mx * mx + my * my + mz * mz);
+    float p = 0;
+    for (int i = 0; i < n; i++) {
+        float dx = buf[i][0] - mx, dy = buf[i][1] - my, dz = buf[i][2] - mz;
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d > p) p = d;
+    }
+    *peak = p;
+}
+
+static void dev_accel_buzz(void)
+{
+    hw_item_t *it = hw_begin("dev.accel.buzz", "马达回环 (通电短震)");
+    if (!probe_at(MPU6500_I2C_ADDR)) {
+        hw_set(it, "0x%02X NACK", MPU6500_I2C_ADDR);
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+    i2c_master_dev_handle_t dev = open_at(MPU6500_I2C_ADDR, 400);
+    uint8_t cfg = 0, c1a = 0, c19 = 0;
+    if (!dev || rd_rr(dev, 0x1C, &cfg, 1) != ESP_OK || rd_rr(dev, 0x1A, &c1a, 1) != ESP_OK ||
+        rd_rr(dev, 0x19, &c19, 1) != ESP_OK) {
+        if (dev) close_at(dev);
+        hw_note(it, "加速度配置寄存器读失败");
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+    float lsb = accel_lsb_per_g(cfg);
+    /* 临时开到 260Hz 带宽 + 1kHz 输出, 测完还原: 默认 21Hz 带宽会把线性马达
+     * 的谐振滤掉, 200Hz 输出采 200Hz 振动还可能整个混叠成直流 → 假"没震" */
+    bool wr_ok = wr_r(dev, 0x1A, 0x00) == ESP_OK && wr_r(dev, 0x19, 0x00) == ESP_OK;
+    vTaskDelay(pdMS_TO_TICKS(20)); /* 等新配置过一个输出周期 */
+    uint8_t v1a = 0xFF, v19 = 0xFF; /* 读回确认快速模式真进去了 (假阴性都出在这里) */
+    rd_rr(dev, 0x1A, &v1a, 1);
+    rd_rr(dev, 0x19, &v19, 1);
+
+    /* 马达先归零: EN 低 + duty 0 (INPUT_OUTPUT: 纯 OUTPUT 关掉了输入通路,
+     * gpio_get_level() 恒返回 0, 读回就验不了真驱动出去没有) */
+    gpio_config_t en = {
+        .pin_bit_mask = 1ULL << (int)HAPTIC_EN_IO,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&en);
+    gpio_set_level(HAPTIC_EN_IO, 0);
+    ledc_timer_config_t t = {
+        .speed_mode = HW_LEDC_SPD,
+        .duty_resolution = HW_HAPTIC_RES,
+        .timer_num = HW_HAPTIC_TIMER,
+        .freq_hz = HAPTIC_PWM_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ledc_channel_config_t ch = {
+        .gpio_num = HAPTIC_PWM_IO,
+        .speed_mode = HW_LEDC_SPD,
+        .channel = HW_HAPTIC_CH,
+        .timer_sel = HW_HAPTIC_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+        .intr_type = LEDC_INTR_DISABLE,
+    };
+    bool led_ok = ledc_timer_config(&t) == ESP_OK && ledc_channel_config(&ch) == ESP_OK;
+
+    float base_peak = 0, base_mag = 0, buzz_peak = 0, buzz_mag = 0;
+    int nb = 0, nz = 0;
+    buzz_window(dev, lsb, &base_peak, &base_mag, &nb);
+
+    ledc_set_duty(HW_LEDC_SPD, HW_HAPTIC_CH, (uint32_t)HW_EXP_BUZZ_DUTY_PCT * 1023 / 100);
+    ledc_update_duty(HW_LEDC_SPD, HW_HAPTIC_CH);
+    gpio_set_level(HAPTIC_EN_IO, 1);
+    vTaskDelay(pdMS_TO_TICKS(2)); /* duty 下一周期才锁存, 同 G 段那条 */
+    uint32_t got_duty = ledc_get_duty(HW_LEDC_SPD, HW_HAPTIC_CH);
+    int en_hi = gpio_get_level(HAPTIC_EN_IO); /* 真驱动出去没有: 悬空读 0 = 脚没接通 */
+    buzz_window(dev, lsb, &buzz_peak, &buzz_mag, &nz);
+
+    /* 收尾: duty 先归零再断 EN —— 板子交出去时马达必须是停的 */
+    ledc_set_duty(HW_LEDC_SPD, HW_HAPTIC_CH, 0);
+    ledc_update_duty(HW_LEDC_SPD, HW_HAPTIC_CH);
+    gpio_set_level(HAPTIC_EN_IO, 0);
+    bool rb_ok = wr_r(dev, 0x1A, c1a) == ESP_OK && wr_r(dev, 0x19, c19) == ESP_OK;
+    close_at(dev);
+
+    hw_set(it, "静止 峰%.3f → 震中 峰%.3f g (|a| %.2f→%.2f) | %d%% duty %d 笔, EN 读回 %d, duty 读回 %u",
+           base_peak, buzz_peak, base_mag, buzz_mag, HW_EXP_BUZZ_DUTY_PCT, nz, en_hi,
+           (unsigned)got_duty);
+    if (!led_ok || !wr_ok) {
+        hw_note(it, "LEDC/IMU 配置写入失败 → 本项无效");
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+    if (v1a != 0x00 || v19 != 0x00) { /* 快速模式没进去 → 这一项的结论不可信 */
+        hw_note(it, "IMU 快速采样未生效 (0x1A=0x%02X 0x19=0x%02X, 期望 0x00) → 本项无效", v1a, v19);
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+    if (nb < HW_EXP_BUZZ_SAMPLES / 2 || nz < HW_EXP_BUZZ_SAMPLES / 2) {
+        hw_note(it, "读数笔数不足 (读失败太多)");
+        hw_end(it, HW_ST_FAIL);
+        return;
+    }
+    if (!rb_ok) hw_note(it, "IMU 采样配置未还原 (0x1A/0x19)");
+    if (base_peak > HW_EXP_BUZZ_BUSY_G) {
+        /* 静止窗都不安静 → 基线不可用, 这时候任何比值都不作数 */
+        hw_note(it, "静止窗峰抖动 %.3f g > %.3f g → 板子当时在被搬动, 基线不可用, 重跑",
+                base_peak, HW_EXP_BUZZ_BUSY_G);
+        hw_end(it, HW_ST_WARN);
+        return;
+    }
+
+    /* 绝对下限兜底: 基线太平 (峰抖动≈0) 时纯比值会放过本底噪声 */
+    float need = base_peak * HW_EXP_BUZZ_GAIN_MIN;
+    if (need < HW_EXP_BUZZ_MIN_G) need = HW_EXP_BUZZ_MIN_G;
+
+    if (buzz_peak >= need) {
+        hw_end(it, HW_ST_PASS);
+    } else if (buzz_peak >= need * 0.5f) {
+        hw_note(it, "振幅只有 %.3f g (需 %.3f g) → 马达弱/机械卡涩/供电不足", buzz_peak, need);
+        hw_end(it, HW_ST_WARN);
+    } else if (en_hi != 1) {
+        hw_note(it, "EN 驱动高后读回 %d → 脚没被拉起来, 马达根本没通电", en_hi);
+        hw_end(it, HW_ST_FAIL);
+    } else {
+        hw_note(it, "EN/duty 都已到位而加速度计纹丝不动 (%.3f g, 基线 %.3f g) → 马达没震: 焊点/马达本体",
+                buzz_peak, base_peak);
+        hw_end(it, HW_ST_FAIL);
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  * QMC6309 地磁: 挂 MPU6500 的 AUX, 靠 INT_PIN_CFG.BYPASS_EN 桥到主总线
  *
  * 贴装因板而异: 贴了 → 旁路打开后 **0x0C 应答** (reg 0x00 = 0x90, reg 0x0D = 0x00),
@@ -691,6 +852,7 @@ void hw_devices_run(void)
     dev_bq27220();
     dev_mpu6500();
     dev_accel();
+    dev_accel_buzz();
     dev_qmc6309();
 }
 
