@@ -795,6 +795,51 @@ static int scan_aux(char *list, size_t cap)
     return n;
 }
 
+/* 第二条路: 让 MPU 自己去当主机问 AUX (旁路 MUX 之外的另一条通路)。
+ * SLV0 每个采样周期发一次读, 应答与否看 I2C_MST_STATUS(0x36) 的 bit0 = I2C_SLV0_NACK。 */
+static int scan_aux_mst(i2c_master_dev_handle_t mpu, char *list, size_t cap, int *nack, int *arb)
+{
+    uint8_t uc = 0, ip = 0, sr = 0;
+    if (rd_rr(mpu, 0x6A, &uc, 1) != ESP_OK || rd_rr(mpu, 0x37, &ip, 1) != ESP_OK ||
+        rd_rr(mpu, 0x19, &sr, 1) != ESP_OK)
+        return -1;
+
+    wr_r(mpu, 0x19, 0x00); /* 拉到 1kHz → 主机每 1ms 发一次 */
+    wr_r(mpu, 0x6A, uc | 0x02);
+    wr_r(mpu, 0x6A, uc & (uint8_t)~0x02); /* I2C_MST_RESET 自清 */
+    wr_r(mpu, 0x24, 0x0D);                /* I2C_MST_CTRL: 400kHz */
+    wr_r(mpu, 0x6A, (uint8_t)((uc | 0x20) & ~0x02)); /* I2C_MST_EN (芯片会顺手清掉 BYPASS_EN) */
+    esp_rom_delay_us(5000);
+
+    size_t used = 0;
+    int n = 0, nk = 0, na = 0;
+    for (uint16_t a = 0x08; a <= 0x77; a++) {
+        wr_r(mpu, 0x25, (uint8_t)(0x80 | a)); /* I2C_SLV0_ADDR: 读 */
+        wr_r(mpu, 0x26, 0x00);                /* I2C_SLV0_REG */
+        wr_r(mpu, 0x27, 0x81);                /* I2C_SLV0_CTRL: EN + 1 字节 */
+        esp_rom_delay_us(3000);               /* ≥3 个采样周期, 否则读到的是上一条地址的残留 */
+        uint8_t st = 0, d = 0;
+        if (rd_rr(mpu, 0x36, &st, 1) != ESP_OK) continue;
+        if (st & 0x20) na++; /* I2C_LOST_ARB: 有别的东西在抢线 → AUX 电气上不干净 */
+        if (st & 0x01) {
+            nk++;
+            continue;
+        }
+        n++;
+        rd_rr(mpu, 0x49, &d, 1); /* EXT_SENS_DATA_00 */
+        if (used + 9 < cap)
+            used += (size_t)snprintf(list + used, cap - used, "0x%02X=%02X ", (unsigned)a, d);
+    }
+    if (used) list[used - 1] = '\0';
+
+    wr_r(mpu, 0x6A, uc); /* 关主机 */
+    wr_r(mpu, 0x37, ip); /* BYPASS_EN 回写 */
+    wr_r(mpu, 0x19, sr);
+    *nack = nk;
+    *arb = na;
+    return n;
+}
+
 static void dev_qmc6309(void)
 {
     hw_item_t *it = hw_begin("dev.qmc6309", "QMC6309 地磁(AUX)");
@@ -825,16 +870,26 @@ static void dev_qmc6309(void)
     bool a_p = probe_at(HW_EXP_QMC_ADDR);     /* 0x0C: 旁路开后应答的地址 */
     bool a_alt = probe_at(HW_EXP_QMC_ADDR_ALT); /* 0x2C: 主工程常量, 本硬件无应答 */
     if (!a_p && !a_alt) {
-        char list[96] = "", got[112];
+        char list[80] = "", mlist[80] = "", got[96], mgot[96];
         int n = scan_aux(list, sizeof(list));
-        if (n < 0) snprintf(got, sizeof(got), "未跑 (拿不到 I2C 总线句柄)");
-        else if (n == 0) snprintf(got, sizeof(got), "无应答 (总线一片死寂)");
+        int nk = 0, na = 0, m = -1;
+        i2c_master_dev_handle_t mpu2 = open_at(MPU6500_I2C_ADDR, 400);
+        if (mpu2) {
+            m = scan_aux_mst(mpu2, mlist, sizeof(mlist), &nk, &na);
+            close_at(mpu2);
+        }
+        if (n < 0) snprintf(got, sizeof(got), "未跑");
+        else if (n == 0) snprintf(got, sizeof(got), "无应答");
         else snprintf(got, sizeof(got), "%d 个: %s", n, list);
-        hw_set(it, "0x37=0x%02X(BYPASS_EN ✓), 0x%02X/0x%02X 均 NACK; 旁路开后全扫 → %s", cfg,
-               HW_EXP_QMC_ADDR, HW_EXP_QMC_ADDR_ALT, got);
-        if (n < 0) hw_note(it, "本项无效: 总线句柄都没拿到");
-        else if (n == 0) hw_note(it, "旁路已开仍无人应答 → 芯片不在总线上 (未贴装/虚焊/AUX 走线断)");
-        else hw_note(it, "对照 i2c.scan 清单: 一样 → AUX 段没东西 (非地址问题); 多出别的 → 地址要重查");
+        if (m < 0) snprintf(mgot, sizeof(mgot), "未跑");
+        else if (m == 0) snprintf(mgot, sizeof(mgot), "0 个 (NACK %d 仲裁丢 %d)", nk, na);
+        else snprintf(mgot, sizeof(mgot), "%d 个: %s", m, mlist);
+        hw_set(it, "BYPASS_EN=0x%02X ✓ | 旁路扫 %s | MPU 主机扫 %s", cfg, got, mgot);
+        if (n < 0 || m < 0) hw_note(it, "本项无效: MPU 句柄或寄存器读失败");
+        else if (m > 0) hw_note(it, "MPU 主机扫到了东西 → AUX 上有器件, 是旁路那条道没通");
+        else if (na > 0) hw_note(it, "MPU 主机仲裁丢失 %d 次 → AUX 电气上不干净 (抢线/短路), 先查走线", na);
+        else if (n == 0) hw_note(it, "两条路都静默 → 芯片不在总线上 (未贴装/虚焊/AUX 断)");
+        else hw_note(it, "旁路只见原有器件, 主机 112 地址全 NACK → 两条路都没见到 AUX 器件");
         /* 检测不到 = 硬件错误 (未贴装 / 虚焊 / 旁路未接通) */
         hw_end(it, HW_ST_FAIL);
         return;
