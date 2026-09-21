@@ -152,6 +152,7 @@ extern const int HW_EXP_ES_CMP_N;
 #define HW_EXP_SPK_AMP 5000           /* 单音幅度 (LSB, 满 32767) ≈ -16dBFS */
 #define HW_EXP_SPK_VOL_REG 0xCC       /* ES8311 0x32 = DAC 音量; app 播 TTS 时写的就是这个值 */
 #define HW_EXP_SPK_LOOP_GAIN_MIN 4.0f /* 回采相对底噪的提升倍数下限 (先验值, 照结果回调没意义) */
+#define HW_EXP_SPK_REPLAY_GAP_MS 1000 /* 播放与回放之间的静默: 让耳朵把两声分开 */
 
 /* ═══ G. 马达 ═══ */
 #define HW_EXP_HAPTIC_DUTY_PCT 50

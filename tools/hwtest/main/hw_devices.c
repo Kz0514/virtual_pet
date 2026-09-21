@@ -1066,9 +1066,11 @@ static void audio_mic(i2s_chan_handle_t rx)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * F 段 · 扬声器回采 —— 本工程**唯一出声**的地方 (300ms 一声), 其余全程静音。
+ * F 段 · 扬声器回采 —— 本工程**唯一出声**的地方, 其余全程静音。
+ * 响两声: 先放 440Hz 同时录 (300ms), 静默 1 秒, 再把录到的原样放出来。
+ * 第二声听得见 = 麦克风确实录到了喇叭的声音, 这一层不靠读数。
  *
- * 喇叭和麦克风挨着 → "有没有出声"可以用声学回路自动判, 不必等人耳。
+ * 喇叭和麦克风挨着 → "有没有出声"也可以用声学回路自动判, 不必等人耳。
  * 判据 = 播放前后**自己比自己** (静音底噪 vs 播放中) 在同一单音频点上的提升倍数,
  * 所以房间本来多吵不影响结论, 也不需要事先标定麦克风灵敏度。
  *
@@ -1253,8 +1255,19 @@ static void audio_spk(i2s_chan_handle_t tx, i2s_chan_handle_t rx)
     }
     amp_enable(false); /* 交出去时功放必须是关的 */
 
+    /* ④ 把刚录到的原样放出来 —— 耳朵复核。回放期间不读 RX, 免得把回放又录进去。 */
+    vTaskDelay(pdMS_TO_TICKS(HW_EXP_SPK_REPLAY_GAP_MS));
+    bool rep_ok = false;
+    if (n1 > 0) {
+        size_t w = 0;
+        amp_enable(true);
+        rep_ok = (i2s_channel_write(tx, buf, (size_t)n1 * 4, &w, 1000) == ESP_OK);
+        amp_enable(false);
+    }
+
     mic_win_t p;
     mic_analyze(buf, (n1 > 0) ? n1 : 1, &p);
+    mic_drain(rx, buf); /* 上面这一段没人读 RX, DMA 已经溢出: 清掉, 别留给后面的项 */
     heap_caps_free(buf);
 
     int ci = (p.tone[1] > p.tone[0]) ? 1 : 0; /* 判在响的那个槽 */
@@ -1263,8 +1276,9 @@ static void audio_spk(i2s_chan_handle_t tx, i2s_chan_handle_t rx)
     float gain = (got + 1.0f) / (base + 1.0f);
     /* 宽带 RMS 一并报: 单频不动而宽带抬 = 在响但不是这个频点; 两个都不动 = 没出声 */
     float rq = (q.rms[0] + q.rms[1]) * 0.5f, rp = (p.rms[0] + p.rms[1]) * 0.5f;
-    hw_set(it, "440Hz 底噪 %.1f → 播放中 %.1f (%.1f 倍); 宽带RMS %.1f → %.1f, 推 %u 字节 %s",
-           base, got, gain, rq, rp, (unsigned)pushed, dac_ok ? "" : "[DAC 寄存器写失败]");
+    hw_set(it, "440Hz 底噪 %.1f → 播放中 %.1f (%.1f 倍); 宽带RMS %.1f → %.1f, 推 %u 字节%s | 回放%s",
+           base, got, gain, rq, rp, (unsigned)pushed, dac_ok ? "" : "[DAC 寄存器写失败]",
+           rep_ok ? "✓" : "×");
 
     if (!dac_ok) {
         hw_note(it, "0x18 的 DAC 音量/静音寄存器写不进去 → 播放通路配置失败");
