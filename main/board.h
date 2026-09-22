@@ -38,7 +38,7 @@ extern "C" {
 #define MPU6500_I2C_ADDR 0x68 /* 6轴加速度/陀螺仪 (直连I2C0, AD0=0) */
 #define OPT3001_I2C_ADDR 0x44 /* 环境光传感器 (直连I2C0) */
 #define HDC1080_I2C_ADDR 0x40 /* 温湿度传感器 (直连I2C0) */
-#define QMC6309_I2C_ADDR 0x2C /* 地磁传感器 (⚠️ 挂MPU6500 AUX总线, 非直连I2C0) */
+#define QMC6309_I2C_ADDR 0x7C /* 地磁传感器 (⚠️ 挂MPU6500 AUX总线, 非直连I2C0) */
 #define BQ27220_I2C_ADDR 0x55 /* 电池电量计 (直连I2C0) */
 
 /* ════════════════════════════════════════════════════════════════════════

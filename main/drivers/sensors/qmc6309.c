@@ -2,17 +2,15 @@
  * @file qmc6309.c
  * @brief QMC6309 3轴地磁传感器驱动 (指南针方向)
  *
- * ⚠️ 硬件特殊性: QMC6309 不直连 I2C0 总线.
- * 挂载在 MPU6500 的 AUX I2C 总线上, 读取路径:
- *   ESP32 → I2C0 → MPU6500 (I2C_SLVx旁路) → AUX I2C → QMC6309 (地址 0x2C)
+ * 硬件特殊性: QMC6309 不直连 I2C0. 挂载在 MPU6500 的 AUX I2C 总线上,
+ * MPU6500 初始化时使能 INT_PIN_CFG.BYPASS_EN 后, 可通过主 I2C0 直接访问 (地址 0x7C).
  *
- * MPU6500 初始化时使能 INT_PIN_CFG.BYPASS_EN 后, QMC6309 可通过主 I2C0 直接访问.
- *
- * 寄存器参考: QMC6309 Datasheet (QST Corporation)
- *   - 0x00-0x05: X/Y/Z 数据 (16-bit, 小端, 有符号)
- *   - 0x09: Control 1 (模式/ODR/量程/OSR)
- *   - 0x0A: Control 2 (中断/软复位)
- *   - 0x0D: WIA (Who I Am) = 0x31
+ * 寄存器参考: QMC6309 Datasheet (QST) Rev A
+ *   - 0x00:      Chip ID = 0x90
+ *   - 0x01-0x06: X/Y/Z 数据 (16-bit, 小端, 有符号)
+ *   - 0x09:      状态 (只读)
+ *   - 0x0A:      Control 1 — OSR2[7:5] / OSR1[4:3] / MODE[1:0]
+ *   - 0x0B:      Control 2 — SOFT_RST[7] / ODR[6:4] / RNG[3:2] / SET_RESETMODE[1:0]
  */
 
 #include "board.h"
@@ -28,16 +26,24 @@
 
 static const char *TAG = "qmc6309";
 
-#define QMC6309_ADDR     0x2C
+#define QMC6309_ADDR     0x7C
 
 /* 寄存器 */
-#define REG_X_LSB        0x00
-#define REG_CTRL1        0x09
-#define REG_CTRL2        0x0A
-#define REG_WIA          0x0D
+#define REG_CHIP_ID      0x00
+#define REG_X_LSB        0x01  /* 0x01-0x06: X/Y/Z 各 2 字节 */
+#define REG_CTRL1        0x0A
+#define REG_CTRL2        0x0B
 
-/* 灵敏度: ±2G → 12000 LSB/Gauss → 120 LSB/μT */
-#define QMC6309_SENSITIVITY  120.0f  /* LSB/μT (for ±2G range) */
+#define QMC6309_CHIP_ID  0x90
+#define QMC6309_SOFT_RST 0x80
+
+/* Control 1: OSR2=011(8), OSR1=00(8), MODE=01(Normal) */
+#define CTRL1_CFG        0x61
+/* Control 2: ODR=011(100Hz), RNG=10(±8G), SET/RESETMODE=00(Set and reset on) */
+#define CTRL2_CFG        0x38
+
+/* 灵敏度: ±8G → 4000 LSB/Gauss → 40 LSB/μT */
+#define QMC6309_SENSITIVITY  40.0f
 
 static i2c_master_dev_handle_t s_dev = NULL;
 
@@ -75,28 +81,32 @@ esp_err_t qmc6309_init(void)
         return ret;
     }
 
-    /* 读 Chip ID */
-    uint8_t whoami = 0;
-    if (reg_read(REG_WIA, &whoami, 1) == ESP_OK) {
-        ESP_LOGI(TAG, "WHO_AM_I = 0x%02X (预期 0x31)", whoami);
-    } else {
-        ESP_LOGW(TAG, "WHO_AM_I 读取失败, 检查 AUX 旁路和接线");
+    /* 芯片身份 */
+    uint8_t chip_id = 0;
+    ret = reg_read(REG_CHIP_ID, &chip_id, 1);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Chip ID 读取失败: %d — 检查 AUX 旁路和接线", ret);
+        return ret;
+    }
+    if (chip_id != QMC6309_CHIP_ID) {
+        ESP_LOGE(TAG, "Chip ID = 0x%02X, 预期 0x%02X", chip_id, QMC6309_CHIP_ID);
+        return ESP_ERR_NOT_FOUND;
     }
 
-    /* 软复位 */
-    reg_write(REG_CTRL2, 0x80);          /* SOFT_RST */
+    /* 软复位: SOFT_RST 不自清, 必须再写一次 0x00 */
+    reg_write(REG_CTRL2, QMC6309_SOFT_RST);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    reg_write(REG_CTRL2, 0x00);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    /* Control 1: OSR=512, ±2G, 100Hz, 连续模式 */
-    /* 0x0D = 0b00001101: OSR[7:5]=000(512), RNG[4:3]=00(±2G),
-     *                      ODR[2:1]=10(100Hz), MODE[0]=1(连续) */
-    reg_write(REG_CTRL1, 0x0D);
+    reg_write(REG_CTRL2, CTRL2_CFG);   /* ODR / 量程 / Set-Reset */
+    reg_write(REG_CTRL1, CTRL1_CFG);   /* OSR + 模式 */
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    uint8_t ctrl1;
-    reg_read(REG_CTRL1, &ctrl1, 1);
-    ESP_LOGI(TAG, "CTRL1=0x%02X, 模式=%s", ctrl1, (ctrl1 & 0x01) ? "连续" : "待机");
-    ESP_LOGI(TAG, "QMC6309 初始化完成 (100Hz, ±2G, OSR512)");
+    uint8_t ctrl1 = 0;
+    if (reg_read(REG_CTRL1, &ctrl1, 1) == ESP_OK)
+        ESP_LOGI(TAG, "CTRL1=0x%02X MODE=%d (1=Normal)", ctrl1, ctrl1 & 0x03);
+    ESP_LOGI(TAG, "QMC6309 初始化完成 (100Hz, ±8G, OSR 8/8)");
     return ESP_OK;
 }
 
@@ -123,7 +133,7 @@ esp_err_t qmc6309_read(qmc6309_data_t *data)
     data->y = my / QMC6309_SENSITIVITY;
     data->z = mz / QMC6309_SENSITIVITY;
 
-    /* 方位角: atan2(y, x) 弧度转度, 0° = 北 */
+    /* 方位角: atan2(y, x) 弧度转度, 0° = 北; 未做倾斜补偿, 仅在水平放置时成立 */
     float heading_rad = atan2f(data->y, data->x);
     data->heading = heading_rad * 180.0f / (float)M_PI;
     if (data->heading < 0) data->heading += 360.0f;

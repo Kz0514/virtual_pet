@@ -5,7 +5,7 @@
  * I2C地址: 0x68 (AD0=0)
  * 测量范围: ±4g (加速度), ±250dps (陀螺仪)
  * 采样率:   ~200Hz (SMPLRT_DIV=3, 内部1kHz / 4)
- * AUX旁路:  使能 → QMC6309 (0x2C) 可通过主I2C总线直接访问
+ * AUX旁路:  使能 → QMC6309 (0x7C) 可通过主I2C总线直接访问
  */
 
 #pragma once
@@ -49,8 +49,6 @@ esp_err_t mpu6500_init(void);
  * @return ESP_OK 成功, 其他值表示 I2C 读取失败
  */
 esp_err_t mpu6500_read(mpu6500_data_t *data);
-
-esp_err_t mpu6500_read_qmc6309(float *mx, float *my, float *mz, float *heading);
 
 /** Expose I2C device handle for DMP driver reuse */
 i2c_master_dev_handle_t mpu6500_get_i2c_dev(void);
