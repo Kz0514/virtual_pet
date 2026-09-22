@@ -44,12 +44,11 @@ extern const int HW_EXP_PARTS_N;
     }
 #define HW_EXP_ADDRS_N 5
 /* QMC6309: 挂 MPU6500 的 AUX, 靠 INT_PIN_CFG.BYPASS_EN 桥到主总线。
- * 旁路打开后它出现在 **0x0C** 且 reg 0x00 = 0x90;
- *                     未贴装的板 0x0C 与 0x2C 都 NACK。
- * 主工程 board.h:41 / qmc6309.c:31 用的 0x2C 从未观察到应答 → 只作对照探一下。
- * 注意: qmc6309.c:80 那个 "WIA(0x0D)=0x31" 也在硬件上读回 0x00 (该驱动从未被调用过) → 不作判据。 */
-#define HW_EXP_QMC_ADDR 0x0C     /* 旁路开后应答的地址 */
-#define HW_EXP_QMC_ADDR_ALT 0x2C /* 主工程里的常量, 本硬件无应答 */
+ * 手册 §5.4: 只有 1 个 I2C 地址, 默认 7CH (§8.2 时序图里 7 位地址 = 1111100)。
+ * 主工程 board.h:41 的 0x2C 与曾见过应答的 0x0C 都不是它 → 只作对照探一下。 */
+#define HW_EXP_QMC_ADDR 0x7C        /* 手册给的地址 */
+#define HW_EXP_QMC_ADDR_ALT 0x0C    /* 曾见过应答的地址 */
+#define HW_EXP_QMC_ADDR_LEGACY 0x2C /* 主工程里的常量 */
 #define HW_EXP_RISE_MAX_NS 2000    /* 上升时间上限 (基准值见 hw_i2c.c) */
 #define HW_EXP_HAMMER_N 400        /* 每地址背靠背连打笔数 */
 
@@ -79,9 +78,12 @@ extern const int HW_EXP_PARTS_N;
  * → 只记录不作判据, 身份改由"数值是否合理"判定 */
 #define HW_EXP_BQ_DEVTYPE 0x0001
 #define HW_EXP_MPU_WHO 0x70
-#define HW_EXP_QMC_ID_REG 0x00 /* 芯片 ID (应答时为 0x90) */
+#define HW_EXP_QMC_ID_REG 0x00 /* Chip ID, POR = 0x90 */
 #define HW_EXP_QMC_ID 0x90
-#define HW_EXP_QMC_WIA_REG 0x0D /* 主工程驱动声称 0x31, 本硬件读回 0x00 → 只记录不判定 */
+/* 0x09 只读状态: POR = 0x18 → D4 NVM_LOAD_DONE / D3 NVM_RDY 都是 1 (稳态)。
+ * D2 ST_RDY(自检没跑=0) / D1 OVFL / D0 DRDY 随测量变 → 只判 D4/D3。 */
+#define HW_EXP_QMC_ST_REG 0x09
+#define HW_EXP_QMC_ST_MASK 0x18
 
 /* ═══ C2. 加速度读数 (震动) ═══ */
 /* 静止时 |a| 必须就是重力 1g —— 这条同时验了"传感器在产出物理上说得通的数据"。

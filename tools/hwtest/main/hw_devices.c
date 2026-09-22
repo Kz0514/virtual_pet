@@ -771,10 +771,10 @@ static void dev_accel_buzz(void)
 /* ══════════════════════════════════════════════════════════════════════
  * QMC6309 地磁: 挂 MPU6500 的 AUX, 靠 INT_PIN_CFG.BYPASS_EN 桥到主总线
  *
- * 贴装因板而异: 贴了 → 旁路打开后 **0x0C 应答** (reg 0x00 = 0x90, reg 0x0D = 0x00),
- *   主工程那个 0x2C 从不应答 (那一处驱动从没被调用过); 没贴 → 0x0C 与 0x2C 都 NACK。
- * → 两个地址都 NACK 判 FAIL, 0x0C 应答才去读 ID。
- * (曾把"0x2C 有应答"当结论 —— 那是 add_device 不探总线造成的假象。)
+ * 手册地址 0x7C (7 位) —— 三个候选都探, 报出各自 ACK 与否:
+ *   0x7C 应答且 reg 0x00 = 0x90 → 器件在位; 三个都 NACK → 未贴装/虚焊/旁路未接通。
+ *   0x0C 单独应答 = 总线上那个应答者不是 QMC6309。
+ * (曾把 0x2C / 0x0C 当结论 —— 前者是 add_device 不探总线造成的假象。)
  * ══════════════════════════════════════════════════════════════════════ */
 
 /* 全地址扫描。B3 的 i2c.scan 跑在旁路打开**之前**, 看不到 AUX 上的东西;
@@ -785,7 +785,7 @@ static int scan_aux(char *list, size_t cap)
     if (!bus) return -1;
     size_t used = 0;
     int n = 0;
-    for (uint16_t a = 0x08; a <= 0x77; a++) {
+    for (uint16_t a = 0x08; a <= 0x7F; a++) {
         if (i2c_master_probe(bus, a, 20) != ESP_OK) continue;
         n++;
         if (used + 6 < cap)
@@ -813,7 +813,7 @@ static int scan_aux_mst(i2c_master_dev_handle_t mpu, char *list, size_t cap, int
 
     size_t used = 0;
     int n = 0, nk = 0, na = 0;
-    for (uint16_t a = 0x08; a <= 0x77; a++) {
+    for (uint16_t a = 0x08; a <= 0x7F; a++) {
         wr_r(mpu, 0x25, (uint8_t)(0x80 | a)); /* I2C_SLV0_ADDR: 读 */
         wr_r(mpu, 0x26, 0x00);                /* I2C_SLV0_REG */
         wr_r(mpu, 0x27, 0x81);                /* I2C_SLV0_CTRL: EN + 1 字节 */
@@ -867,9 +867,10 @@ static void dev_qmc6309(void)
         return;
     }
 
-    bool a_p = probe_at(HW_EXP_QMC_ADDR);     /* 0x0C: 旁路开后应答的地址 */
-    bool a_alt = probe_at(HW_EXP_QMC_ADDR_ALT); /* 0x2C: 主工程常量, 本硬件无应答 */
-    if (!a_p && !a_alt) {
+    bool a_man = probe_at(HW_EXP_QMC_ADDR);          /* 0x7C: 手册地址 */
+    bool a_seen = probe_at(HW_EXP_QMC_ADDR_ALT);     /* 0x0C: 曾见过应答 */
+    bool a_legacy = probe_at(HW_EXP_QMC_ADDR_LEGACY);/* 0x2C: 主工程常量 */
+    if (!a_man && !a_seen && !a_legacy) {
         char list[80] = "", mlist[80] = "", got[96], mgot[96];
         int n = scan_aux(list, sizeof(list));
         int nk = 0, na = 0, m = -1;
@@ -894,7 +895,11 @@ static void dev_qmc6309(void)
         hw_end(it, HW_ST_FAIL);
         return;
     }
-    uint8_t addr = a_p ? HW_EXP_QMC_ADDR : HW_EXP_QMC_ADDR_ALT;
+    uint8_t addr = a_man ? HW_EXP_QMC_ADDR
+                         : (a_seen ? HW_EXP_QMC_ADDR_ALT : HW_EXP_QMC_ADDR_LEGACY);
+    if (!a_man)
+        hw_note(it, "手册地址 0x%02X 无 ACK, 应答的是 0x%02X → 那个应答者不是 QMC6309",
+                HW_EXP_QMC_ADDR, addr);
     i2c_master_dev_handle_t dev = open_at(addr, 400);
     if (!dev) {
         hw_set(it, "ACK 于 0x%02X", addr);
@@ -902,11 +907,12 @@ static void dev_qmc6309(void)
         hw_end(it, HW_ST_FAIL);
         return;
     }
-    uint8_t idv = 0, wia = 0;
+    uint8_t idv = 0, st = 0;
     esp_err_t e1 = rd_rr(dev, HW_EXP_QMC_ID_REG, &idv, 1);
-    esp_err_t e2 = rd_rr(dev, HW_EXP_QMC_WIA_REG, &wia, 1);
+    esp_err_t e2 = rd_rr(dev, HW_EXP_QMC_ST_REG, &st, 1);
     close_at(dev);
-    hw_set(it, "INT_PIN_CFG=0x%02X, ACK 于 0x%02X", cfg, addr);
+    hw_set(it, "INT_PIN_CFG=0x%02X, ACK 0x%02X=%d 0x%02X=%d 0x%02X=%d", cfg, HW_EXP_QMC_ADDR,
+           a_man, HW_EXP_QMC_ADDR_ALT, a_seen, HW_EXP_QMC_ADDR_LEGACY, a_legacy);
     /* 地址 ACK 了却读不出 ID = "半死应答者"特征 (器件半死时就是这样) → FAIL */
     if (e1 != ESP_OK) {
         hw_note(it, "地址 ACK 但 ID(0x%02X) 读失败 → 半死应答者 (器件/走线), 不是没贴装",
@@ -914,14 +920,16 @@ static void dev_qmc6309(void)
         hw_end(it, HW_ST_FAIL);
         return;
     }
-    hw_note(it, "ID(0x%02X)=0x%02X (期望 0x%02X)%s", HW_EXP_QMC_ID_REG, idv, HW_EXP_QMC_ID,
-            (e2 == ESP_OK) ? "" : " [0x0D 读失败]");
-    if (idv == HW_EXP_QMC_ID) {
-        if (e2 == ESP_OK && wia != 0x00)
-            hw_note(it, "0x0D=0x%02X (主工程驱动声称 0x31, 本硬件读回 0x00 → 不判定)", wia);
-        hw_end(it, HW_ST_PASS);
-    } else {
+    hw_note(it, "ID(0x%02X)=0x%02X (期望 0x%02X); 状态(0x%02X)=0x%02X, NVM 两位期望置上%s",
+            HW_EXP_QMC_ID_REG, idv, HW_EXP_QMC_ID, HW_EXP_QMC_ST_REG, st,
+            (e2 == ESP_OK) ? "" : " [0x09 读失败]");
+    if (idv != HW_EXP_QMC_ID) {
         hw_end(it, HW_ST_WARN);
+    } else if (e2 == ESP_OK && (st & HW_EXP_QMC_ST_MASK) != HW_EXP_QMC_ST_MASK) {
+        hw_note(it, "ID 对得上但 NVM_LOAD_DONE/NVM_RDY 没置上 → 器件没到就绪态 (供电/时钟)");
+        hw_end(it, HW_ST_WARN);
+    } else {
+        hw_end(it, HW_ST_PASS);
     }
 }
 

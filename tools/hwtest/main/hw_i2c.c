@@ -58,7 +58,7 @@ static const struct {
     {0x44, 0x7F, 2}, /* OPT3001 设备 ID */
     {0x55, 0x08, 2}, /* BQ27220 电压 */
     {0x68, 0x75, 1}, /* MPU6500 WHO_AM_I */
-    {0x0C, 0x00, 2}, /* QMC6309 (AUX 旁路开的) */
+    {0x7C, 0x00, 2}, /* QMC6309 (AUX 旁路开的) */
 };
 #define HAMMER_TARGETS_N (sizeof(HAMMER_TARGETS) / sizeof(HAMMER_TARGETS[0]))
 
@@ -66,7 +66,7 @@ const char *hw_dev_name(uint8_t a)
 {
     switch (a) {
     case 0x18: return "ES8311";
-    case 0x0C: return "QMC6309";
+    case 0x7C: return "QMC6309";
     case 0x40: return "HDC1080";
     case 0x44: return "OPT3001";
     case 0x55: return "BQ27220";
@@ -221,7 +221,7 @@ static void fmt_found(const uint8_t *found, int n, char *out, size_t out_len)
     }
 }
 
-/* 期望集合核对: 5 个直连器件必须全在; 0x0C(QMC6309, AUX 旁路开的) 允许出现。
+/* 期望集合核对: 5 个直连器件必须全在; 0x7C(QMC6309, AUX 旁路开的) 允许出现。
  * 返回: 0 = 一致; 否则 *note 写原因 */
 static int addrs_verify(const uint8_t *found, int n, char *note, size_t nl)
 {
@@ -334,7 +334,7 @@ void hw_i2c_bitbang(void)
     int n = 0;
     char stuck[96] = {0};
     size_t su = 0;
-    for (uint16_t a = 0x08; a <= 0x77; a++) {
+    for (uint16_t a = 0x08; a <= 0x7F; a++) {
         bb_start();
         bool ack = bb_write_byte((uint8_t)(a << 1));
         bb_stop();
@@ -413,7 +413,7 @@ static i2c_master_dev_handle_t dev_open(i2c_master_bus_handle_t bus, uint8_t add
 static int hw_scan(i2c_master_bus_handle_t bus, uint8_t *found)
 {
     int n = 0;
-    for (uint16_t a = 0x08; a <= 0x77; a++) {
+    for (uint16_t a = 0x08; a <= 0x7F; a++) {
         /* 注意: i2c_master_probe() 内部固定 100kHz (与 scl_speed_hz 无关) */
         if (i2c_master_probe(bus, a, HW_PROBE_TIMEOUT_MS) == ESP_OK && n < HW_SCAN_MAX) {
             found[n++] = (uint8_t)a;
@@ -503,7 +503,7 @@ static int hammer(i2c_master_bus_handle_t bus, uint8_t addr, uint8_t reg, int nb
     return at ? 1 : 0;
 }
 
-/* 每地址 400 笔 + 间隔扫描 + 0x0C↔0x55 交替 */
+/* 每地址 400 笔 + 间隔扫描 + 0x7C↔0x55 交替 */
 void hw_i2c_stress(void)
 {
     if (!s_bus) {
@@ -552,7 +552,7 @@ void hw_i2c_stress(void)
         hw_end(it, HW_ST_PASS);
     }
 
-    /* ── (b) 间隔扫描 + 0x0C↔0x55 交替 ── */
+    /* ── (b) 间隔扫描 + 0x7C↔0x55 交替 ── */
     it = hw_begin("i2c.timing", "间隔/交替流量");
     if (ok_total == 0) {
         hw_note(it, "总线全程无应答 → 没有流量可测 (先解决上一项的失败)");
@@ -581,15 +581,15 @@ void hw_i2c_stress(void)
         }
     }
     if (!t_wedged) {
-        /* 0x0C (旁路开的 QMC) 一笔 ↔ 0x55 一笔: 卡点落在谁身上就指认谁是触发者 */
+        /* 0x7C (旁路开的 QMC) 一笔 ↔ 0x55 一笔: 卡点落在谁身上就指认谁是触发者 */
         i2c_master_dev_handle_t d55 = dev_open(s_bus, 0x55, 400);
-        i2c_master_dev_handle_t d0c = dev_open(s_bus, 0x0C, 400);
+        i2c_master_dev_handle_t d0c = dev_open(s_bus, 0x7C, 400);
         int at = 0;
         uint8_t last = 0;
         if (d55 && d0c) {
             for (int i = 1; i <= HW_EXP_HAMMER_N; i++) {
                 uint8_t cmd = 0x00, buf[2] = {0, 0};
-                last = 0x0C;
+                last = 0x7C;
                 i2c_master_transmit_receive(d0c, &cmd, 1, buf, 2, HW_HAMMER_TIMEOUT_MS);
                 if (!hw_i2c_lines_free()) { at = i; break; }
                 cmd = 0x08;
@@ -601,9 +601,9 @@ void hw_i2c_stress(void)
         if (d55) i2c_master_bus_rm_device(d55);
         if (d0c) i2c_master_bus_rm_device(d0c);
         if (at) {
-            hw_note(it, "0x0C↔0x55 第 %d 对钳线, 那笔打的是 0x%02X", at, last);
+            hw_note(it, "0x7C↔0x55 第 %d 对钳线, 那笔打的是 0x%02X", at, last);
             t_wedged = true;
-            recover_ladder("0x0C↔0x55");
+            recover_ladder("0x7C↔0x55");
         }
     }
     hw_set(it, "间隔 0/200/500/1000/2000us ×200 笔 + 交替 %d 对", HW_EXP_HAMMER_N);

@@ -30,7 +30,7 @@
 #define OPT3001_I2C_ADDR 0x44 /* 环境光 */
 #define HDC1080_I2C_ADDR 0x40 /* 温湿度 */
 #define BQ27220_I2C_ADDR 0x55 /* 电量计 (板上唯一 BGA) */
-#define QMC6309_I2C_ADDR 0x0C /* 地磁 (AUX 旁路开时出现在 0x0C; 主工程 board.h 的 0x2C 是错的, 见 README) */
+#define QMC6309_I2C_ADDR 0x7C /* 地磁 (挂 AUX; 主工程 board.h 的 0x2C 是错的) */
 
 /* ── 显示屏 ST7789 (SPI2, 4 线制, 无 MISO → 只能验写通路) ── */
 #define DISPLAY_SPI_HOST SPI2_HOST

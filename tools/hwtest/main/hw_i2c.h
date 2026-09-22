@@ -29,7 +29,7 @@ void hw_i2c_bus_close(void);
 i2c_master_bus_handle_t hw_i2c_bus(void);
 /* B3 外设路径全地址扫描 + 期望比对 */
 void hw_i2c_bus_scan(void);
-/* B4 满速连打压力 + 间隔扫描 + 0x0C↔0x55 交替 */
+/* B4 满速连打压力 + 间隔扫描 + 0x7C↔0x55 交替 */
 void hw_i2c_stress(void);
 /* B5 MCLK 开关压力 (LEDC 假 MCLK — 关键实验) */
 void hw_i2c_mclk_stress(void);
