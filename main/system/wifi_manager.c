@@ -575,8 +575,8 @@ static esp_err_t http_server_start(void)
     }
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
-    /* 规则 (httpd_main.c): max_open_sockets + 3 ≤ LWIP_MAX_SOCKETS, 否则 INVALID_ARG;
-     * LWIP=8 (sdkconfig.defaults) → 上限 5。旧值 8 使配网门户起不来 (2026-09-16 新板首烧发现) */
+    /* httpd_main.c 约束: max_open_sockets + 3 ≤ LWIP_MAX_SOCKETS, 否则 INVALID_ARG。
+     * 另需 softAP DHCP 与 DNS 劫持各 1 槽 → LWIP=12 时客户端可用 7 */
     cfg.max_open_sockets = 5;
     esp_err_t err = httpd_start(&s_httpd, &cfg);
     if (err != ESP_OK) {
