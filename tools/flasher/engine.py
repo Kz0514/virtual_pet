@@ -30,7 +30,11 @@ STEP_NAMES = ("解析镜像", "找板", "连接", "写镜像", "回读校验", "
 
 # 进度行 (esptool v5 logger.progress_bar: \r{clear}{prefix}[{bar}] {pct:>5}%{suffix})
 PROG_RE = re.compile(r"^(?P<what>Writing|Reading|Dumping|Downloading|Erasing)\b[^\[]*\[[^\]]*\]\s*(?P<pct>[\d.]+)%")
-WROTE_RE = re.compile(r"^Wrote (\d+) bytes at (0x[0-9a-fA-F]+)")
+# esptool v5 默认压缩 (Compressed N to M), "Wrote" 行会多一段 "(M compressed)"。
+# 少了这个可选段, 每个区域的收官行都对不上 → 区域下标永远停在第一个区域
+WROTE_RE = re.compile(r"^Wrote (\d+) bytes(?: \(\d+ compressed\))? at (0x[0-9a-fA-F]+)")
+# 进度行尾巴 " 0/13856 bytes...": 是压缩流的字节数, 不是日志。当噪声丢掉
+TAIL_RE = re.compile(r"^\d+/\d+ bytes")
 APP_VER_RE = re.compile(r"App version:\s*(\S+)")
 PROJ_RE = re.compile(r"Project name:\s*(\S+)")
 MAC_RE = re.compile(r"MAC:\s*([0-9a-fA-F:]{17})")
@@ -217,7 +221,7 @@ def run_esptool(cmd, sink, cwd=None, timeout=900, on_event=None):
             emit(line.strip()[:m.end()], float(m.group("pct")) / 100.0)
             # 末尾那次刷新没有换行符, 下一行日志会粘在百分比后面 — 拆出来别吞掉
             rest = line.strip()[m.end():].strip()
-            if rest:
+            if rest and not TAIL_RE.match(rest):
                 feed(rest.encode("utf-8"))
             return
         lines.append(line)

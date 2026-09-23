@@ -18,17 +18,40 @@ import device
 import engine
 import images
 
-# 进度解析的固定样例 — esptool 输出格式一变这里先红, 而不是等到烧录现场
+# 进度解析的固定样例 — esptool 输出格式一变这里先红, 而不是等到烧录现场。
+# 样例全部照抄 v5.3.1 实测输出 (含默认压缩), 别照 v4 的样子编 — 编出来的样例是绿的,
+# 现场却是死的 (WROTE_RE 漏了压缩尾巴那次就是这么漏过去的)。
 PROG_SAMPLES = [
-    ("Writing [==========          ]  45.0%", "Writing", 0.45),
-    ("\033[KWriting [====                ]  12.5%", "Writing", 0.125),
-    ("\r\033[KReading [==============      ]  72.0%", "Reading", 0.72),
+    # 写: 前缀带地址, 后缀是压缩流字节数 (end="\n" 时整行独立)
+    ("Writing at 0x0000f000 [                              ]   0.0% 0/46 bytes...",
+     "Writing", 0.0),
+    ("Writing at 0x00011000 [==============================] 100.0% 46/46 bytes...",
+     "Writing", 1.0),
+    ("\r\033[KWriting at 0x00020000 [====>           ]  32.5% 16384/1031389 bytes...",
+     "Writing", 0.325),
+    # 读: 没有后缀
+    ("\r\033[KReading from 0x0000a000 [====>                    ]  16.7%",
+     "Reading", 0.167),
+    ("Reading from 0x0000f000 [==============================] 100.0%", "Reading", 1.0),
     ("Erasing [====================] 100.0%", "Erasing", 1.0),
-    ("Writing at 0x00010000... (45 %)", None, None),      # v4 语法: 不认, 降级成日志
-    ("Wrote 4096 bytes at 0x00010000", None, None),
+    # 不是进度: 带引号文件名的搬运行 / 容量横幅 / 压缩摘要 / v4 老语法
+    ("Writing 'C:\\Users\\x\\build\\Virtualpet.bin' at 0x00020000...", None, None),
+    ("Flash will be erased from 0x00020000 to 0x001a4fff...", None, None),
+    ("Compressed 1591264 bytes to 1031389...", None, None),
+    ("Writing at 0x00010000... (45 %)", None, None),
+    ("Wrote 21536 bytes (13856 compressed) at 0x00000000 in 0.4 seconds...", None, None),
     ("Hash of data verified.", None, None),
 ]
-WROTE_SAMPLE = "Wrote 4096 bytes at 0x00010000 in 0.3 seconds..."
+# "Wrote" 行两个变体都要认: 不压缩 / 压缩(带 "(N compressed)")。它给的是**未压缩**字节数,
+# 也就是 op.size, 区域进度全靠它累加
+WROTE_SAMPLES = [
+    ("Wrote 4096 bytes at 0x00010000 in 0.3 seconds (440.6 kbit/s).", "4096", "0x00010000"),
+    ("Wrote 1591264 bytes (1031389 compressed) at 0x00020000 in 13.1 seconds.", "1591264",
+     "0x00020000"),
+]
+# 进度行尾巴要当噪声丢掉, 不能当日志行吐出来
+TAIL_SAMPLES = [("0/13856 bytes...", True), ("16384/1031389 bytes...", True),
+                ("Wrote 4096 bytes", False)]
 
 
 class Report:
@@ -134,9 +157,13 @@ def check_progress_regex(rep: Report):
             continue
         if not m or m.group("what") != what or abs(float(m.group("pct")) / 100 - frac) > 1e-9:
             bad.append("%r 解析错" % line)
-    m = engine.WROTE_RE.match(WROTE_SAMPLE)
-    if not (m and m.group(1) == "4096" and m.group(2) == "0x00010000"):
-        bad.append("WROTE_RE 认不出已写字节数")
+    for line, size, addr in WROTE_SAMPLES:
+        m = engine.WROTE_RE.match(line)
+        if not (m and m.group(1) == size and m.group(2) == addr):
+            bad.append("WROTE_RE 认不出 %r" % line)
+    for line, want_tail in TAIL_SAMPLES:
+        if bool(engine.TAIL_RE.match(line)) != want_tail:
+            bad.append("TAIL_RE 判错 %r" % line)
     rep.add("进度正则自测", "FAIL" if bad else "PASS",
             "; ".join(bad) if bad else "%d 条样例" % len(PROG_SAMPLES))
 

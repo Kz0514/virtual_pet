@@ -423,6 +423,25 @@ def _tool_stamp() -> str:
         return "esptool ?"
 
 
+def _work_area() -> tuple:
+    """桌面可用区 (已扣掉任务栏)。窗口默认尺寸按它定 — 定死 980x780 在高分屏/小屏上
+    会一开就装不下自己, 上面的操作区只能靠手动滚。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                        ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+        r = RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):
+            return r.right - r.left, r.bottom - r.top
+    except Exception:  # noqa: BLE001
+        pass
+    return 1440, 900
+
+
 # ══════════════════════════════════════════════════════════════════════
 def run() -> int:
     import webview
@@ -433,8 +452,10 @@ def run() -> int:
     if not html.is_file():
         print("!! 找不到界面文件 %s" % html, file=sys.stderr)
         return 2
+    aw, ah = _work_area()
+    w, h = min(1040, max(760, aw - 60)), min(1050, max(560, ah - 46))
     win = webview.create_window("Virtualpet 烧录器", str(html), js_api=api,
-                               width=980, height=780, min_size=(820, 640))
+                               width=w, height=h, min_size=(min(820, w), min(600, h)))
     holder[0] = win
     webview.start()          # 阻塞到窗口关闭
     return 0

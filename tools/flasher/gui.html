@@ -13,11 +13,13 @@
        font:13px/1.6 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;}
   .wrap{display:flex;flex-direction:column;height:100vh;padding:12px;gap:10px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
-  h2{margin:0 0 8px;font-size:13px;font-weight:600;color:var(--dim);letter-spacing:.5px}
-  .row{display:flex;gap:10px}
-  .row>*{flex:1;min-width:0}
+  h2{margin:0 0 6px;font-size:13px;font-weight:600;color:var(--dim);letter-spacing:.5px}
+  /* 中间两列按内容定高; 挤不下时内部自己滚 (min-height:0 才允许压到内容高度以下) —
+     否则它们会一直长, 把底下的日志区挤成一条缝 */
+  .row{display:flex;gap:10px;min-height:0;overflow:hidden}
+  .row>*{flex:1;min-width:0;overflow:auto}
   .banner{display:flex;align-items:center;gap:12px}
-  .ver{font-size:20px;font-weight:700}
+  .ver{font-size:18px;line-height:1.35;font-weight:700}
   .dim{color:var(--dim)}
   .small{font-size:12px}
   .dot{width:9px;height:9px;border-radius:50%;background:var(--dim);display:inline-block}
@@ -28,6 +30,7 @@
        border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
   label.chk{display:block;margin:3px 0;cursor:pointer;user-select:none}
   label.chk input{margin-right:6px;vertical-align:-1px}
+  label.chk.off{color:var(--dim);cursor:default}
   .radio{display:block;margin:4px 0;padding:6px 8px;border:1px solid var(--line);
          border-radius:6px;cursor:pointer}
   .radio.on{border-color:var(--acc);background:#16233a}
@@ -40,10 +43,11 @@
   button.danger{background:var(--erase);border-color:var(--erase);color:#fff}
   .danger-zone{border-color:#5a2420;background:#1f1614}
   .danger-zone h2{color:#e08e84}
-  .erase-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
-  .erase-grid button{background:#2a1c1a;border-color:#5a2420;padding:7px 4px;font-size:12px}
+  .erase-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}
+  .erase-grid button{background:#2a1c1a;border-color:#5a2420;padding:6px 4px;font-size:12px}
   .erase-grid button:hover:not(:disabled){background:#3a2422}
-  #dumpListBox{max-height:136px;overflow:auto;margin:8px 0}
+  /* 勾选列表吃掉剩下的高度, 不够就自己滚 — 别让整个右列滚, 那样连"开始提取"都看不见了 */
+  #dumpListBox{flex:1 1 auto;min-height:0;overflow:auto;margin:6px 0}
   #dumpListBox label.chk{margin:2px 0}
   .cred{color:var(--warn)}
   .bar{height:14px;background:#0e1116;border-radius:7px;overflow:hidden;border:1px solid var(--line)}
@@ -59,7 +63,10 @@
   .chip.WARN{border-color:var(--warn);color:var(--warn)}
   .chip.FAIL{border-color:var(--bad);color:var(--bad)}
   .chip.SKIP{opacity:.5}
-  #log{flex:1;overflow:auto;background:#0b0d11;border:1px solid var(--line);border-radius:8px;
+  /* min-height 是底线: flex-basis 0 的项没有下限时会被上面长高的列吃干净 (实测压到 18px,
+     只剩内边距) — 烧录过程全靠这块看进度, 不能归零。窗口矮时按比例缩, 好把高度让给上面的操作区 */
+  #log{flex:1 1 0;min-height:clamp(80px,15vh,150px);overflow:auto;background:#0b0d11;
+       border:1px solid var(--line);border-radius:8px;
        padding:8px 10px;font:12px/1.5 Consolas,"Cascadia Mono",monospace;white-space:pre-wrap;
        word-break:break-all}
   #log div{color:#c8cfda}
@@ -119,7 +126,7 @@
       </label>
 
       <div style="margin-top:10px">
-        <label class="chk"><input type="checkbox" id="oAssets"> 附带资源包 assets (约 26MB, 动画/音效/语音)</label>
+        <label class="chk" id="lAssets"><input type="checkbox" id="oAssets"> 附带资源包 assets <span class="small dim" id="assetsHint">(约 26MB, 动画/音效/语音)</span></label>
         <label class="chk"><input type="checkbox" id="oOta1" checked> 写 ota_1 副本 (不写则 OTA 回滚会回旧版本)</label>
         <label class="chk"><input type="checkbox" id="oVerify" checked> 写后回读校验</label>
         <label class="chk"><input type="checkbox" id="oCapture" checked> 烧完复位并核对版本号</label>
@@ -131,7 +138,7 @@
       <div class="card danger-zone">
         <h2>维护 / 擦除</h2>
         <div class="small dim" style="margin-bottom:8px">
-          擦除是不可逆的。擦完设备上的数据就没了, 唯一的后路是擦前先备份。
+          擦除不可逆: 设备上的数据会没, 唯一后路是擦前备份。
         </div>
         <div class="erase-grid" id="eraseGrid"></div>
 
@@ -142,10 +149,10 @@
         <div class="small dim" id="maintainHint" style="margin-top:8px"></div>
       </div>
 
-      <div class="card">
+      <div class="card" style="flex:1 1 auto;min-height:200px;display:flex;flex-direction:column">
         <h2>提取分区</h2>
         <div class="small dim" style="margin-bottom:8px">
-          把板上区域读成 bin 文件 — 只读, 不改设备。偏移取自板上真实的分区表。
+          只读操作, 不改设备。偏移取自板上真实分区表。
         </div>
         <div class="row">
           <button onclick="dumpList()" id="btnDumpList" style="flex:none">读取板上分区表</button>
@@ -213,7 +220,9 @@ async function poll(){
     if (ev.t === "log") say(ev.line);
     else if (ev.t === "step") step(ev);
     else if (ev.t === "progress") setProgress(ev);
-    else if (ev.t === "begin"){ $("log").innerHTML = ""; say(">>> " + ev.what + " 开始", "s"); clearSteps(); }
+    else if (ev.t === "begin"){ $("log").innerHTML = ""; say(">>> " + ev.what + " 开始", "s"); clearSteps();
+                             const b = $("bar"); b.classList.remove("done","bad");
+                             b.firstElementChild.style.width = "0"; }
     else if (ev.t === "done") done(ev);
     else if (ev.t === "power") powerPrompt(ev.reason);
     else if (ev.t === "erase_info") onEraseInfo(ev);
@@ -246,7 +255,12 @@ function step(ev){
   if (ev.detail) say(">>> " + ev.name + " " + ev.status + " " + ev.detail, ev.status === "FAIL" ? "f" : "s");
 }
 function done(ev){
-  $("bar").classList.add(ev.ok ? "done" : "bad");
+  const bar = $("bar");
+  // 收尾必须补满: 最后一条进度事件未必是 100% (写镜像的百分比是分区域的, 校验阶段干脆没有),
+  // 不补就停在半路还变绿 — 看着像卡死。失败则留着, 好让人看到死在哪
+  if (ev.ok) bar.firstElementChild.style.width = "100%";
+  bar.classList.remove("done","bad");          // 上一轮的颜色别留下 (两条规则同权重, 靠先后定胜负太脆)
+  bar.classList.add(ev.ok ? "done" : "bad");
   say(ev.ok ? ">>> 完成 (退出码 0)" : ">>> 失败: " + (ev.error || "退出码 " + ev.exit),
       ev.ok ? "p" : "f");
   $("status").textContent = ev.ok ? "完成" : "失败";
@@ -267,11 +281,17 @@ window.addEventListener("pywebviewready", async () => {
   // 包里没有 bootloader 就只能烧 app — 默认别停在做不到的那个选项上
   if (info.has_bootloader === false){
     $("rApp").querySelector("input").checked = true;
-    $("oAssets").disabled = info.assets === false;
     say(">>> 这个包只有主程序镜像 (没有 bootloader.bin), 已默认选「只烧主程序」。", "w");
   }
-  // 禁用时一并取消勾选 — 禁用的复选框若先前被勾上, .checked 仍是 true
-  if (info.assets === false){ $("oAssets").disabled = true; $("oAssets").checked = false; }
+  // 没有 assets.bin 就烧不了这一项。禁用的复选框若先前被勾上 .checked 仍是 true, 要一并清掉;
+  // 光禁掉不说原因, 用户只会当成按钮坏了 — 把原因写在选项旁边
+  if (info.assets === false){
+    $("oAssets").disabled = true;
+    $("oAssets").checked = false;
+    $("lAssets").classList.add("off");
+    $("assetsHint").textContent =
+      "本包不含 assets.bin — 要烧资源包请换带 assets 的包, 或把 assets.bin 放进 images/";
+  }
   buildEraseGrid();
   refreshPorts();
   if (!pollTimer) pollTimer = setInterval(poll, 120);

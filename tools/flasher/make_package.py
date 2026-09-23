@@ -33,7 +33,7 @@ STAGE_ROOT = DIST / "pkg"
 
 BASE_PY = Path(r"C:\Espressif\tools\python\python.exe")   # 打包与运行共用这一套
 APP_NAME = "VirtualpetFlasher"
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.1"
 
 # 进 images/ 的文件: 相对 build/ 的路径 → 是否随 --with-assets 才带
 IMAGES = {
@@ -274,6 +274,12 @@ git:      %s
 文件名必须保持 Virtualpet.bin — 烧录器按文件名认角色, 并会核对文件内容与
 名字是否相符 (不符会拒绝烧, 免得把资源包当主程序写进去)。
 
+想连资源包一起烧?
+---------------
+本包%s资源包 (26MB 的动画/音效/语音模型)。设备上已经有资源包的话, 平时只烧
+主程序就行, 资源包不用重烧。要重烧, 把 assets.bin 放进 images/ 再重新打开 —
+界面上「附带资源包 assets」那个选项会自动变为可勾选 (灰着就是包里没有它)。
+
 images/ 目录里各文件的 md5 (核对用):
 %s
 
@@ -313,6 +319,7 @@ images/ 目录里各文件的 md5 (核对用):
 """ % (ver, "含 (26MB)" if with_assets else "不含",
        manifest["built_at"], manifest["git_commit"] or "(未知)",
        APP_NAME,
+       "含" if with_assets else "不含",
        "\n".join("  %-42s %s" % (k, v["md5"]) for k, v in sorted(z.items())),
        APP_NAME, APP_NAME, APP_NAME, APP_NAME, APP_NAME, APP_NAME, APP_NAME)
 
