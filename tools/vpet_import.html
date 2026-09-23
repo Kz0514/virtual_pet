@@ -8,7 +8,7 @@
   --bg:#101418; --panel:#171d24; --panel2:#1d2530; --line:#2a333d;
   --txt:#d7e0e8; --dim:#7b8894; --dim2:#5a6672;
   --accent:#4f8cff; --accent-deep:#3a6fd8; --gold:#ffd23d;
-  --teal:#3fc9b0; --grey:#4a545f;
+  --teal:#3fc9b0; --grey:#4a545f; --bad:#e05c5c;
   --r:10px; --r-sm:7px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -64,16 +64,25 @@ main{flex:1;display:flex;min-height:0}
 .top-row .arw{color:var(--dim2);font-size:10px;width:10px;transition:transform .15s}
 .top-row.open .arw{transform:rotate(90deg)}
 .top-row .n{margin-left:auto;color:var(--dim2);font-size:11.5px;font-weight:400}
-.leaf{
-  display:flex;align-items:center;gap:6px;padding:4px 8px 4px 24px;
-  border-radius:6px;cursor:pointer;font-size:12.5px;color:#b6c2ce;
+.top-row .nm b{color:#fff;font-weight:600}
+/* 组内: 心情排 + 段排 */
+.gbody{padding:2px 6px 8px 14px;display:flex;flex-direction:column;gap:5px}
+.chips{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.chips .cl{color:var(--dim2);font-size:11px;width:30px;flex:none}
+.chip{
+  padding:2px 9px;font-size:11.5px;border-radius:20px;cursor:pointer;
+  border:1px solid var(--line);background:#1a2029;color:#b6c2ce;
 }
-.leaf:hover{background:#1e2732}
-.leaf.active{background:#202a3a;box-shadow:0 0 0 1px var(--accent) inset;color:#fff}
-.leaf .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.leaf .n{margin-left:auto;color:var(--dim2);font-size:11px;flex:none}
-.leaf .bd{flex:none;font-size:10px;padding:0 4px;border-radius:4px;background:#2b3644;color:#9fb2c4}
-.leaf .bd.w{background:#4a3520;color:#ffb454}
+.chip:hover{border-color:#3a4756;color:#fff}
+.chip.on{background:#202a3a;border-color:var(--accent);color:#fff}
+.chip.v{min-width:22px;text-align:center;padding:2px 7px}
+.chip.cur{box-shadow:0 0 0 1px var(--gold) inset}
+.srow{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.srow .slab{
+  color:var(--dim);font-size:11.5px;width:52px;flex:none;cursor:pointer;
+}
+.srow .slab:hover{color:#fff}
+.srow .n{margin-left:auto;color:var(--dim2);font-size:11px;flex:none}
 /* 中: 舞台 */
 #stage{flex:1;display:flex;flex-direction:column;min-width:0;padding:12px;gap:10px}
 #pv-wrap{display:flex;align-items:center;gap:16px;flex:none}
@@ -86,17 +95,20 @@ main{flex:1;display:flex;min-height:0}
   padding:4px 12px;border-radius:20px;border:1px solid var(--line);width:fit-content}
 #pv-dev{color:var(--dim2);font-size:11.5px}
 #pv-dev b{color:var(--gold);font-weight:600}
+#compose{display:flex;gap:6px;flex-wrap:wrap}
+#compose .seg{
+  font-size:11.5px;color:var(--dim);background:var(--panel2);padding:2px 9px;
+  border-radius:20px;border:1px solid var(--line);
+}
+#compose .seg b{color:var(--txt);font-weight:600}
 .kv{display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px;color:var(--dim)}
 .kv b{color:var(--txt);font-weight:600}
-/* 折叠条 */
-#fold-bar{
+/* 去重条 */
+#dedup-bar{
   display:none;align-items:center;gap:10px;padding:8px 12px;font-size:12.5px;
   background:#2b2416;border:1px solid #5c4a1e;border-radius:var(--r);color:#ffd98a;
 }
-#fold-bar.on{display:flex}
-#fold-bar.warn{background:#33201c;border-color:#6b3226;color:#ffb0a0}
-#fold-bar .sp{flex:1}
-#fold-bar button{padding:3px 10px;font-size:12px}
+#dedup-bar.on{display:flex}
 /* 帧带 */
 #strip-wrap{flex:1;min-height:0;display:flex;flex-direction:column;
   border:1px solid var(--line);border-radius:var(--r);background:var(--panel);overflow:hidden}
@@ -122,15 +134,18 @@ main{flex:1;display:flex;min-height:0}
 .fr.blank{border-color:var(--grey);border-style:dashed}
 .fr.blank img{opacity:.12}
 .fr.merge{border-color:var(--teal)}
+.fr.bad{border-color:var(--bad);border-style:dashed}
+.fr.bad img{opacity:.08}
+.fr.bad .tag{color:var(--bad)}
 .fr.merge .cap{color:var(--teal)}
-.fr.fold{border-color:var(--gold)}
-.fr.fold .cap{color:var(--gold)}
+.fr.dup{border-color:var(--gold)}
+.fr.dup .cap{color:var(--gold)}
 .fr .tag{position:absolute;top:3px;left:3px;font-size:9.5px;padding:1px 5px;
   border-radius:4px;background:rgba(10,14,18,.85)}
 .fr.k .tag{color:var(--accent)}
 .fr.blank .tag{color:var(--dim)}
 .fr.merge .tag{color:var(--teal)}
-.fr.fold .tag{color:var(--gold)}
+.fr.dup .tag{color:var(--gold)}
 /* 右: 导出 */
 #side{
   width:330px;min-width:330px;display:flex;flex-direction:column;gap:9px;
@@ -177,11 +192,11 @@ main{flex:1;display:flex;min-height:0}
           <span>导出 <b id="k-out">0</b></span>
           <span>总时长 <b id="k-dur">0</b></span>
         </div>
+        <div id="compose"></div>
       </div>
     </div>
 
-    <div id="fold-bar"><span id="fold-txt"></span><span class="sp"></span>
-      <button id="btn-unfold">展开 (不折叠)</button></div>
+    <div id="dedup-bar"><span id="dedup-txt"></span></div>
 
     <div id="strip-wrap">
       <div id="strip-bar">
@@ -212,13 +227,21 @@ main{flex:1;display:flex;min-height:0}
 <script>
 const $=id=>document.getElementById(id);
 const api=()=> window.pywebview? window.pywebview.api : null;
+const ORDER=["A_Start","B_Loop","C_End","Single"];   /* 播放顺序 */
+const SECN={A_Start:"A 起始",B_Loop:"B 循环",C_End:"C 收尾",Single:"独立"};
 
 /* ══════════ 状态 ══════════ */
 let SCAN=null;      /* scan_tree 结果 */
-let DIR=null;       /* 当前目录的 analyze_frames 结果 */
-let KEEP=new Set(); /* 勾选的原始帧号 */
-let SEQ=[];         /* 当前 keep 集对应的播放序列 (含 loop_back) */
-let PLAY=null;      /* 内置播放器 */
+let GROUPS=[];      /* build_groups 结果: 组 → 心情 → 段 → 变体 */
+let SEL=null;       /* 展开的组 */
+let MOODI=0;        /* 该组选中的心情 */
+let PICKS={};       /* 段 → 选中的变体下标 */
+let CURSEC=null;    /* 帧带正在显示哪个段 */
+let FR={};          /* rel → analyze_frames 结果 (含帧 URI) */
+let KEEPS={};       /* rel → 勾选的帧号 Set, 每段各自记 */
+let SECS=[];        /* 当前合成 [{sec, rel, keep}], 按 A→B→C 排 */
+let SEQ=[];         /* 合成后的播放序列 (含 loop_back 与所属段) */
+let PLAY=null;
 const PLAY_LOOPS=3; /* 与 assets/anim_meta.json 顶层一致 */
 
 function toast(msg,err){const t=$("toast");t.textContent=msg;
@@ -227,23 +250,144 @@ function toast(msg,err){const t=$("toast");t.textContent=msg;
 function status(m,ok){const s=$("status");s.textContent=m;s.className=ok?"ok":"";}
 const fmt=(ms)=> ms>=1000? (ms/1000).toFixed(ms%1000?1:0)+"s" : ms+"ms";
 
+/* ══════════ 组 / 心情 / 段 / 变体 ══════════ */
+function mood(){ return SEL? SEL.moods[MOODI] : null; }
+function secs(){ const m=mood(); return m? m.sections : {}; }
+function pick(a){
+  const ds=secs()[a]; if(!ds||!ds.length) return null;
+  return ds[Math.min(PICKS[a]||0, ds.length-1)];
+}
+function curRel(){ const d=pick(CURSEC); return d? d.rel : null; }
+function firstSec(){
+  for(const a of ORDER) if((secs()[a]||[]).length) return a;
+  return null;
+}
+/* 选中的各段 → 后端 seq_group / export_group 的入参 */
+function buildSecs(){
+  const out=[];
+  for(const a of ORDER){
+    const d=pick(a); if(!d) continue;
+    out.push({sec:a, rel:d.rel,
+              keep:[...(KEEPS[d.rel]||new Set())].sort((x,y)=>x-y)});
+  }
+  return out;
+}
+
+/* ══════════ 目录树 ══════════ */
+function renderTree(){
+  const t=$("tree"); t.innerHTML="";
+  if(!GROUPS.length){
+    t.innerHTML='<div class="hint" style="padding:8px">选择 VPet 目录后列出动作组</div>';
+    return;
+  }
+  GROUPS.forEach(g=>{
+    const on = SEL===g;
+    const row=document.createElement("div"); row.className="top-row";
+    row.innerHTML=`<span class="arw">▶</span>
+      <span class="nm">${g.gt}<b>/${g.name}</b></span>
+      <span class="n">${g.moods.length} 心情 · ${g.frames} 帧</span>`;
+    row.onclick=()=>{ if(on){ SEL=null; renderTree(); return; } pickGroup(g); };
+    t.appendChild(row);
+    if(!on) return;
+    row.classList.add("open");
+
+    const box=document.createElement("div"); box.className="gbody";
+    t.appendChild(box);
+
+    const mb=document.createElement("div"); mb.className="chips";
+    mb.innerHTML='<span class="cl">心情</span>';
+    g.moods.forEach((m,i)=>{
+      const c=document.createElement("button");
+      c.className="chip"+(i===MOODI?" on":"");
+      c.textContent=m.mode;
+      c.title=`${m.dirs} 个目录 · ${m.frames} 帧`;
+      c.onclick=()=>{ if(i!==MOODI){ MOODI=i; PICKS={}; CURSEC=null; applyGroup(); } };
+      mb.appendChild(c);
+    });
+    box.appendChild(mb);
+
+    const S=secs();
+    for(const a of ORDER){
+      const ds=S[a]; if(!ds||!ds.length) continue;
+      const r=document.createElement("div"); r.className="srow";
+      const lab=document.createElement("span"); lab.className="slab";
+      lab.textContent=SECN[a]; lab.title="点这里看这一段的帧";
+      lab.onclick=()=>{ if(CURSEC!==a){ CURSEC=a; renderTree(); renderStrip(); } };
+      r.appendChild(lab);
+      ds.forEach((d,i)=>{
+        const c=document.createElement("button");
+        c.className="chip v"+(i===(PICKS[a]||0)?" on":"")+(a===CURSEC?" cur":"");
+        c.textContent=ds.length>1? String(i+1) : d.rel.split("/").slice(-1)[0];
+        c.title=`${d.rel}  (${d.n} 帧)`;
+        c.onclick=()=>{ if((PICKS[a]||0)!==i){ PICKS[a]=i; CURSEC=a; applyGroup(); } };
+        r.appendChild(c);
+      });
+      const n=document.createElement("span"); n.className="n";
+      n.textContent=`${pick(a).n} 帧`;
+      r.appendChild(n);
+      box.appendChild(r);
+    }
+  });
+  updateExportState();
+}
+
+async function pickGroup(g){
+  SEL=g; MOODI=0; PICKS={}; CURSEC=null;
+  $("prefix").value=g.name.replace(/[^A-Za-z0-9_]/g,"");
+  renderTree();
+  await applyGroup();
+}
+/* 组/心情/变体变了 → 确保各段目录都转过 → 重画 */
+async function applyGroup(){
+  renderTree();
+  playStop();
+  const stale=$("strip");
+  for(const a of ORDER){
+    const d=pick(a); if(!d) continue;
+    if(FR[d.rel]) continue;
+    stale.innerHTML='<div class="hint" style="padding:6px">正在转换 1000×1000 帧…</div>';
+    status("正在转换 "+d.rel+" …",false);
+    const r=await api().load_dir(d.rel);
+    if(!r.ok){ status("转换失败: "+r.error,false); toast(r.error,true); return; }
+    FR[d.rel]=r.dir;
+    if(!KEEPS[d.rel]) KEEPS[d.rel]=new Set(r.dir.frames.filter(f=>f.keep).map(f=>f.i));
+  }
+  if(!CURSEC||!pick(CURSEC)) CURSEC=firstSec();
+  renderTree(); renderStrip();
+}
+
 /* ══════════ 序列 (唯一实现在后端 build_seq, 前端只显示) ══════════ */
 let seqTok=0;
 async function refresh(){
-  if(!DIR) return;
+  SECS=buildSecs();
+  if(!SECS.length){ SEQ=[]; renderSummary(); playStop(); return; }
   const tok=++seqTok;
-  const r=await api().seq(DIR.rel,$("prefix").value.trim(),[...KEEP].sort((a,b)=>a-b));
+  const r=await api().seq_group(SECS.map(s=>({rel:s.rel,keep:s.keep})),
+                                $("prefix").value.trim());
   if(tok!==seqTok||!r.ok) return;      /* 期间又点了一下, 丢弃这次的返回 */
   SEQ=r.seq;
-  $("k-src").textContent=DIR.count;
+  markFrames();
+  renderSummary();
+  $("meta-json").textContent= SEQ.length? JSON.stringify(r.entry,null,2) : "";
+  playStart();
+}
+function renderSummary(){
+  const src=SECS.reduce((a,s)=>a+((FR[s.rel]||{}).count||0),0);
+  $("k-src").textContent=src;
   $("k-out").textContent=SEQ.length;
   $("k-dur").textContent=fmt(SEQ.reduce((a,e)=>a+e.ms,0));
   const hasSub=SEQ.some(e=>e.lb>0);
-  $("pv-dev").innerHTML= SEQ.length<2? "帧太少, 设备会跳过"
+  $("pv-dev").innerHTML= !SEQ.length? "还没选段"
+    : SEQ.length<2? "帧太少, 设备会跳过"
     : (hasSub? "设备: 播一遍<b>就回 idle</b> (含子循环)"
              : `设备: 整组播 <b>${PLAY_LOOPS} 遍</b>后回 idle (无子循环)`);
-  $("meta-json").textContent= SEQ.length? JSON.stringify(r.entry,null,2) : "";
-  playStart();
+  $("compose").innerHTML= SECS.map(s=>
+    `<span class="seg">${SECN[s.sec]} <b>${s.keep.length}</b>/${(FR[s.rel]||{}).count||0} 帧</span>`
+  ).join("");
+  updateExportState();      /* SECS 刚在这儿刷新, 导出按钮要跟着重判 */
+}
+function updateExportState(){
+  $("btn-export").disabled= !SECS.length || SECS.some(s=>!s.keep.length);
 }
 
 /* ══════════ 播放器 — 复刻固件 pet_avatar.c 的推进语义 ══════════ */
@@ -254,13 +398,19 @@ function playStart(){
   PLAY.timer=setTimeout(tick,SEQ[0].ms);
 }
 function playStop(){ if(PLAY){PLAY.run=false;clearTimeout(PLAY.timer);} PLAY=null; }
+function uriOf(e){
+  const s=SECS[e.s], d=s? FR[s.rel]:null;
+  return d? d.frames[e.i].uri : "";
+}
 function showFrame(){
   const e=SEQ[PLAY.pos]; if(!e) return;
-  $("pv-img").src=DIR.frames[e.i].uri;
-  const tag=e.lb>0? ` · 此处 loop_back=${e.lb}` : "";
-  $("pv-cap").textContent=`#${PLAY.pos}/${SEQ.length-1} · ${e.ms}ms${tag}`;
+  $("pv-img").src=uriOf(e);
+  const s=SECS[e.s];
+  $("pv-cap").textContent=`${s?SECN[s.sec]:"?"} #${e.i+1} · ${e.ms}ms`+
+    (e.lb>0? ` · 此处 loop_back=${e.lb}`:"");
+  const rel=s? s.rel:"";
   document.querySelectorAll(".fr").forEach(el=>
-    el.classList.toggle("now", +el.dataset.i===e.i));
+    el.classList.toggle("now", rel===curRel() && +el.dataset.i===e.i));
 }
 function tick(){
   if(!PLAY||!PLAY.run) return;
@@ -283,32 +433,93 @@ function tick(){
   PLAY.timer=setTimeout(tick,SEQ[PLAY.pos].ms);
 }
 
-/* ══════════ 目录树 ══════════ */
-function renderTree(){
-  const t=$("tree"); t.innerHTML="";
-  if(!SCAN) return;
-  SCAN.tops.forEach(top=>{
-    const row=document.createElement("div"); row.className="top-row open";
-    row.innerHTML=`<span class="arw">▶</span><span>${top.name}</span>
-      <span class="n">${top.dirs} 组</span>`;
-    const box=document.createElement("div");
-    t.appendChild(row); t.appendChild(box);
-    SCAN.leaves.filter(l=>l.top===top.name).forEach(l=>{
-      const el=document.createElement("div"); el.className="leaf";
-      el.dataset.rel=l.rel;
-      const short=l.rel.slice(top.name.length+1)||"(根)";
-      let bd="";
-      if(l.layered) bd+=`<span class="bd w">分层</span>`;
-      if(!l.contiguous) bd+=`<span class="bd w">跳号</span>`;
-      if(l.warn) bd+=`<span class="bd w">多帧</span>`;
-      el.innerHTML=`<span class="nm" title="${l.rel}">${short}</span>${bd}
-        <span class="n">${l.count}</span>`;
-      el.onclick=()=>loadDir(l.rel,el);
-      box.appendChild(el);
-    });
-    row.onclick=()=>{row.classList.toggle("open");
-      box.style.display=row.classList.contains("open")?"":"none";};
+/* ══════════ 帧带 ══════════ */
+function renderStrip(){
+  playStop();
+  const s=$("strip"); s.innerHTML="";
+  const rel=curRel(), d=rel? FR[rel]:null;
+  if(!d){
+    $("strip-ttl").textContent="帧";
+    s.innerHTML='<div class="hint" style="padding:6px">展开左边一个动作组</div>';
+    renderDedup(); refresh(); return;
+  }
+  $("strip-ttl").textContent=`${SECN[CURSEC]} · ${rel} · 源 ${d.count} 帧`+
+    (d.bad? ` (含 ${d.bad} 张坏图)` : "");
+  const K=KEEPS[rel]||new Set();
+  d.frames.forEach(f=>{
+    const el=document.createElement("div"); el.className="fr"; el.dataset.i=f.i;
+    let tag="";
+    if(f.plan==="bad"){ el.className+=" bad"; tag="源图坏"; }
+    else if(f.plan==="blank"){ el.className+=" blank"; tag="空帧"; }
+    else if(f.plan==="merge"){ el.className+=" merge"; tag="并入 #"+f.ref; }
+    else if(f.plan==="dup"){ el.className+=" dup"; tag="重复 #"+f.ref; }
+    if(K.has(f.i)) el.className+=" k";
+    el.innerHTML=`<span class="tag">${tag||"#"+(f.i+1)}</span>
+      <img src="${f.uri}" alt="">
+      <div class="cap">${f.ms}ms</div>`;
+    if(f.plan==="merge"||f.plan==="dup")
+      el.title=`${f.file}\n${tag} (参考帧 #${f.ref+1} 的像素完全相同)`;
+    else el.title=f.file;
+    el.onclick=()=>{
+      if(f.plan==="blank"||f.plan==="bad") return toast(
+        f.plan==="bad"? "源图损坏 (文件截断) — 导不出去, 重新下载该素材"
+                      : "空帧 (源图全透明) — 导不出去", true);
+      if(f.plan==="keep"&&d.frames.some(x=>x.plan!=="keep"&&x.grp===f.i)&&K.has(f.i))
+        toast("这一帧代表整组合并后的时长");
+      K.has(f.i)? K.delete(f.i) : K.add(f.i);
+      renderStrip();
+    };
+    s.appendChild(el);
   });
+  renderDedup();
+  refresh();
+}
+/* SEQ 是 refresh() 异步取回来的, 建帧带时它还是上一次的 —— 所以逐帧时长和 ↺ 标记
+   等序列回来再补; 合并组首帧显示的是合并后的实际时长。 */
+function markFrames(){
+  const by=new Map();                    /* rel → Map(帧号 → 序列项) */
+  SEQ.forEach(e=>{
+    const s=SECS[e.s]; if(!s) return;
+    if(!by.has(s.rel)) by.set(s.rel,new Map());
+    by.get(s.rel).set(e.i,e);
+  });
+  const rel=curRel(), m=by.get(rel);
+  document.querySelectorAll(".fr").forEach(el=>{
+    const d=rel? FR[rel]:null, i=+el.dataset.i;
+    if(!d||!d.frames[i]) return;
+    const e=m? m.get(i):null, cap=el.querySelector(".cap");
+    cap.innerHTML=(e? e.ms : d.frames[i].ms)+"ms"+
+      ((e&&e.lb>0)? ' <span class="lb">↺</span>':"");
+  });
+}
+function renderDedup(){
+  const bar=$("dedup-bar");
+  const d=curRel()? FR[curRel()]:null;
+  const n=d? d.frames.filter(f=>f.plan==="dup"||f.plan==="merge").length : 0;
+  if(!d||!n){ bar.className=""; $("dedup-txt").textContent=""; return; }
+  bar.className="on";
+  $("dedup-txt").innerHTML=
+    `${SECN[CURSEC]} 同样的像素只留第一张 — 剔除 <b>${n}</b> 张, 源 ${d.count} 帧 → `+
+    `<b>${d.unique}</b> 种像素`;
+}
+
+/* ══════════ 导出 ══════════ */
+function doExport(){
+  const secs=buildSecs();
+  if(!secs.length) return toast("先展开一个动作组",true);
+  if(secs.some(s=>!s.keep.length)) return toast("有段一帧都没勾",true);
+  const p=$("prefix").value.trim();
+  if(!p) return toast("先填前缀",true);
+  const n=secs.map(s=>`${SECN[s.sec]} ${s.keep.length}`).join(" · ");
+  $("btn-export").disabled=true;
+  status(`导出中 — ${n}`,false);
+  api().export_group(secs,p).then(r=>{
+    $("btn-export").disabled=false;
+    if(!r.ok){ status("导出失败: "+r.error,false); return toast(r.error,true); }
+    const sub=r.entry.frames.filter(f=>f.loop_back).length;
+    status(`已导出 ${r.n} 帧 → assets/anim_bin/${p}_NN.bin`,true);
+    toast(`写了 ${r.n} 个 bin (${secs.length} 段${sub?`, ${sub} 处 loop_back`:""})`);
+  }).catch(e=>{ $("btn-export").disabled=false; toast("导出异常: "+e,true); });
 }
 
 /* ══════════ 装载 ══════════ */
@@ -324,21 +535,23 @@ function bind(){
     if(!r.ok) return r.error==="已取消"?null:toast(r.error,true);
     if(r.info) applyScan(r.info); else scan(r.root);
   }).catch(e=>toast("选择异常: "+e,true));
-  $("btn-all").onclick=()=>{ if(!DIR)return;
-    DIR.frames.forEach(f=>{ if(f.plan!=="blank") KEEP.add(f.i); }); renderStrip(); };
-  $("btn-none").onclick=()=>{ KEEP.clear(); renderStrip(); };
-  $("btn-rec").onclick=()=>{ if(!DIR)return;
-    KEEP=new Set(DIR.frames.filter(f=>f.keep).map(f=>f.i)); renderStrip(); };
-  $("btn-unfold").onclick=()=>{ if(!DIR||!DIR.fold)return;
-    DIR.fold.drop.forEach(i=>KEEP.add(i)); renderStrip();
-    toast("已展开: 循环重复帧全部恢复为独立帧"); };
+  $("btn-all").onclick=()=>{ const rel=curRel(); if(!rel) return;
+    KEEPS[rel]=new Set(FR[rel].frames.filter(
+      f=>f.plan!=="blank"&&f.plan!=="bad").map(f=>f.i));
+    renderStrip(); };
+  $("btn-none").onclick=()=>{ const rel=curRel(); if(!rel) return;
+    KEEPS[rel]=new Set(); renderStrip(); };
+  $("btn-rec").onclick=()=>{ const rel=curRel(); if(!rel) return;
+    KEEPS[rel]=new Set(FR[rel].frames.filter(f=>f.keep).map(f=>f.i));
+    renderStrip(); };
   $("btn-export").onclick=doExport;
   $("btn-copy").onclick=()=>{
     const t=$("meta-json").textContent;
-    if(!t) return toast("先选一个目录",true);
+    if(!t) return toast("先展开一个动作组",true);
     navigator.clipboard.writeText(t).then(()=>toast("JSON 已复制"))
       .catch(()=>toast("复制失败 — 手动选中即可",true));
   };
+  $("prefix").oninput=()=>{ if(SECS.length) refresh(); };
 }
 async function scan(root){
   status("正在扫描 "+root+" …",false);
@@ -346,88 +559,16 @@ async function scan(root){
   if(!r.ok){ status("扫描失败: "+r.error,false); return; }
   applyScan(r.scan);
 }
-function applyScan(sc){
+async function applyScan(sc){
   SCAN=sc;
   $("root-lab").textContent=sc.root;
-  $("prefix").placeholder="前缀";
   renderTree();
-  status(`VPet 根目录已载入 — ${sc.leaves.length} 个动作目录`,true);
+  const r=await api().groups();
+  if(!r.ok){ status("分组失败: "+r.error,false); return; }
+  GROUPS=r.groups;
+  renderTree();
+  status(`VPet 根目录已载入 — ${sc.leaves.length} 个目录 → ${GROUPS.length} 个动作组`,true);
 }
-async function loadDir(rel,el){
-  if(!DIR||DIR.rel!==rel) playStop();
-  document.querySelectorAll(".leaf").forEach(x=>x.classList.toggle("active",x===el));
-  $("strip").innerHTML='<div class="hint" style="padding:6px">正在转换 1000×1000 帧…</div>';
-  status("正在转换 "+rel+" …",false);
-  const r=await api().load_dir(rel);
-  if(!r.ok){ status("转换失败: "+r.error,false); toast(r.error,true); return; }
-  DIR=r.dir;
-  KEEP=new Set(DIR.frames.filter(f=>f.keep).map(f=>f.i));
-  $("prefix").value=rel.split("/")[0].toLowerCase().replace(/[^a-z0-9]/g,"").slice(0,10);
-  renderStrip();
-  status(`${rel} — ${DIR.count} 帧 → 导出 ${KEEP.size}`,true);
-}
-
-/* ══════════ 帧带 ══════════ */
-function renderStrip(){
-  playStop();
-  const s=$("strip"); s.innerHTML="";
-  if(!DIR) return;
-  $("strip-ttl").textContent=`${DIR.rel} · 源 ${DIR.count} 帧`;
-  DIR.frames.forEach(f=>{
-    const el=document.createElement("div"); el.className="fr"; el.dataset.i=f.i;
-    let tag="";
-    if(f.plan==="blank"){ el.className+=" blank"; tag="空帧"; }
-    else if(f.plan==="merge"){ el.className+=" merge"; tag="并入 #"+f.ref; }
-    else if(f.plan==="fold"){ el.className+=" fold"; tag="循环 #"+f.ref; }
-    if(KEEP.has(f.i)) el.className+=" k";
-    const isAnchor=DIR.fold&&f.i===DIR.fold.anchor;
-    el.innerHTML=`<span class="tag">${tag||"#"+(f.i+1)}</span>
-      <img src="${f.uri}" alt="">
-      <div class="cap">${f.ms}ms${isAnchor?' <span class="lb">↺</span>':''}</div>`;
-    if(f.plan==="merge"||f.plan==="fold")
-      el.title=`${f.file}\n${tag} (参考帧 #${f.ref+1} 的像素完全相同)`;
-    else el.title=f.file;
-    el.onclick=()=>{
-      if(f.plan==="blank") return toast("空帧 (源图全透明) — 导不出去",true);
-      if(f.plan==="keep"&&DIR.frames.some(x=>x.plan!=="keep"&&x.grp===f.i)&&KEEP.has(f.i))
-        toast("这一帧代表整组合并后的时长");
-      KEEP.has(f.i)? KEEP.delete(f.i) : KEEP.add(f.i);
-      renderStrip();
-    };
-    s.appendChild(el);
-  });
-  renderFold();
-  refresh();
-}
-function renderFold(){
-  const bar=$("fold-bar"), fd=DIR&&DIR.fold;
-  if(!fd){ bar.className=""; return; }
-  const keptAll=fd.drop.every(i=>!KEEP.has(i));
-  bar.className="on"+(fd.drift.length?" warn":"");
-  const dr=fd.drift.map(d=>`周期第 ${d.pos+1} 帧时长不一 (${d.ms.join("/")}ms)`).join("; ");
-  $("fold-txt").innerHTML=
-    `检测到循环: <b>#${fd.members[0]+1}–#${fd.members[fd.members.length-1]+1}</b> `+
-    `共 ${fd.period} 帧 × ${fd.repeats} 遍 → 只留 1 遍, 末帧挂 `+
-    `<b>loop_back=${fd.loop_back}</b> (省 ${fd.saved} 帧)`+
-    (keptAll? "": " — <b>你恢复了重复帧, 已改线性播放 (不挂 loop_back)</b>")+
-    (dr? `<br>⚠ 各遍时长不一致, 折叠后按保留的那遍播放: ${dr}` : "");
-  $("btn-unfold").style.display=keptAll?"":"none";
-}
-function doExport(){
-  if(!DIR||!KEEP.size) return toast("先选目录并勾选帧",true);
-  const p=$("prefix").value.trim();
-  if(!p) return toast("前缀不能为空",true);
-  status("正在导出…",false);
-  api().export(DIR.rel,p,[...KEEP].sort((a,b)=>a-b)).then(r=>{
-    if(!r.ok) return toast(r.error,true);
-    const sub=r.entry.frames.filter(f=>f.loop_back).length;
-    toast(`已导出 ${r.n} 帧到 assets/anim_bin/${p}_NN.bin`+
-      (sub? ` (含 ${sub} 处 loop_back)`:""));
-    status(`已导出 ${r.n} 帧`,true);
-    $("meta-json").textContent=JSON.stringify(r.entry,null,2);
-  }).catch(e=>toast("导出异常: "+e,true));
-}
-$("prefix").oninput=()=>{ if(DIR) refresh(); };
 
 window.addEventListener("pywebviewready",init);
 if(window.pywebview) init();
