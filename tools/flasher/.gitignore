@@ -1,0 +1,7 @@
+# 本工具的本地产物 (源码入库, 产物不入库)
+backup/
+dump/          # 提取分区落点 — 读 nvs 出来的文件等同 WiFi 密码 + 设备 Token, 绝不入库
+*.spec
+__pycache__/
+# 说明文档留在本地, 不入库 (同 tools/hwtest 惯例)
+README.md

@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Virtualpet 烧录器</title>
+<style>
+  :root{
+    --bg:#12151a; --card:#1b1f27; --line:#2b313c; --fg:#e6e9ef; --dim:#8d97a8;
+    --acc:#4a9eff; --ok:#3ecf8e; --warn:#e0a33e; --bad:#ef5b5b; --erase:#c0392b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:13px/1.6 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;}
+  .wrap{display:flex;flex-direction:column;height:100vh;padding:12px;gap:10px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  h2{margin:0 0 8px;font-size:13px;font-weight:600;color:var(--dim);letter-spacing:.5px}
+  .row{display:flex;gap:10px}
+  .row>*{flex:1;min-width:0}
+  .banner{display:flex;align-items:center;gap:12px}
+  .ver{font-size:20px;font-weight:700}
+  .dim{color:var(--dim)}
+  .small{font-size:12px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--dim);display:inline-block}
+  .dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .dot.disk{background:var(--warn)}
+  .dot.off{background:var(--bad)}
+  select,input[type=text],input[type=number]{width:100%;background:#0e1116;color:var(--fg);
+       border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
+  label.chk{display:block;margin:3px 0;cursor:pointer;user-select:none}
+  label.chk input{margin-right:6px;vertical-align:-1px}
+  .radio{display:block;margin:4px 0;padding:6px 8px;border:1px solid var(--line);
+         border-radius:6px;cursor:pointer}
+  .radio.on{border-color:var(--acc);background:#16233a}
+  .radio input{margin-right:8px}
+  button{font:inherit;padding:7px 14px;border-radius:6px;border:1px solid var(--line);
+         background:#252b35;color:var(--fg);cursor:pointer}
+  button:hover:not(:disabled){background:#2f3743}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.primary{background:var(--acc);border-color:var(--acc);color:#08121f;font-weight:600}
+  button.danger{background:var(--erase);border-color:var(--erase);color:#fff}
+  .danger-zone{border-color:#5a2420;background:#1f1614}
+  .danger-zone h2{color:#e08e84}
+  .erase-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+  .erase-grid button{background:#2a1c1a;border-color:#5a2420;padding:7px 4px;font-size:12px}
+  .erase-grid button:hover:not(:disabled){background:#3a2422}
+  #dumpListBox{max-height:136px;overflow:auto;margin:8px 0}
+  #dumpListBox label.chk{margin:2px 0}
+  .cred{color:var(--warn)}
+  .bar{height:14px;background:#0e1116;border-radius:7px;overflow:hidden;border:1px solid var(--line)}
+  .bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#2f6fd0,#4a9eff);
+         transition:width .15s}
+  .bar.done>i{background:var(--ok)}
+  .bar.bad>i{background:var(--bad)}
+  .steps{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  .chip{font-size:12px;padding:3px 9px;border-radius:11px;background:#0e1116;
+        border:1px solid var(--line);color:var(--dim)}
+  .chip.RUN{border-color:var(--acc);color:var(--acc)}
+  .chip.PASS{border-color:var(--ok);color:var(--ok)}
+  .chip.WARN{border-color:var(--warn);color:var(--warn)}
+  .chip.FAIL{border-color:var(--bad);color:var(--bad)}
+  .chip.SKIP{opacity:.5}
+  #log{flex:1;overflow:auto;background:#0b0d11;border:1px solid var(--line);border-radius:8px;
+       padding:8px 10px;font:12px/1.5 Consolas,"Cascadia Mono",monospace;white-space:pre-wrap;
+       word-break:break-all}
+  #log div{color:#c8cfda}
+  #log div.s{color:var(--acc)}
+  #log div.p{color:var(--ok)}
+  #log div.w{color:var(--warn)}
+  #log div.f{color:var(--bad)}
+  .foot{display:flex;align-items:center;gap:10px}
+  .foot .sp{flex:1}
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.62);display:none;
+         align-items:center;justify-content:center;padding:20px;z-index:9}
+  .modal.show{display:flex}
+  .box{background:var(--card);border:1px solid #5a2420;border-radius:10px;max-width:620px;
+       width:100%;padding:18px}
+  .box h3{margin:0 0 10px;color:#e08e84;font-size:16px}
+  .box .warn{border-left:3px solid var(--erase);padding-left:10px;margin:12px 0}
+  .dev{background:#0e1116;border:1px solid var(--line);border-radius:6px;padding:8px 10px;
+       margin:12px 0;font:12px/1.7 Consolas,monospace}
+  .box .actions{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+  #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#252b35;
+         border:1px solid var(--line);padding:8px 18px;border-radius:20px;display:none;z-index:20}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="card banner">
+    <span class="dot" id="dot"></span>
+    <div style="flex:1">
+      <div class="ver" id="ver">读取中…</div>
+      <div class="small dim" id="verSub"></div>
+    </div>
+    <div class="small dim" style="text-align:right;flex:none" id="stamp"></div>
+  </div>
+
+  <div class="row">
+    <div class="card" style="flex:1.25">
+      <h2>设备</h2>
+      <div class="row">
+        <select id="port" style="flex:2"></select>
+        <button onclick="refreshPorts()" style="flex:none">刷新</button>
+      </div>
+      <div class="small dim" id="portHint" style="margin-top:6px"></div>
+
+      <h2 style="margin-top:14px">烧录内容</h2>
+      <label class="radio on" id="rFull">
+        <input type="radio" name="kind" value="full" checked>
+        <b>全烧</b> <span class="small dim">bootloader + 分区表 + otadata + 主程序</span>
+      </label>
+      <label class="radio" id="rApp">
+        <input type="radio" name="kind" value="app">
+        <b>只烧主程序</b> <span class="small dim">开发内循环用</span>
+      </label>
+      <label class="radio" id="rOta">
+        <input type="radio" name="kind" value="otadata">
+        <b>只清 otadata</b> <span class="small dim">让设备回到 ota_0 槽启动</span>
+      </label>
+
+      <div style="margin-top:10px">
+        <label class="chk"><input type="checkbox" id="oAssets"> 附带资源包 assets (约 26MB, 动画/音效/语音)</label>
+        <label class="chk"><input type="checkbox" id="oOta1" checked> 写 ota_1 副本 (不写则 OTA 回滚会回旧版本)</label>
+        <label class="chk"><input type="checkbox" id="oVerify" checked> 写后回读校验</label>
+        <label class="chk"><input type="checkbox" id="oCapture" checked> 烧完复位并核对版本号</label>
+        <label class="chk"><input type="checkbox" id="oProtect"> 烧前后核对用户数据 (nvs/config/data 的 md5)</label>
+      </div>
+    </div>
+
+    <div style="flex:1;display:flex;flex-direction:column;gap:10px;min-width:0">
+      <div class="card danger-zone">
+        <h2>维护 / 擦除</h2>
+        <div class="small dim" style="margin-bottom:8px">
+          擦除是不可逆的。擦完设备上的数据就没了, 唯一的后路是擦前先备份。
+        </div>
+        <div class="erase-grid" id="eraseGrid"></div>
+
+        <h2 style="margin-top:14px">备份与写回</h2>
+        <label class="chk"><input type="checkbox" id="oBackup"> 擦除前先备份目标分区到文件</label>
+        <input type="text" id="bakDir" placeholder="留空 = exe 同级的 backup\ 目录" style="margin:6px 0">
+        <button onclick="restoreFlow()" style="width:100%;margin-top:6px">写回备份文件…</button>
+        <div class="small dim" id="maintainHint" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card">
+        <h2>提取分区</h2>
+        <div class="small dim" style="margin-bottom:8px">
+          把板上区域读成 bin 文件 — 只读, 不改设备。偏移取自板上真实的分区表。
+        </div>
+        <div class="row">
+          <button onclick="dumpList()" id="btnDumpList" style="flex:none">读取板上分区表</button>
+          <span class="small dim" id="dumpHint" style="align-self:center">还没读, 先读一次</span>
+        </div>
+        <div id="dumpListBox" class="small"></div>
+        <input type="text" id="dumpDir" placeholder="存到哪 (留空 = exe 同级的 dump\ 目录)">
+        <div class="row" style="margin-top:6px">
+          <button id="btnDump" onclick="dumpFlow()" disabled style="flex:2">开始提取</button>
+          <button onclick="openDumpDir()" style="flex:1">打开目录</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="padding:10px 12px">
+    <div class="bar" id="bar"><i></i></div>
+    <div class="steps" id="steps"></div>
+  </div>
+
+  <div id="log"></div>
+
+  <div class="foot">
+    <button class="primary" id="btnStart" onclick="startFlash()">开始烧录</button>
+    <button id="btnCancel" onclick="doCancel()" disabled>取消</button>
+    <div class="sp"></div>
+    <span class="small dim" id="status">就绪</span>
+    <button onclick="doSelftest()" id="btnSelf">自检</button>
+    <button onclick="doQuit()">退出</button>
+  </div>
+</div>
+
+<div class="modal" id="modal"><div class="box" id="modalBox"></div></div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+let api = null, busy = false, targets = [], dumpItems = [], pendingInfo = null, pollTimer = null;
+const $ = id => document.getElementById(id);
+
+/* ── 日志 ── */
+function say(text, cls){
+  const box = $("log");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = text;
+  box.appendChild(d);
+  while (box.childNodes.length > 3000) box.removeChild(box.firstChild);
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+function toast(t){
+  const el = $("toast"); el.textContent = t; el.style.display = "block";
+  clearTimeout(el._t); el._t = setTimeout(()=>{ el.style.display = "none"; }, 2600);
+}
+
+/* ── 轮询引擎事件 ── */
+async function poll(){
+  if (!api) return;
+  let data;
+  try { data = JSON.parse(await api.poll()); } catch(e){ return; }
+  busy = data.busy;
+  syncButtons();
+  for (const ev of data.events){
+    if (ev.t === "log") say(ev.line);
+    else if (ev.t === "step") step(ev);
+    else if (ev.t === "progress") setProgress(ev);
+    else if (ev.t === "begin"){ $("log").innerHTML = ""; say(">>> " + ev.what + " 开始", "s"); clearSteps(); }
+    else if (ev.t === "done") done(ev);
+    else if (ev.t === "power") powerPrompt(ev.reason);
+    else if (ev.t === "erase_info") onEraseInfo(ev);
+    else if (ev.t === "dump_list") onDumpList(ev);
+  }
+}
+function syncButtons(){
+  $("btnStart").disabled = busy;
+  $("btnCancel").disabled = !busy;
+  $("btnSelf").disabled = busy;
+  document.querySelectorAll("#eraseGrid button").forEach(b => { if (!b.dataset.always) b.disabled = busy; });
+  $("btnDumpList").disabled = busy;
+  syncDumpBtn();
+  $("status").textContent = busy ? "进行中…" : "就绪";
+}
+function setProgress(ev){
+  const bar = $("bar");
+  if (ev.frac === null){ bar.classList.remove("done","bad"); return; }
+  bar.firstElementChild.style.width = Math.round(ev.frac * 100) + "%";
+  if (ev.text) $("status").textContent = ev.text;
+}
+function clearSteps(){ $("steps").innerHTML = ""; }
+function step(ev){
+  const chips = $("steps");
+  let c = chips.querySelector('[data-n="' + CSS.escape(ev.name) + '"]');
+  if (!c){ c = document.createElement("span"); c.className = "chip"; c.dataset.n = ev.name;
+           chips.appendChild(c); }
+  c.className = "chip " + ev.status;
+  c.textContent = ev.name + (ev.detail ? " · " + ev.detail : "");
+  if (ev.detail) say(">>> " + ev.name + " " + ev.status + " " + ev.detail, ev.status === "FAIL" ? "f" : "s");
+}
+function done(ev){
+  $("bar").classList.add(ev.ok ? "done" : "bad");
+  say(ev.ok ? ">>> 完成 (退出码 0)" : ">>> 失败: " + (ev.error || "退出码 " + ev.exit),
+      ev.ok ? "p" : "f");
+  $("status").textContent = ev.ok ? "完成" : "失败";
+  pickKind();
+}
+
+/* ── 启动 ── */
+window.addEventListener("pywebviewready", async () => {
+  api = window.pywebview.api;
+  const info = JSON.parse(await api.bootstrap());
+  $("ver").textContent = info.version ? "固件 " + info.version : "未找到镜像";
+  $("verSub").textContent = (info.project ? info.project + " · " : "") + (info.source || "");
+  $("stamp").textContent = info.tool + (info.webview2 ? "\nWebView2 " + info.webview2 : "");
+  targets = info.targets || [];
+  info.warnings.forEach(w => say("WARN " + w, "w"));
+  if (!info.version) say("!! 没有解析到可用镜像 — 只能做擦除/自检。把固件目录用 --bin-dir 指定, 或放到 exe 同级的 images/ 里。", "f");
+
+  // 包里没有 bootloader 就只能烧 app — 默认别停在做不到的那个选项上
+  if (info.has_bootloader === false){
+    $("rApp").querySelector("input").checked = true;
+    $("oAssets").disabled = info.assets === false;
+    say(">>> 这个包只有主程序镜像 (没有 bootloader.bin), 已默认选「只烧主程序」。", "w");
+  }
+  // 禁用时一并取消勾选 — 禁用的复选框若先前被勾上, .checked 仍是 true
+  if (info.assets === false){ $("oAssets").disabled = true; $("oAssets").checked = false; }
+  buildEraseGrid();
+  refreshPorts();
+  if (!pollTimer) pollTimer = setInterval(poll, 120);
+  document.querySelectorAll('input[name=kind]').forEach(r =>
+    r.addEventListener("change", pickKind));
+  say(">>> 就绪。先看上方固件版本与设备端口, 再点开始烧录。");
+});
+
+function pickKind(){
+  document.querySelectorAll(".radio").forEach(el => {
+    el.classList.toggle("on", el.querySelector("input").checked);
+  });
+}
+
+async function refreshPorts(){
+  if (!api) return;
+  const ports = await api.refresh_ports();
+  const sel = $("port");
+  const keep = sel.value;
+  sel.innerHTML = "";
+  const opt0 = document.createElement("option");
+  opt0.value = ""; opt0.textContent = "自动发现 (等待设备出现)";
+  sel.appendChild(opt0);
+  ports.forEach(p => {
+    const o = document.createElement("option");
+    o.value = p.dev; o.textContent = p.text;
+    sel.appendChild(o);
+  });
+  if (keep && ports.some(p => p.dev === keep)) sel.value = keep;
+  const flashable = ports.filter(p => p.role === "flashable");
+  const disk = ports.filter(p => p.role === "disk");
+  const dot = $("dot");
+  dot.className = "dot " + (flashable.length ? "on" : (disk.length ? "disk" : "off"));
+  $("portHint").textContent = flashable.length
+    ? "发现 " + flashable.map(p => p.dev).join(", ") + " — 可以烧录"
+    : (disk.length ? "设备处于 U 盘模式 (303A:4004), 该模式不能烧录 — 请先在设备上关掉 U 盘"
+                   : "没发现可烧录的设备 — 插上板子再点刷新");
+}
+
+/* ── 烧录 ── */
+function opts(){
+  const kind = document.querySelector('input[name=kind]:checked').value;
+  return {kind, opts: JSON.stringify({
+    assets: $("oAssets").checked, ota1: $("oOta1").checked,
+    verify: $("oVerify").checked, capture: $("oCapture").checked,
+    protect: $("oProtect").checked, port: $("port").value || null
+  })};
+}
+async function startFlash(){
+  if (busy) return;
+  const {kind, opts: o} = opts();
+  if (kind !== "otadata" && !$("ver").textContent.startsWith("固件")){
+    toast("没有可用镜像, 烧不了"); return;
+  }
+  const r = await api.start(kind, o);
+  if (r === "busy") toast("正在忙");
+}
+async function doCancel(){ if (api) await api.cancel(); }
+async function doSelftest(){
+  if (busy) return;
+  $("log").innerHTML = ""; clearSteps();
+  await api.selftest();
+}
+async function doQuit(){ if (api) await api.quit(); }
+
+/* ── 擦除 ── */
+function buildEraseGrid(){
+  const grid = $("eraseGrid");
+  grid.innerHTML = "";
+  targets.forEach(t => {
+    const b = document.createElement("button");
+    b.textContent = t.label;
+    b.title = t.what + "\n" + t.conseq;
+    if (t.label === "all"){ b.textContent = "整片擦除"; b.className = "danger"; }
+    b.onclick = () => eraseFlow(t);
+    grid.appendChild(b);
+  });
+  const b = document.createElement("button");
+  b.textContent = "备份目录…"; b.dataset.always = "1";
+  b.onclick = () => {
+    const d = prompt("备份文件存到哪个目录?", localStorage.getItem("bak") || "");
+    if (d){ localStorage.setItem("bak", d); $("bakDir").value = d; }
+  };
+  grid.appendChild(b);
+}
+
+function eraseFlow(t){
+  if (busy) return;
+  // 先让引擎后台读 MAC — 连错板擦错板是唯一不可挽回的错误
+  say(">>> 正在读取目标设备信息 (端口 + 芯片 MAC)…", "s");
+  api.erase_info(JSON.stringify([t.label]));
+}
+
+function onEraseInfo(ev){
+  const t = targets.find(x => x.label === ev.targets[0]);
+  if (!t) return;
+  const isAll = t.label === "all";
+  const dev = ev.port || "(未发现设备)";
+  const mac = ev.mac || "(读取失败 — 请自行确认插的是哪块板)";
+  // 弹窗里那个才是权威, 但面板上勾过的要带进来 (以前面板那个根本没人读)
+  const bakDefault = $("oBackup").checked || t.label === "data" || t.label === "config";
+  $("modalBox").innerHTML = `
+    <h3>确认擦除 ${isAll ? "整片 flash" : t.label}</h3>
+    <div class="warn">
+      <b>会擦掉什么:</b> ${t.what}<br>
+      <b>后果:</b> ${t.conseq}
+    </div>
+    <div class="dev">
+      目标设备: <b>${dev}</b><br>
+      芯片 MAC: <b>${mac}</b><br>
+      <span style="color:#8d97a8">确认这就是你要擦的那块板 — 擦错了没法挽回。</span>
+    </div>
+    <label class="chk"><input type="checkbox" id="mBackup" ${bakDefault ? "checked" : ""}>
+      擦除前先把这一区读出来存成文件 (唯一的后路)</label>
+    <div style="margin-top:14px">
+      请手动输入确认词 <b style="color:#e08e84">${t.phrase}</b> 才能继续:<br>
+      <input type="text" id="mPhrase" autocomplete="off" placeholder="在这里输入 ${t.phrase}">
+    </div>
+    <div class="actions">
+      <button onclick="closeModal()">取消</button>
+      <button class="danger" id="mGo" disabled onclick='doErase(${JSON.stringify(t.label)}, ${JSON.stringify(t.phrase)})'>确认擦除</button>
+    </div>`;
+  $("modal").classList.add("show");
+  const ph = $("mPhrase"), go = $("mGo");
+  ph.oninput = () => { go.disabled = ph.value.trim() !== t.phrase; };
+  ph.onkeydown = e => { if (e.key === "Enter" && !go.disabled) go.click(); };
+  ph.focus();
+}
+
+async function doErase(label, phrase){
+  const typed = $("mPhrase").value.trim();
+  const bak = $("mBackup").checked;
+  const dir = $("bakDir").value.trim();
+  closeModal();
+  const r = await api.erase(JSON.stringify([label]), typed, bak, dir);
+  if (typeof r === "string" && r.startsWith("phrase:")){
+    toast("确认词不对, 已取消"); return;
+  }
+  if (r === "busy") toast("正在忙");
+  else if (bak) say(">>> 备份目录: " + (dir || "(默认 backup\\ 目录)"), "s");
+}
+function closeModal(){ $("modal").classList.remove("show"); }
+
+/* 写回是覆盖性写入 — 门槛与擦除同级: 说清覆盖什么 + 手打确认词 */
+async function restoreFlow(){
+  if (busy) return;
+  const path = await api.restore_begin();
+  if (!path) return;
+  const picks = targets.filter(x => x.label !== "all");
+  $("modalBox").innerHTML = `
+    <h3>写回备份文件</h3>
+    <div class="dev">文件: <b>${path.split(/[\\/]/).pop()}</b><br>
+      <span style="color:#8d97a8">${path.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span></div>
+    <div class="warn">写回会<b>整区覆盖</b>目标分区当前的內容 — 设备上该分区现有的数据会被这个文件替掉。</div>
+    <div style="margin-top:10px">
+      写回到哪个分区?<br>
+      <select id="mTarget">${picks.map(x => `<option value="${x.label}">${x.label} — ${x.what}</option>`).join("")}</select>
+    </div>
+    <div style="margin-top:14px">
+      请手动输入确认词 <b style="color:#e08e84">写回</b> 才能继续:<br>
+      <input type="text" id="mPhrase" autocomplete="off" placeholder="在这里输入 写回">
+    </div>
+    <div class="actions">
+      <button onclick="closeModal()">取消</button>
+      <button class="danger" id="mGo" disabled>确认写回</button>
+    </div>`;
+  $("modal").classList.add("show");
+  const ph = $("mPhrase"), go = $("mGo");
+  ph.oninput = () => { go.disabled = ph.value.trim() !== "写回"; };
+  ph.onkeydown = e => { if (e.key === "Enter" && !go.disabled) go.click(); };
+  go.onclick = async () => {
+    const t = $("mTarget").value;
+    closeModal();
+    say(">>> 写回 " + path + " → " + t, "s");
+    const r = await api.restore(path, t, "写回");
+    if (r === "busy") toast("正在忙");
+  };
+  ph.focus();
+}
+
+/* ── 提取分区 ── */
+function fmtSize(n){
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + "M";
+  if (n >= 1024) return Math.round(n / 1024) + "K";
+  return n + "B";
+}
+/* 别叫 dumpDir: id="dumpDir" 会在 window 上生成同名全局, 读起来也分不清是元素还是函数 */
+const dumpOutDir = () => $("dumpDir").value.trim();
+async function openDumpDir(){ if (api) await api.open_folder(dumpOutDir()); }
+
+async function dumpList(){
+  if (busy) return;
+  $("dumpHint").textContent = "读取中…";
+  await api.dump_list($("port").value || "");
+}
+
+function onDumpList(ev){
+  dumpItems = ev.items || [];
+  const box = $("dumpListBox");
+  box.innerHTML = "";
+  if (!dumpItems.length){
+    $("dumpHint").textContent = ev.note || "没读到可提取的分区";
+    syncDumpBtn();
+    return;
+  }
+  $("dumpHint").textContent = (ev.port ? ev.port + " · " : "")
+    + dumpItems.length + " 个可提取目标" + (ev.note ? " — " + ev.note : "");
+  dumpItems.forEach((it, i) => {
+    const l = document.createElement("label");
+    l.className = "chk";
+    const c = document.createElement("input");
+    c.type = "checkbox"; c.dataset.i = i;
+    c.checked = !it.phrase;          // 含凭据的默认不勾 — 得先看见那句警告
+    c.addEventListener("change", syncDumpBtn);
+    l.appendChild(c);
+    const b = document.createElement("b");
+    b.textContent = it.label;
+    l.appendChild(b);
+    const s = document.createElement("span");
+    s.className = "dim";
+    s.textContent = " " + fmtSize(it.size) + " @0x" + it.offset.toString(16)
+                  + " — " + it.desc;
+    l.appendChild(s);
+    if (it.phrase){
+      const w = document.createElement("span");
+      w.className = "cred";
+      w.textContent = " [含" + it.why + ", 产出文件等同凭据]";
+      l.appendChild(w);
+    }
+    box.appendChild(l);
+  });
+  syncDumpBtn();
+}
+
+function syncDumpBtn(){
+  const n = document.querySelectorAll("#dumpListBox input:checked").length;
+  $("btnDump").disabled = busy || !n;
+}
+
+function pickedDumps(){
+  return [...document.querySelectorAll("#dumpListBox input:checked")]
+    .map(c => dumpItems[+c.dataset.i]);
+}
+
+function dumpFlow(){
+  if (busy) return;
+  const picked = pickedDumps();
+  if (!picked.length){ toast("先勾一个分区"); return; }
+  const labels = picked.map(p => p.label), out = dumpOutDir();
+  const sens = picked.filter(p => p.phrase);
+  if (!sens.length){ doDump(labels, "", out); return; }   // 无凭据: 只读, 不必拦
+  const want = sens[0].phrase;
+  $("modalBox").innerHTML = `
+    <h3>提取含凭据的分区</h3>
+    <div class="warn">
+      <b>${sens.map(p => p.label).join(", ")}</b> 里含${sens[0].why}。<br>
+      读出来的 bin <b>等同凭据</b> — 拿到它就能连上这台设备, 切勿外传。
+    </div>
+    <div class="dev">产出目录: <b>${out || "(exe 同级的 dump\\ 目录)"}</b></div>
+    <div style="margin-top:14px">
+      请手动输入确认词 <b style="color:#e08e84">${want}</b> 才能继续:<br>
+      <input type="text" id="mPhrase" autocomplete="off" placeholder="在这里输入 ${want}">
+    </div>
+    <div class="actions">
+      <button onclick="closeModal()">取消</button>
+      <button class="danger" id="mGo" disabled>确认提取</button>
+    </div>`;
+  $("modal").classList.add("show");
+  const ph = $("mPhrase"), go = $("mGo");
+  ph.oninput = () => { go.disabled = ph.value.trim() !== want; };
+  ph.onkeydown = e => { if (e.key === "Enter" && !go.disabled) go.click(); };
+  go.onclick = () => { const typed = ph.value.trim(); closeModal(); doDump(labels, typed, out); };
+  ph.focus();
+}
+
+async function doDump(labels, phrase, out){
+  say(">>> 提取 " + labels.join(", ") + " → " + (out || "(exe 同级的 dump\\ 目录)"), "s");
+  const r = await api.dump(JSON.stringify(labels), phrase, out, $("port").value || "");
+  if (r === "busy") toast("正在忙");
+  else if (r === "none") toast("没有勾选任何分区");
+  else if (typeof r === "string" && r.startsWith("phrase:")) toast("确认词不对, 已取消");
+}
+
+/* ── 断电提示 ── */
+function powerPrompt(reason){
+  $("modalBox").innerHTML = `
+    <h3>需要给设备断电</h3>
+    <div class="warn">${reason}<br><br>
+      芯片已经挂死, 反复重试没有意义。请<b>拔掉电源等 3 秒再插上</b> (USB 线拔掉重插也行)。</div>
+    <div class="actions">
+      <button onclick='answerPower(false)'>放弃</button>
+      <button class="primary" onclick='answerPower(true)'>已重新上电, 继续</button>
+    </div>`;
+  $("modal").classList.add("show");
+}
+async function answerPower(ok){ closeModal(); await api.power_answer(ok); }
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && $("modal").classList.contains("show")) closeModal();
+});
+</script>
+</body>
+</html>
