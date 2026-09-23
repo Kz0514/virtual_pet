@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>VPet 素材导入器</title>
+<style>
+:root{
+  --bg:#101418; --panel:#171d24; --panel2:#1d2530; --line:#2a333d;
+  --txt:#d7e0e8; --dim:#7b8894; --dim2:#5a6672;
+  --accent:#4f8cff; --accent-deep:#3a6fd8; --gold:#ffd23d;
+  --teal:#3fc9b0; --grey:#4a545f;
+  --r:10px; --r-sm:7px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--bg);color:var(--txt);font:14px/1.5 system-ui,"Segoe UI",sans-serif;
+  height:100vh;display:flex;flex-direction:column;overflow:hidden;user-select:none;
+}
+/* ═══ 顶栏 ═══ */
+header{
+  display:flex;align-items:center;gap:8px;padding:10px 14px;
+  background:linear-gradient(180deg,#1a2129,#171d24);border-bottom:1px solid var(--line);
+}
+.brand{font-weight:600;display:flex;align-items:center;gap:8px}
+.brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);
+  box-shadow:0 0 10px var(--accent)}
+button{
+  background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+  padding:6px 14px;border-radius:var(--r-sm);font:inherit;cursor:pointer;
+  transition:background .15s,border-color .15s,transform .05s;
+}
+button:hover{background:#25303c;border-color:#3a4756}
+button:active{transform:translateY(1px)}
+button.acc{background:var(--accent);border-color:var(--accent);color:#fff}
+button.acc:hover{background:var(--accent-deep)}
+button.ghost{background:transparent}
+button:disabled{opacity:.4;cursor:default}
+.sep{width:1px;height:22px;background:var(--line);margin:0 4px}
+label{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:13px}
+input[type=text],input[type=number]{
+  background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+  border-radius:var(--r-sm);padding:5px 8px;font:inherit;outline:none;
+}
+input[type=number]{width:54px}
+input[type=text]:focus{border-color:var(--accent);background:#1b2430}
+.spacer{flex:1}
+#root-lab{color:var(--dim2);font-size:12px;max-width:36vw;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+#status{color:var(--dim);font-size:12.5px;max-width:26vw;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;text-align:right}
+#status.ok{color:var(--accent)}
+/* ═══ 主区 ═══ */
+main{flex:1;display:flex;min-height:0}
+/* 左: 动作树 */
+#tree{
+  width:270px;min-width:270px;overflow-y:auto;padding:8px;
+  background:var(--panel);border-right:1px solid var(--line);
+}
+.top-row{
+  display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:var(--r-sm);
+  cursor:pointer;font-weight:600;font-size:13px;
+}
+.top-row:hover{background:#1e2732}
+.top-row .arw{color:var(--dim2);font-size:10px;width:10px;transition:transform .15s}
+.top-row.open .arw{transform:rotate(90deg)}
+.top-row .n{margin-left:auto;color:var(--dim2);font-size:11.5px;font-weight:400}
+.leaf{
+  display:flex;align-items:center;gap:6px;padding:4px 8px 4px 24px;
+  border-radius:6px;cursor:pointer;font-size:12.5px;color:#b6c2ce;
+}
+.leaf:hover{background:#1e2732}
+.leaf.active{background:#202a3a;box-shadow:0 0 0 1px var(--accent) inset;color:#fff}
+.leaf .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.leaf .n{margin-left:auto;color:var(--dim2);font-size:11px;flex:none}
+.leaf .bd{flex:none;font-size:10px;padding:0 4px;border-radius:4px;background:#2b3644;color:#9fb2c4}
+.leaf .bd.w{background:#4a3520;color:#ffb454}
+/* 中: 舞台 */
+#stage{flex:1;display:flex;flex-direction:column;min-width:0;padding:12px;gap:10px}
+#pv-wrap{display:flex;align-items:center;gap:16px;flex:none}
+#pv-img{
+  width:264px;height:264px;border-radius:14px;image-rendering:pixelated;
+  box-shadow:0 12px 40px rgba(0,0,0,.5);background:#0c0f13;
+}
+#pv-side{display:flex;flex-direction:column;gap:7px;min-width:0}
+#pv-cap{color:var(--dim);font-size:12.5px;background:var(--panel2);
+  padding:4px 12px;border-radius:20px;border:1px solid var(--line);width:fit-content}
+#pv-dev{color:var(--dim2);font-size:11.5px}
+#pv-dev b{color:var(--gold);font-weight:600}
+.kv{display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px;color:var(--dim)}
+.kv b{color:var(--txt);font-weight:600}
+/* 折叠条 */
+#fold-bar{
+  display:none;align-items:center;gap:10px;padding:8px 12px;font-size:12.5px;
+  background:#2b2416;border:1px solid #5c4a1e;border-radius:var(--r);color:#ffd98a;
+}
+#fold-bar.on{display:flex}
+#fold-bar.warn{background:#33201c;border-color:#6b3226;color:#ffb0a0}
+#fold-bar .sp{flex:1}
+#fold-bar button{padding:3px 10px;font-size:12px}
+/* 帧带 */
+#strip-wrap{flex:1;min-height:0;display:flex;flex-direction:column;
+  border:1px solid var(--line);border-radius:var(--r);background:var(--panel);overflow:hidden}
+#strip-bar{display:flex;align-items:center;gap:8px;padding:8px 10px;
+  border-bottom:1px solid var(--line)}
+#strip-bar .ttl{font-weight:600;font-size:13px}
+#strip-bar button{padding:3px 10px;font-size:12px}
+#strip{flex:1;overflow-y:auto;padding:10px;display:flex;flex-wrap:wrap;
+  gap:8px;align-content:flex-start}
+.fr{
+  position:relative;width:78px;border:2px solid var(--line);border-radius:9px;
+  overflow:hidden;cursor:pointer;background:#0c0f13;transition:border-color .12s;
+}
+.fr:hover{border-color:#3a4756}
+.fr img{width:100%;display:block;image-rendering:pixelated;opacity:.35}
+.fr .cap{font-size:10.5px;text-align:center;padding:2px 0;color:var(--dim2);
+  background:var(--panel2)}
+.fr.k{border-color:var(--accent)}
+.fr.k img{opacity:1}
+.fr.k .cap{color:#9fb2c4}
+.fr.k .lb{color:var(--gold);font-weight:700}
+.fr.now{box-shadow:0 0 0 3px var(--gold);border-color:var(--gold)}
+.fr.blank{border-color:var(--grey);border-style:dashed}
+.fr.blank img{opacity:.12}
+.fr.merge{border-color:var(--teal)}
+.fr.merge .cap{color:var(--teal)}
+.fr.fold{border-color:var(--gold)}
+.fr.fold .cap{color:var(--gold)}
+.fr .tag{position:absolute;top:3px;left:3px;font-size:9.5px;padding:1px 5px;
+  border-radius:4px;background:rgba(10,14,18,.85)}
+.fr.k .tag{color:var(--accent)}
+.fr.blank .tag{color:var(--dim)}
+.fr.merge .tag{color:var(--teal)}
+.fr.fold .tag{color:var(--gold)}
+/* 右: 导出 */
+#side{
+  width:330px;min-width:330px;display:flex;flex-direction:column;gap:9px;
+  background:var(--panel);border-left:1px solid var(--line);padding:12px;
+}
+.panel-title{display:flex;align-items:center;gap:8px;font-weight:600;font-size:13.5px}
+#meta-json{
+  flex:1;min-height:0;overflow:auto;background:#0c0f13;border:1px solid var(--line);
+  border-radius:var(--r-sm);padding:10px;font:12px/1.55 Consolas,"Cascadia Mono",monospace;
+  color:#a9c4dd;white-space:pre;user-select:text;
+}
+.hint{color:var(--dim2);font-size:11.5px}
+#toast{
+  position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(14px);
+  background:var(--panel2);border:1px solid var(--line);border-radius:22px;
+  padding:9px 20px;font-size:13px;opacity:0;pointer-events:none;
+  transition:opacity .2s,transform .2s;z-index:99;box-shadow:0 10px 30px rgba(0,0,0,.5);
+  max-width:70vw;
+}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.err{border-color:#a33;color:#ffb0a0}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot"></span>VPet 素材导入器</div>
+  <button id="btn-root">选择 VPet 目录</button>
+  <span id="root-lab">未选择</span>
+  <span class="spacer"></span>
+  <span id="status">就绪</span>
+</header>
+
+<main>
+  <div id="tree"><div class="hint" style="padding:8px">选择 VPet 目录后列出动作</div></div>
+
+  <div id="stage">
+    <div id="pv-wrap">
+      <img id="pv-img" alt="">
+      <div id="pv-side">
+        <div id="pv-cap">—</div>
+        <div id="pv-dev"></div>
+        <div class="kv">
+          <span>源帧 <b id="k-src">0</b></span>
+          <span>导出 <b id="k-out">0</b></span>
+          <span>总时长 <b id="k-dur">0</b></span>
+        </div>
+      </div>
+    </div>
+
+    <div id="fold-bar"><span id="fold-txt"></span><span class="sp"></span>
+      <button id="btn-unfold">展开 (不折叠)</button></div>
+
+    <div id="strip-wrap">
+      <div id="strip-bar">
+        <span class="ttl" id="strip-ttl">帧</span>
+        <span class="spacer"></span>
+        <button id="btn-all">全选</button>
+        <button id="btn-rec">只保留推荐</button>
+        <button id="btn-none">全不选</button>
+      </div>
+      <div id="strip"><div class="hint" style="padding:6px">左侧选一个动作目录</div></div>
+    </div>
+  </div>
+
+  <div id="side">
+    <div class="panel-title">导出 <span class="hint" id="out-dir">assets/anim_bin/</span></div>
+    <label>文件名前缀 <input type="text" id="prefix" placeholder="zhanli" style="flex:1"></label>
+    <button class="acc" id="btn-export">导出帧 bin</button>
+    <div class="panel-title" style="margin-top:4px">anim_meta.json 草稿
+      <span class="spacer"></span><button id="btn-copy" style="padding:2px 9px;font-size:12px">复制</button></div>
+    <div id="meta-json"></div>
+    <div class="hint">草稿只含本组条目 — 粘进 assets/anim_meta.json 的 anims 数组。
+      id/name 需自行分配, play_loops 沿用文件顶层的值。</div>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const api=()=> window.pywebview? window.pywebview.api : null;
+
+/* ══════════ 状态 ══════════ */
+let SCAN=null;      /* scan_tree 结果 */
+let DIR=null;       /* 当前目录的 analyze_frames 结果 */
+let KEEP=new Set(); /* 勾选的原始帧号 */
+let SEQ=[];         /* 当前 keep 集对应的播放序列 (含 loop_back) */
+let PLAY=null;      /* 内置播放器 */
+const PLAY_LOOPS=3; /* 与 assets/anim_meta.json 顶层一致 */
+
+function toast(msg,err){const t=$("toast");t.textContent=msg;
+  t.className="show"+(err?" err":"");clearTimeout(t._h);
+  t._h=setTimeout(()=>{t.className="";},3200);}
+function status(m,ok){const s=$("status");s.textContent=m;s.className=ok?"ok":"";}
+const fmt=(ms)=> ms>=1000? (ms/1000).toFixed(ms%1000?1:0)+"s" : ms+"ms";
+
+/* ══════════ 序列 (唯一实现在后端 build_seq, 前端只显示) ══════════ */
+let seqTok=0;
+async function refresh(){
+  if(!DIR) return;
+  const tok=++seqTok;
+  const r=await api().seq(DIR.rel,$("prefix").value.trim(),[...KEEP].sort((a,b)=>a-b));
+  if(tok!==seqTok||!r.ok) return;      /* 期间又点了一下, 丢弃这次的返回 */
+  SEQ=r.seq;
+  $("k-src").textContent=DIR.count;
+  $("k-out").textContent=SEQ.length;
+  $("k-dur").textContent=fmt(SEQ.reduce((a,e)=>a+e.ms,0));
+  const hasSub=SEQ.some(e=>e.lb>0);
+  $("pv-dev").innerHTML= SEQ.length<2? "帧太少, 设备会跳过"
+    : (hasSub? "设备: 播一遍<b>就回 idle</b> (含子循环)"
+             : `设备: 整组播 <b>${PLAY_LOOPS} 遍</b>后回 idle (无子循环)`);
+  $("meta-json").textContent= SEQ.length? JSON.stringify(r.entry,null,2) : "";
+  playStart();
+}
+
+/* ══════════ 播放器 — 复刻固件 pet_avatar.c 的推进语义 ══════════ */
+function playStart(){
+  playStop(); if(!SEQ.length) return;
+  PLAY={pos:0,rem:null,done:0,timer:0,run:true};
+  showFrame();
+  PLAY.timer=setTimeout(tick,SEQ[0].ms);
+}
+function playStop(){ if(PLAY){PLAY.run=false;clearTimeout(PLAY.timer);} PLAY=null; }
+function showFrame(){
+  const e=SEQ[PLAY.pos]; if(!e) return;
+  $("pv-img").src=DIR.frames[e.i].uri;
+  const tag=e.lb>0? ` · 此处 loop_back=${e.lb}` : "";
+  $("pv-cap").textContent=`#${PLAY.pos}/${SEQ.length-1} · ${e.ms}ms${tag}`;
+  document.querySelectorAll(".fr").forEach(el=>
+    el.classList.toggle("now", +el.dataset.i===e.i));
+}
+function tick(){
+  if(!PLAY||!PLAY.run) return;
+  const e=SEQ[PLAY.pos];
+  if(e.lb>0){                                   /* ── 子循环 ── */
+    if(PLAY.rem===null) PLAY.rem=PLAY_LOOPS-1;
+    if(PLAY.rem>0){
+      PLAY.rem--; PLAY.pos-=e.lb; showFrame();
+      PLAY.timer=setTimeout(tick,SEQ[PLAY.pos].ms); return;
+    }
+    PLAY.rem=null;
+  }
+  PLAY.pos++;                                   /* ── 前进 ── */
+  if(PLAY.pos>=SEQ.length){
+    PLAY.pos=0; PLAY.done++;
+    const hasSub=SEQ.some(x=>x.lb>0);
+    if(PLAY.done>=(hasSub?1:PLAY_LOOPS)) PLAY.done=0;   /* 设备此时回 idle, 预览里重播 */
+  }
+  showFrame();
+  PLAY.timer=setTimeout(tick,SEQ[PLAY.pos].ms);
+}
+
+/* ══════════ 目录树 ══════════ */
+function renderTree(){
+  const t=$("tree"); t.innerHTML="";
+  if(!SCAN) return;
+  SCAN.tops.forEach(top=>{
+    const row=document.createElement("div"); row.className="top-row open";
+    row.innerHTML=`<span class="arw">▶</span><span>${top.name}</span>
+      <span class="n">${top.dirs} 组</span>`;
+    const box=document.createElement("div");
+    t.appendChild(row); t.appendChild(box);
+    SCAN.leaves.filter(l=>l.top===top.name).forEach(l=>{
+      const el=document.createElement("div"); el.className="leaf";
+      el.dataset.rel=l.rel;
+      const short=l.rel.slice(top.name.length+1)||"(根)";
+      let bd="";
+      if(l.layered) bd+=`<span class="bd w">分层</span>`;
+      if(!l.contiguous) bd+=`<span class="bd w">跳号</span>`;
+      if(l.warn) bd+=`<span class="bd w">多帧</span>`;
+      el.innerHTML=`<span class="nm" title="${l.rel}">${short}</span>${bd}
+        <span class="n">${l.count}</span>`;
+      el.onclick=()=>loadDir(l.rel,el);
+      box.appendChild(el);
+    });
+    row.onclick=()=>{row.classList.toggle("open");
+      box.style.display=row.classList.contains("open")?"":"none";};
+  });
+}
+
+/* ══════════ 装载 ══════════ */
+async function init(){
+  bind();
+  if(!api()){ status("未检测到 pywebview — 请通过 vpet_import.py 启动",false); return; }
+  const root=await api().default_root();
+  if(root) await scan(root);
+  else status("就绪 — 点「选择 VPet 目录」",false);
+}
+function bind(){
+  $("btn-root").onclick=()=>api().pick_root().then(r=>{
+    if(!r.ok) return r.error==="已取消"?null:toast(r.error,true);
+    if(r.info) applyScan(r.info); else scan(r.root);
+  }).catch(e=>toast("选择异常: "+e,true));
+  $("btn-all").onclick=()=>{ if(!DIR)return;
+    DIR.frames.forEach(f=>{ if(f.plan!=="blank") KEEP.add(f.i); }); renderStrip(); };
+  $("btn-none").onclick=()=>{ KEEP.clear(); renderStrip(); };
+  $("btn-rec").onclick=()=>{ if(!DIR)return;
+    KEEP=new Set(DIR.frames.filter(f=>f.keep).map(f=>f.i)); renderStrip(); };
+  $("btn-unfold").onclick=()=>{ if(!DIR||!DIR.fold)return;
+    DIR.fold.drop.forEach(i=>KEEP.add(i)); renderStrip();
+    toast("已展开: 循环重复帧全部恢复为独立帧"); };
+  $("btn-export").onclick=doExport;
+  $("btn-copy").onclick=()=>{
+    const t=$("meta-json").textContent;
+    if(!t) return toast("先选一个目录",true);
+    navigator.clipboard.writeText(t).then(()=>toast("JSON 已复制"))
+      .catch(()=>toast("复制失败 — 手动选中即可",true));
+  };
+}
+async function scan(root){
+  status("正在扫描 "+root+" …",false);
+  const r=await api().scan(root);
+  if(!r.ok){ status("扫描失败: "+r.error,false); return; }
+  applyScan(r.scan);
+}
+function applyScan(sc){
+  SCAN=sc;
+  $("root-lab").textContent=sc.root;
+  $("prefix").placeholder="前缀";
+  renderTree();
+  status(`VPet 根目录已载入 — ${sc.leaves.length} 个动作目录`,true);
+}
+async function loadDir(rel,el){
+  if(!DIR||DIR.rel!==rel) playStop();
+  document.querySelectorAll(".leaf").forEach(x=>x.classList.toggle("active",x===el));
+  $("strip").innerHTML='<div class="hint" style="padding:6px">正在转换 1000×1000 帧…</div>';
+  status("正在转换 "+rel+" …",false);
+  const r=await api().load_dir(rel);
+  if(!r.ok){ status("转换失败: "+r.error,false); toast(r.error,true); return; }
+  DIR=r.dir;
+  KEEP=new Set(DIR.frames.filter(f=>f.keep).map(f=>f.i));
+  $("prefix").value=rel.split("/")[0].toLowerCase().replace(/[^a-z0-9]/g,"").slice(0,10);
+  renderStrip();
+  status(`${rel} — ${DIR.count} 帧 → 导出 ${KEEP.size}`,true);
+}
+
+/* ══════════ 帧带 ══════════ */
+function renderStrip(){
+  playStop();
+  const s=$("strip"); s.innerHTML="";
+  if(!DIR) return;
+  $("strip-ttl").textContent=`${DIR.rel} · 源 ${DIR.count} 帧`;
+  DIR.frames.forEach(f=>{
+    const el=document.createElement("div"); el.className="fr"; el.dataset.i=f.i;
+    let tag="";
+    if(f.plan==="blank"){ el.className+=" blank"; tag="空帧"; }
+    else if(f.plan==="merge"){ el.className+=" merge"; tag="并入 #"+f.ref; }
+    else if(f.plan==="fold"){ el.className+=" fold"; tag="循环 #"+f.ref; }
+    if(KEEP.has(f.i)) el.className+=" k";
+    const isAnchor=DIR.fold&&f.i===DIR.fold.anchor;
+    el.innerHTML=`<span class="tag">${tag||"#"+(f.i+1)}</span>
+      <img src="${f.uri}" alt="">
+      <div class="cap">${f.ms}ms${isAnchor?' <span class="lb">↺</span>':''}</div>`;
+    if(f.plan==="merge"||f.plan==="fold")
+      el.title=`${f.file}\n${tag} (参考帧 #${f.ref+1} 的像素完全相同)`;
+    else el.title=f.file;
+    el.onclick=()=>{
+      if(f.plan==="blank") return toast("空帧 (源图全透明) — 导不出去",true);
+      if(f.plan==="keep"&&DIR.frames.some(x=>x.plan!=="keep"&&x.grp===f.i)&&KEEP.has(f.i))
+        toast("这一帧代表整组合并后的时长");
+      KEEP.has(f.i)? KEEP.delete(f.i) : KEEP.add(f.i);
+      renderStrip();
+    };
+    s.appendChild(el);
+  });
+  renderFold();
+  refresh();
+}
+function renderFold(){
+  const bar=$("fold-bar"), fd=DIR&&DIR.fold;
+  if(!fd){ bar.className=""; return; }
+  const keptAll=fd.drop.every(i=>!KEEP.has(i));
+  bar.className="on"+(fd.drift.length?" warn":"");
+  const dr=fd.drift.map(d=>`周期第 ${d.pos+1} 帧时长不一 (${d.ms.join("/")}ms)`).join("; ");
+  $("fold-txt").innerHTML=
+    `检测到循环: <b>#${fd.members[0]+1}–#${fd.members[fd.members.length-1]+1}</b> `+
+    `共 ${fd.period} 帧 × ${fd.repeats} 遍 → 只留 1 遍, 末帧挂 `+
+    `<b>loop_back=${fd.loop_back}</b> (省 ${fd.saved} 帧)`+
+    (keptAll? "": " — <b>你恢复了重复帧, 已改线性播放 (不挂 loop_back)</b>")+
+    (dr? `<br>⚠ 各遍时长不一致, 折叠后按保留的那遍播放: ${dr}` : "");
+  $("btn-unfold").style.display=keptAll?"":"none";
+}
+function doExport(){
+  if(!DIR||!KEEP.size) return toast("先选目录并勾选帧",true);
+  const p=$("prefix").value.trim();
+  if(!p) return toast("前缀不能为空",true);
+  status("正在导出…",false);
+  api().export(DIR.rel,p,[...KEEP].sort((a,b)=>a-b)).then(r=>{
+    if(!r.ok) return toast(r.error,true);
+    const sub=r.entry.frames.filter(f=>f.loop_back).length;
+    toast(`已导出 ${r.n} 帧到 assets/anim_bin/${p}_NN.bin`+
+      (sub? ` (含 ${sub} 处 loop_back)`:""));
+    status(`已导出 ${r.n} 帧`,true);
+    $("meta-json").textContent=JSON.stringify(r.entry,null,2);
+  }).catch(e=>toast("导出异常: "+e,true));
+}
+$("prefix").oninput=()=>{ if(DIR) refresh(); };
+
+window.addEventListener("pywebviewready",init);
+if(window.pywebview) init();
+</script>
+</body>
+</html>
