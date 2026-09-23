@@ -585,7 +585,8 @@ static void playback_task(void *pv)
          * 环内零残留, 预冲泵即足矣 */
         if (!dac_ready) {
             es8311_drv_set_vol(100);
-            if (dac) esp_codec_dev_write_reg(dac, 0x32, 0xCC);
+            /* 0x32: 0xBF=0dB (0xCC=+6.5dB) */
+            if (dac) esp_codec_dev_write_reg(dac, 0x32, 0xBF);
             if (!s_ws_mode) {
                 pump_silence(chunk);
                 pump_silence(chunk);
