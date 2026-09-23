@@ -75,10 +75,13 @@ CONFIG_LV_FS_MEMFS_LETTER=77
 # 本项目负载 (TTS ~64kbps + HTTP 小请求) 远低于 WiFi 极限, 减池无感。
 # 1.0.249: 动态 rx/tx 16→8 再回收 ~25KB — 目标是内部堆保持 >8KB 连续块,
 # esp_flash 读的 8KB 内部 DMA 缓冲可分配 (否则动画帧读 0x101 失败, 首帧卡)。
+# 静态 RX 保持 3: 每块 ~1.6KB 常驻内部 RAM, 加大会挤掉堆 → 门户任务栈 (需连续 4KB) 建不起来
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+# TX 32: 配网门户期手机处于省电态, 下行帧要 AP 代存 (省电缓冲 = TX 缓冲的一半);
+# 8 个 TX 只剩 4 个省电缓冲 → DNS 应答 sendto ENOMEM, 手机解析不了域名
 CONFIG_ESP_WIFI_TX_BUFFER_TYPE=DYNAMIC
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
 
 # LWIP — 12: 配网门户固定占用 5 (httpd 3 + softAP DHCP 1 + DNS 劫持 1) → 客户端 7 槽;
