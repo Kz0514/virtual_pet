@@ -138,23 +138,23 @@ static const char *CAPTIVE_HTML_TAIL =
     "<button type='submit'>连接 Wi-Fi</button>"
     "</form><p class='ok' id='ok'>✅ 已保存! 设备正在连接…</p>"
     "</div><script>"
-    "async function loadSaved{try{const r=await fetch('/list');const list=await r.json;"
+    "async function loadSaved(){try{const r=await fetch('/list');const list=await r.json();"
     "const d=document.getElementById('saved');"
     "d.innerHTML=list.map(n=>`<div class='net'><b>${n}</b><button onclick='del(\"${n}\")'>删除</button></div>`).join('')}"
     "catch(e){}}" /* 闭合 catch + loadSaved 函数体 — 缺此括号整段 JS 语法错误不执行 */
-    "async function del(ssid){await fetch('/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid})});loadSaved}"
-    "async function scan{try{const r=await fetch('/scan');const list=await r.json;"
+    "async function del(ssid){await fetch('/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid})});loadSaved()}"
+    "async function scan(){try{const r=await fetch('/scan');const list=await r.json();"
     "const s=document.getElementById('ssid_select');s.innerHTML=list.map(ssid=>`<option value='${ssid}'>${ssid}</option>`).join('');"
     "document.getElementById('ssid').style.display=(list.length?'none':'block')}"
     "catch(e){document.getElementById('ssid').style.display='block'}}"
-    "async function submitWifi(e){e.preventDefault;"
+    "async function submitWifi(e){e.preventDefault();"
     "const sel=document.getElementById('ssid_select');"
     "const ssid=sel.value||document.getElementById('ssid').value;"
     "const pwd=document.getElementById('pwd').value;"
     "await fetch('/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,pwd})});"
     "document.getElementById('f').style.display='none';document.getElementById('ok').style.display='block';"
     "return false}"
-    "scan;loadSaved;"
+    "scan();loadSaved();"
     "</script></body></html>";
 
 static char s_captive_html[4096]; /* softap_start 时拼装 (HEAD+TAIL≈3.3KB) */
