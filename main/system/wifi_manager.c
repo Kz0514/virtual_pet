@@ -575,9 +575,9 @@ static esp_err_t http_server_start(void)
     }
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
-    /* httpd_main.c 约束: max_open_sockets + 3 ≤ LWIP_MAX_SOCKETS, 否则 INVALID_ARG。
-     * 另需 softAP DHCP 与 DNS 劫持各 1 槽 → LWIP=12 时客户端可用 7 */
-    cfg.max_open_sockets = 5;
+    /* httpd_main.c 约束: max_open_sockets + 3 ≤ LWIP_MAX_SOCKETS (8+3 ≤ 12), 否则 INVALID_ARG。
+     * 另需 softAP DHCP 与 DNS 劫持各 1 槽 → 客户端实得 7 */
+    cfg.max_open_sockets = 8;
     esp_err_t err = httpd_start(&s_httpd, &cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start 失败: %s (errno=%d, port=%u)",
