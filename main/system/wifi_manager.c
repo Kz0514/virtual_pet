@@ -889,7 +889,7 @@ esp_err_t wifi_manager_init(void)
     ESP_ERROR_CHECK(esp_timer_create(&tcfg, &s_timeout_timer));
 
     /* WiFi 控制任务 (门户启动/关闭切换, 必须脱离事件回调与 httpd 上下文) */
-    xTaskCreate(wifi_ctrl_task, "wifi_ctrl", 4096, NULL, 5, &s_ctrl_task);
+    xTaskCreate(wifi_ctrl_task, "wifi_ctrl", 3072, NULL, 5, &s_ctrl_task);
 
     /* 加载网络列表 (JSON + 旧 NVS 迁移) */
     load_wifi_list();

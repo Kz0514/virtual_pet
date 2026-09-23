@@ -155,7 +155,7 @@ void noise_detector_init(void)
     memset(s_buckets, 0, sizeof(s_buckets));
     memset(s_bucket_t0, 0, sizeof(s_bucket_t0));
     /* 栈保持内部 RAM — 本任务写 noise.csv (flash 写期间 cache 冻结) */
-    xTaskCreate(noise_task, "noise", 8192, NULL, 1, NULL);
+    xTaskCreate(noise_task, "noise", 4096, NULL, 1, NULL);
     ESP_LOGI(TAG, "噪音检测器就绪 (级联%d层)", NOISE_WIN_COUNT);
 }
 

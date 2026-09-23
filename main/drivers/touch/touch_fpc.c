@@ -889,7 +889,7 @@ esp_err_t touch_fpc_init(void)
         ESP_LOGE(TAG, "创建探针互斥量失败");
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreate(probe_task_fn, "touch_prb", 4096, NULL, 6, &s_probe_task)
+    if (xTaskCreate(probe_task_fn, "touch_prb", 3072, NULL, 6, &s_probe_task)
         != pdPASS)
         ESP_LOGE(TAG, "创建探针任务失败");
 

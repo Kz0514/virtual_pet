@@ -112,7 +112,7 @@ typedef struct {
 } mem_write_item_t;
 
 #define MEM_WRITE_Q_LEN 4
-#define MEM_WRITE_STACK (6 * 1024)
+#define MEM_WRITE_STACK (3 * 1024)
 
 static QueueHandle_t s_write_q = NULL;
 
