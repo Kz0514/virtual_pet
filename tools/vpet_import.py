@@ -66,13 +66,67 @@ MS_MIN_HINT = 100         # 单数字文件名的判别阈值: >= 值视为时�
 
 LAYER_RE = re.compile(r'(front_lay|back_lay|front|back)$', re.I)
 
-# 默认 VPet 安装位置候选 (仅用于启动时预填)
-ROOT_CANDIDATES = [
-    r"I:\SteamLibrary\steamapps\common\VPet\mod\0000_core\pet\vup",
-    r"C:\Program Files (x86)\Steam\steamapps\common\VPet\mod\0000_core\pet\vup",
-    r"D:\SteamLibrary\steamapps\common\VPet\mod\0000_core\pet\vup",
-    r"E:\SteamLibrary\steamapps\common\VPet\mod\0000_core\pet\vup",
-]
+# VPet 的 GraphType 枚举 (值同 C# 的 GraphInfo.GraphType, 顺序即匹配优先级, 首个命中即止)
+GRAPH_TYPES = (
+    'Common', 'Raised_Dynamic', 'Raised_Static', 'Move', 'Default', 'Touch_Head',
+    'Touch_Body', 'Idel', 'Sleep', 'Say', 'StateONE', 'StateTWO', 'StartUP',
+    'Shutdown', 'Work', 'Switch_Up', 'Switch_Down', 'Switch_Thirsty',
+    'Switch_Hunger', 'SideHide_Left_Main', 'SideHide_Left_Rise',
+    'SideHide_Right_Main', 'SideHide_Right_Rise',
+)
+MODE_ORDER = ('Nomal', 'Happy', 'PoorCondition', 'Ill')
+_MODE_KW = (('happy', 'Happy'), ('nomal', 'Nomal'),
+            ('poorcondition', 'PoorCondition'), ('ill', 'Ill'))
+_ANIMAT_KW = ((('a', 'start'), 'A_Start'), (('b', 'loop'), 'B_Loop'),
+              (('c', 'end'), 'C_End'), (('single',), 'Single'))
+
+_CFG = os.path.join(os.path.expanduser('~'), '.vpet_import.json')
+
+
+def load_cfg():
+    try:
+        with open(_CFG, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cfg(**kv):
+    c = load_cfg()
+    c.update(kv)
+    try:
+        with open(_CFG, 'w', encoding='utf-8') as f:
+            json.dump(c, f)
+    except OSError:
+        pass
+
+
+def steam_vpet_roots():
+    """从 Steam 注册表 + libraryfolders.vdf 拼出 VPet 的 vup 路径候选。"""
+    import winreg
+    libs = []
+    for hive, sub in ((winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam'),
+                      (winreg.HKEY_LOCAL_MACHINE,
+                       r'SOFTWARE\WOW6432Node\Valve\Steam')):
+        for val in ('SteamPath', 'InstallPath'):
+            try:
+                with winreg.OpenKey(hive, sub) as k:
+                    libs.append(winreg.QueryValueEx(k, val)[0])
+            except OSError:
+                pass
+    out = []
+    for lib in libs:
+        roots = [lib]
+        try:
+            with open(os.path.join(lib, 'steamapps', 'libraryfolders.vdf'),
+                      encoding='utf-8', errors='replace') as f:
+                roots += re.findall(r'"path"\s+"([^"]+)"', f.read())
+        except OSError:
+            pass
+        for r in roots:
+            out.append(os.path.join(r.replace('\\\\', '\\'), 'steamapps', 'common',
+                                    'VPet', 'mod', '0000_core', 'pet', 'vup'))
+    return out
 
 
 # ══════════ 文件名解析 ══════════
@@ -136,6 +190,84 @@ def read_dir(root, rel):
     }
 
 
+# ══════════ VPet 路径解析 (复刻 GraphInfo) ══════════
+
+def _take(tokens, word):
+    """等价 List<string>.Remove: 删掉首个匹配项, 返回是否删到。"""
+    if word in tokens:
+        tokens.remove(word)
+        return True
+    return False
+
+
+def parse_graph_path(rel):
+    """相对 startuppath 的路径 → (GraphType, Name, Mode, AnimatType)。
+
+    关键词按 `_` 切词 (`/` 等价), 三段顺序任意、大小写不敏感; 名字取剥掉尾部
+    数字后剩下的最后一段。四步顺序必须照 VPet: 状态 → 类型 → 动作 → 名字。
+    """
+    tk = [t for t in rel.lower().replace('\\', '_').replace('/', '_').split('_') if t]
+
+    mode = 'Nomal'
+    for word, m in _MODE_KW:
+        if _take(tk, word):
+            mode = m
+            break
+
+    gtype = 'Common'
+    for gt in GRAPH_TYPES:
+        parts = gt.lower().split('_')
+        if parts[0] not in tk:
+            continue
+        at = tk.index(parts[0])
+        hit = True
+        for n in range(1, len(parts)):
+            if at + n >= len(tk):          # 越界不算失配 —— VPet 原实现如此
+                break
+            if tk[at + n] != parts[n]:
+                hit = False
+                break
+        if hit:
+            gtype = gt
+            del tk[at:at + len(parts)]
+            break
+
+    animat = 'Single'
+    for words, a in _ANIMAT_KW:
+        if any(_take(tk, w) for w in words):   # 短路: 删到就不再试同组的下一个
+            animat = a
+            break
+
+    while tk and (re.fullmatch(r'\d+(\.\d*)?', tk[-1]) or tk[-1].startswith('~')):
+        tk.pop()
+    return gtype, (tk[-1] if tk else gtype.lower()), mode, animat
+
+
+def build_groups(root):
+    """全树 → 动画组。一组 = 一个 (GraphType, Name); 心情是该组的变体维度。"""
+    acc = {}
+    for rel in find_leaves(root):
+        gt, name, mode, animat = parse_graph_path(rel)
+        acc.setdefault((gt, name), {}).setdefault(mode, {}).setdefault(animat, []).append(rel)
+
+    out = []
+    for (gt, name), moods in acc.items():
+        ms = []
+        for mode in sorted(moods, key=lambda m: (MODE_ORDER.index(m)
+                                                 if m in MODE_ORDER else 9, m)):
+            sec = {k: [{'rel': r, 'n': read_dir(root, r)['count']}
+                       for r in sorted(v)] for k, v in moods[mode].items()}
+            ms.append({'mode': mode, 'sections': sec,
+                       'dirs': sum(len(v) for v in sec.values()),
+                       'frames': sum(x['n'] for v in sec.values() for x in v)})
+        out.append({'key': f'{gt}/{name}', 'gt': gt, 'name': name, 'moods': ms,
+                    'mode': ms[0]['mode'],           # 默认心情: Nomal 优先
+                    'dirs': sum(m['dirs'] for m in ms),
+                    'frames': sum(m['frames'] for m in ms)})
+    out.sort(key=lambda g: (g['gt'], g['name']))
+    return out
+
+
 def scan_tree(root, max_frames_warn=45):
     """全树扫描 → 每个叶子目录的摘要 (不读像素)。"""
     rels = find_leaves(root)
@@ -183,19 +315,22 @@ def rgb565_bytes(img_rgb):
 
 
 def convert_one(path):
-    """源 PNG → (RGB565 bytes, 是否空帧)。
+    """源 PNG → (RGB565 bytes, 'ok'|'blank'|'bad')。
 
     合成黑底是必须的: 源图透明区带 (20,20,31) 底色, 直接 convert('RGB')
     会把它铺成可见背景, 角色抗锯齿边缘也会混到错的底色上。
     """
-    im = Image.open(path).convert('RGBA')
+    try:
+        im = Image.open(path).convert('RGBA')
+    except OSError:
+        return b'\x00' * FRAME_BYTES, 'bad'     # 源图截断/损坏, 别连累整个目录
     if im.getchannel('A').getextrema() == (0, 0):
-        return b'\x00' * FRAME_BYTES, True
+        return b'\x00' * FRAME_BYTES, 'blank'
     bg = Image.new('RGB', im.size, (0, 0, 0))
     bg.paste(im, (0, 0), im)
     if bg.size != (FW, FH):
         bg = bg.resize((FW, FH), Image.LANCZOS)
-    return rgb565_bytes(bg), False
+    return rgb565_bytes(bg), 'ok'
 
 
 def to_data_uri(rgb565):
@@ -215,67 +350,31 @@ def to_data_uri(rgb565):
     return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
 
 
-def find_cycle(keys):
-    """找能被折叠的最长连续周期段 → (start, period, repeats, saved) 或 None。
-
-    周期 p 的判据: keys[s+j] == keys[s + j % p] (j < p*k)。
-    p 必须 >= 2 —— p==1 是相邻重复, 归合并处理, 且 loop_back 只能是 0 等于没有。
-    """
-    n = len(keys)
-    best = None
-    for s in range(n):
-        for p in range(2, (n - s) // 2 + 1):
-            if any(keys[s + j] != keys[s + j - p] for j in range(p, 2 * p)):
-                continue
-            k = 2
-            while s + p * (k + 1) <= n and \
-                    all(keys[s + p * k + j] == keys[s + j] for j in range(p)):
-                k += 1
-            saved = p * (k - 1)
-            if best is None or saved > best[3] or \
-                    (saved == best[3] and p < best[1]):
-                best = (s, p, k, saved)
-    return best
-
-
 def build_plan(frames, keys):
-    """→ {'grp': {帧号: 组首帧号}, 'fold': 折叠描述|None}。
+    """→ {'grp': {帧号: 相邻同像素组的组首}, 'dup': {帧号: 首次出现的同像素帧}}。
 
-    先合并后折叠: 合并把各遍循环的内部抖动归一, 周期才检测得出来。
+    相邻同像素并入一组 (时长归组首); 非相邻的同像素帧也不导, 但时长不并到首次那张上
+    —— 挪动它会改节奏, 这是为省 flash 主动接受的损失。
     """
-    grp = {}
-    reps = []
-    cur = None
+    grp, dup, first, cur = {}, {}, {}, None
     for i, f in enumerate(frames):
-        if f['blank']:
+        if f['blank'] or f['bad']:
             continue
         if cur is not None and keys[i] == keys[cur]:
             grp[i] = grp[cur]
+            continue
+        grp[i] = i
+        cur = i
+        if keys[i] in first:
+            dup[i] = first[keys[i]]
         else:
-            grp[i] = i
-            reps.append(i)
-            cur = i
+            first[keys[i]] = i
+    return {'grp': grp, 'dup': dup}
 
-    cyc = find_cycle([keys[i] for i in reps])
-    fold = None
-    if cyc:
-        s, p, k, saved = cyc
-        members = [reps[s + j] for j in range(p)]
-        drop = [reps[s + j] for j in range(p, p * k)]
-        # 各遍时长不一致时折叠会把差异抹平 —— 报出来, 别让它静默发生
-        drift = []
-        for j in range(p):
-            ms = sorted({frames[members[j]]['ms']} |
-                        {frames[drop[t]]['ms'] for t in range(j, len(drop), p)})
-            if len(ms) > 1:
-                drift.append({'pos': j, 'ms': ms})
-        fold = {
-            'period': p, 'repeats': k, 'saved': saved,
-            'members': members, 'drop': drop, 'drift': drift,
-            'anchor': members[-1],           # 这一帧挂 loop_back
-            'loop_back': p - 1,
-        }
-    return {'grp': grp, 'fold': fold}
+
+def is_loop_rel(rel):
+    """B 段是循环体 —— 导出时整段挂 loop_back, 圈数交给固件。"""
+    return parse_graph_path(rel)[3] == 'B_Loop'
 
 
 def analyze_frames(root, rel, want_uris=True):
@@ -285,41 +384,30 @@ def analyze_frames(root, rel, want_uris=True):
     seen = {}          # 像素摘要 -> 首次出现的帧序号
     raw = []
     for i, t in enumerate(info['frames']):
-        blob, blank = convert_one(os.path.join(d, t['file']))
+        blob, st = convert_one(os.path.join(d, t['file']))
         key = hashlib.blake2b(blob, digest_size=16).digest()
-        dup_of = None
-        if not blank:
-            if key in seen:
-                dup_of = seen[key]
-            else:
-                seen[key] = i
+        if st == 'ok' and key not in seen:
+            seen[key] = i
         raw.append({
             'i': i, 'file': t['file'], 'ms': t['ms'] or DEFAULT_MS,
             'ms_from_name': t['ms'] is not None,
             'idx': t['idx'], 'note': t['note'],
-            'blank': blank, 'dup_of': dup_of,
+            'blank': st == 'blank', 'bad': st == 'bad',
             '_blob': blob, '_key': key,
         })
 
     plan = build_plan(raw, [r['_key'] for r in raw])
-    fold = plan['fold']
-    grp = plan['grp']
-    dropped = set(fold['drop']) if fold else set()
-    # 折叠段里被丢的第 j 个重复, 对应保留的周期内第 j 个成员 —— UI 靠它显示"折到哪去了"
-    fold_to = {}
-    if fold:
-        for n, i in enumerate(fold['drop']):
-            fold_to[i] = fold['members'][n % fold['period']]
+    grp, dup = plan['grp'], plan['dup']
 
     frames = []
     for r in raw:
         blob, key = r.pop('_blob'), r.pop('_key')
-        if r['blank']:
-            r['plan'], r['ref'] = 'blank', None
-        elif r['i'] in dropped:
-            r['plan'], r['ref'] = 'fold', fold_to[r['i']]
+        if r['blank'] or r['bad']:
+            r['plan'], r['ref'] = ('bad' if r['bad'] else 'blank'), None
         elif grp.get(r['i']) != r['i']:
             r['plan'], r['ref'] = 'merge', grp[r['i']]
+        elif r['i'] in dup:
+            r['plan'], r['ref'] = 'dup', dup[r['i']]
         else:
             r['plan'], r['ref'] = 'keep', None
         # 合并组首帧要替整组承担时长
@@ -333,20 +421,22 @@ def analyze_frames(root, rel, want_uris=True):
     return {'rel': rel, 'count': len(frames), 'frames': frames,
             'contiguous': info['contiguous'], 'layered': info['layered'],
             'no_ms': info['no_ms'], 'no_idx': info['no_idx'],
-            'unique': len(seen), 'fold': fold,
+            'unique': len(seen), 'animat': parse_graph_path(rel)[3],
+            'bad': sum(1 for f in frames if f['plan'] == 'bad'),
             'kept': sum(1 for f in frames if f['keep'])}
 
 
 # ══════════ 导出 ══════════
 
-def build_seq(plan, keep_idx):
+def build_seq(plan, keep_idx, loop=False):
     """勾选集 → 播放序列 [{i, grp, ms, lb}]。
 
-    合并组的时长合计压在组首帧上; 折叠段只在周期仍完整保留时才在周期末帧挂
-    loop_back (用户从周期里删了帧就不挂, 否则会循环到错的帧上)。
+    合并组的时长合计压在组首帧上。loop 时在末帧挂 loop_back = 序列长度-1, 让固件
+    把整段当循环体重复播放 (圈数看 s_play_loops); 只剩 1 帧就挂不上, 当线性播。
     """
     by_i = {f['i']: f for f in plan['frames']}
-    kept = [i for i in keep_idx if i in by_i and by_i[i]['plan'] != 'blank']
+    kept = [i for i in keep_idx
+            if i in by_i and by_i[i]['plan'] not in ('blank', 'bad')]
     ks = set(kept)
     # 组首帧 (= grp 指向自己) 恒留下; 组成员只在组首没被保留时才自己出面
     use = [i for i in kept
@@ -361,16 +451,8 @@ def build_seq(plan, keep_idx):
         else:
             seq.append({'i': i, 'grp': f['grp'], 'ms': ms, 'lb': 0})
 
-    # 周期仍完整保留、且重复帧没被恢复时才挂 loop_back —— 恢复了重复帧就是要
-    # 线性播放, 挂上去既会多播一遍循环, 又会把整组从"播 3 遍"变成"播 1 遍"
-    fold = plan['fold']
-    if fold and not any(i in ks for i in fold['drop']):
-        have = {e['i'] for e in seq} | {e['grp'] for e in seq}
-        if all(m in have for m in fold['members']):
-            for e in seq:
-                if e['i'] == fold['anchor'] or e['grp'] == fold['anchor']:
-                    e['lb'] = fold['loop_back']
-                    break
+    if loop and len(seq) > 1:
+        seq[-1]['lb'] = len(seq) - 1
     return seq
 
 
@@ -387,68 +469,32 @@ def seq_entry(prefix, seq):
     }
 
 
-def export_bins(root, rel, prefix, keep_idx, out_dir, plan=None):
-    """按勾选的帧导出 <prefix>_NN.bin, 返回 (写入清单, anim_meta 条目草稿)。"""
-    plan = plan or analyze_frames(root, rel, want_uris=False)
-    by_i = {f['i']: f for f in plan['frames']}
-    d = os.path.join(root, rel.replace('/', os.sep))
-    os.makedirs(out_dir, exist_ok=True)
+def export_sections(root, sections, prefix, out_dir):
+    """多目录合成一条序列 → (写入清单, anim_meta 条目草稿)。
 
+    sections: [{'rel':..., 'keep':[...], 'plan':分析结果|None}, ...], 调用方按
+    A→B→C 排好; 单段就是普通的独立动画。每段各自去重 (loop_back 只落在自己段内,
+    见 is_loop_rel), 段间不合并同像素帧 —— 否则边界时长会被吃掉。
+    """
+    os.makedirs(out_dir, exist_ok=True)
     written, live = [], []
-    for e in build_seq(plan, keep_idx):
-        blob, blank = convert_one(os.path.join(d, by_i[e['i']]['file']))
-        if blank:
-            continue
-        name = f'{prefix}_{len(written):02d}.bin'
-        with open(os.path.join(out_dir, name), 'wb') as fh:
-            fh.write(blob)
-        written.append(name)
-        live.append(e)
+    for s in sections:
+        plan = s.get('plan') or analyze_frames(root, s['rel'], want_uris=False)
+        by_i = {f['i']: f for f in plan['frames']}
+        d = os.path.join(root, s['rel'].replace('/', os.sep))
+        for e in build_seq(plan, s.get('keep') or [], is_loop_rel(s['rel'])):
+            blob, st = convert_one(os.path.join(d, by_i[e['i']]['file']))
+            if st != 'ok':
+                continue
+            name = f'{prefix}_{len(written):02d}.bin'
+            with open(os.path.join(out_dir, name), 'wb') as fh:
+                fh.write(blob)
+            written.append(name)
+            live.append(e)
     return written, seq_entry(prefix, live)
 
 
 # ══════════ Win32 对话框 ══════════
-
-def _win32_dialog(kind, title, init_dir, default_name=''):
-    """kind: 'open' | 'save'。返回路径或 None。"""
-    import ctypes
-    from ctypes import wintypes
-
-    class OPENFILENAMEW(ctypes.Structure):
-        _fields_ = [
-            ('lStructSize', wintypes.DWORD), ('hwndOwner', wintypes.HWND),
-            ('hInstance', wintypes.HINSTANCE), ('lpstrFilter', wintypes.LPCWSTR),
-            ('lpstrCustomFilter', wintypes.LPWSTR), ('nMaxCustFilter', wintypes.DWORD),
-            ('nFilterIndex', wintypes.DWORD), ('lpstrFile', wintypes.LPWSTR),
-            ('nMaxFile', wintypes.DWORD), ('lpstrFileTitle', wintypes.LPWSTR),
-            ('nMaxFileTitle', wintypes.DWORD), ('lpstrInitialDir', wintypes.LPCWSTR),
-            ('lpstrTitle', wintypes.LPCWSTR), ('Flags', wintypes.DWORD),
-            ('nFileOffset', wintypes.WORD), ('nFileExtension', wintypes.WORD),
-            ('lpstrDefExt', wintypes.LPCWSTR), ('lCustData', wintypes.LPARAM),
-            ('lpfnHook', ctypes.c_void_p), ('lpTemplateName', wintypes.LPCWSTR),
-        ]
-
-    buf = ctypes.create_unicode_buffer(1024)
-    if default_name:
-        buf.value = default_name
-    ofn = OPENFILENAMEW()
-    ofn.lStructSize = ctypes.sizeof(ofn)
-    ofn.lpstrFilter = 'PNG (*.png)\0*.png\0All\0*.*\0' if kind == 'open' \
-        else 'All\0*.*\0'
-    ofn.lpstrFile = buf
-    ofn.nMaxFile = 1024
-    ofn.lpstrInitialDir = init_dir or None
-    ofn.lpstrTitle = title
-    ofn.lpstrDefExt = 'png' if kind == 'open' else None
-    # 打开目录用 FOLDER 专用 DWORD; 这里简化为文件选择, 目录选择走下面单独函数
-    ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800  # PREVENTOVERWRITE|NOCHANGEDIR|PATHMUSTEXIST
-
-    fn = ctypes.windll.comdlg32.GetOpenFileNameW if kind == 'open' \
-        else ctypes.windll.comdlg32.GetSaveFileNameW
-    if not fn(ctypes.byref(ofn)):
-        return None
-    return buf.value
-
 
 def win32_pick_dir(title):
     """选择目录 (SHBrowseForFolderW)。"""
@@ -482,16 +528,16 @@ class Api:
         self.project_home = os.path.abspath(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
         self.root = None
-        self.plan = None
+        self.plans = {}        # rel -> analyze_frames 结果 (含帧 URI), 换段不重转
 
     def default_root(self):
-        for p in ROOT_CANDIDATES:
-            if os.path.isdir(p):
+        saved = load_cfg().get('root')
+        for p in [saved] + steam_vpet_roots():
+            if p and os.path.isdir(p) and find_leaves(p):
                 return p
         return ''
 
     def pick_root(self):
-        init = self.root or self.default_root()
         p = win32_pick_dir('选择 VPet 的 pet 目录 (含 vup/ 的那一层)')
         if not p:
             return {'ok': False, 'error': '已取消'}
@@ -499,9 +545,9 @@ class Api:
         for cand in (p, os.path.join(p, 'vup')):
             if os.path.isdir(cand) and find_leaves(cand):
                 self.root = cand
+                save_cfg(root=cand)
                 try:
-                    return {'ok': True, 'root': cand,
-                            'info': scan_tree(cand)}
+                    return {'ok': True, 'root': cand, 'info': scan_tree(cand)}
                 except OSError as e:
                     return {'ok': False, 'error': str(e)}
         return {'ok': False, 'error': f'{p} 下没找到含 PNG 的动作目录'}
@@ -511,8 +557,18 @@ class Api:
         if not root or not os.path.isdir(root):
             return {'ok': False, 'error': 'VPet 目录无效'}
         self.root = root
+        save_cfg(root=root)
         try:
             return {'ok': True, 'scan': scan_tree(root)}
+        except OSError as e:
+            return {'ok': False, 'error': str(e)}
+
+    def groups(self):
+        """全库 → 动画组 (组 = GraphType+Name; 心情/段/变体是组内层次)。"""
+        if not self.root:
+            return {'ok': False, 'error': '尚未选择 VPet 目录'}
+        try:
+            return {'ok': True, 'groups': build_groups(self.root)}
         except OSError as e:
             return {'ok': False, 'error': str(e)}
 
@@ -520,31 +576,48 @@ class Api:
         if not self.root:
             return {'ok': False, 'error': '尚未选择 VPet 目录'}
         try:
-            self.plan = analyze_frames(self.root, rel)
+            self.plans[rel] = analyze_frames(self.root, rel)
         except OSError as e:
             return {'ok': False, 'error': str(e)}
-        return {'ok': True, 'dir': self.plan}
+        return {'ok': True, 'dir': self.plans[rel]}
 
-    def seq(self, rel, prefix, keep_idx):
-        """勾选集 → 播放序列 + 条目草稿 (不落盘)。前端每次改勾选都调它。"""
-        if not self.plan or self.plan['rel'] != rel:
-            r = self.load_dir(rel)
-            if not r['ok']:
-                return r
-        s = build_seq(self.plan, keep_idx or [])
-        return {'ok': True, 'seq': s, 'entry': seq_entry(prefix or 'x', s)}
+    def _plan(self, rel):
+        """已装载就用缓存 —— 一个目录转换要几百毫秒起, 预览每次改勾选都得复用。"""
+        if rel not in self.plans:
+            self.plans[rel] = analyze_frames(self.root, rel, want_uris=False)
+        return self.plans[rel]
 
-    def export(self, rel, prefix, keep_idx):
+    def seq_group(self, sections, prefix):
+        """合成预览。sections: [{'rel', 'keep'}...], 按 A→B→C 排好。"""
+        if not self.root:
+            return {'ok': False, 'error': '尚未选择 VPet 目录'}
+        out = []
+        try:
+            for n, s in enumerate(sections or []):
+                if not s.get('rel'):
+                    continue
+                seq = build_seq(self._plan(s['rel']), s.get('keep') or [],
+                                is_loop_rel(s['rel']))
+                out += [dict(e, s=n) for e in seq]
+        except OSError as e:
+            return {'ok': False, 'error': str(e)}
+        return {'ok': True, 'seq': out, 'n': len(out),
+                'entry': seq_entry(prefix or 'x', out)}
+
+    def export_group(self, sections, prefix):
+        """多段合成一条动画。sections: [{'rel', 'keep'}...], 按 A→B→C 排好。"""
         if not self.root:
             return {'ok': False, 'error': '尚未选择 VPet 目录'}
         prefix = re.sub(r'[^A-Za-z0-9_]', '', prefix or '')
         if not prefix:
             return {'ok': False, 'error': '前缀不能为空 (仅字母数字下划线)'}
+        secs = [dict(s, plan=self.plans.get(s['rel']))
+                for s in (sections or []) if s.get('rel')]
+        if not secs:
+            return {'ok': False, 'error': '没有选中的段'}
         out_dir = os.path.join(self.project_home, 'assets', 'anim_bin')
-        plan = self.plan if self.plan and self.plan['rel'] == rel else None
         try:
-            written, entry = export_bins(self.root, rel, prefix, keep_idx,
-                                         out_dir, plan)
+            written, entry = export_sections(self.root, secs, prefix, out_dir)
         except OSError as e:
             return {'ok': False, 'error': str(e)}
         if not written:
