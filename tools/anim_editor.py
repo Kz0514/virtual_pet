@@ -18,6 +18,7 @@ gen_anim_bin 语义 (格式对齐见该文件头注释 v3 节)。
 """
 import base64
 import ctypes
+import hashlib
 import io
 import json
 import os
@@ -295,28 +296,56 @@ class Api:
         return {"ok": True, "meta": meta, "frames": frames,
                 "info": {"path": path, "total": len(pack.tab)}}
 
+    def _uris_cache_path(self, pack_path):
+        """帧图 URI 缓存的落盘位置 —— 必须放在 assets_fs/ 之外。
+
+        assets_fs/ 会被 main/CMakeLists.txt 的 littlefs_create_partition_image()
+        整个目录打包进 assets 分区, 缓存文件混进去会让本机构建的 assets.bin
+        与他人 clone 后构建的结果不一致 (差 ~4.5MB), 而设备端根本不读它。
+        统一放 <项目>/tmp/ (已 gitignore, 不进镜像); 文件名带绝对路径哈希,
+        避免 assets_fs/anims.bin 与 simulator/spiffs/anims.bin 互相覆盖。
+        """
+        ap = os.path.abspath(pack_path)
+        tag = hashlib.sha1(ap.encode("utf-8")).hexdigest()[:8]
+        root = self.project_home
+        if not os.path.isdir(os.path.join(root, "assets_fs")):
+            # 打包成 exe 运行时 project_home 指向 _MEIPASS, 不可靠 → 用系统缓存目录
+            root = os.path.join(os.environ.get("LOCALAPPDATA")
+                                or os.path.expanduser("~"), "Virtualpet")
+        return os.path.join(root, "tmp",
+                            f"{os.path.basename(ap)}.{tag}.uris.json")
+
     def _frame_uris_cached(self, pack, path, anims):
-        cache_p = path + ".uris.json"
         try:
             st = os.stat(path)
             key = (st.st_mtime_ns, st.st_size)
-            with open(cache_p, "r", encoding="utf-8") as f:
-                c = json.load(f)
-            if c.get("size") == key[1] and c.get("mtime") == key[0]:
-                return c["uris"]
-        except (OSError, ValueError, KeyError):
-            pass
+        except OSError:
+            key = None
+        try:
+            cache_p = self._uris_cache_path(path)
+            os.makedirs(os.path.dirname(cache_p), exist_ok=True)
+        except OSError:
+            cache_p = None
+        if cache_p and key:
+            try:
+                with open(cache_p, "r", encoding="utf-8") as f:
+                    c = json.load(f)
+                if c.get("size") == key[1] and c.get("mtime") == key[0]:
+                    return c["uris"]
+            except (OSError, ValueError, KeyError):
+                pass
         uris = {}
         for a in anims:
             for idx in range(a["count"]):
                 uri = pack.frame_datauri(a["id"], idx)
                 if uri:
                     uris[f"{a['id']}:{idx}"] = uri
-        try:
-            with open(cache_p, "w", encoding="utf-8") as f:
-                json.dump({"size": key[1], "mtime": key[0], "uris": uris}, f)
-        except OSError:
-            pass
+        if cache_p and key:
+            try:
+                with open(cache_p, "w", encoding="utf-8") as f:
+                    json.dump({"size": key[1], "mtime": key[0], "uris": uris}, f)
+            except OSError:
+                pass
         return uris
 
     # ── 保存 ──

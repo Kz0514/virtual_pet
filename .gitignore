@@ -156,7 +156,8 @@ Desktop.ini
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
 
-# anim_editor 帧图 URI 缓存 (sidecar 靠近 anims.bin, 不入库)
+# anim_editor 帧图 URI 缓存 (写到 tmp/, 不落 assets_fs/ — 见 anim_editor.py
+# _uris_cache_path 的说明: assets_fs/ 会被整体打包进固件镜像)
 *.uris.json
 
 # PyInstaller 构建产物 (便利文件, 不入库)
