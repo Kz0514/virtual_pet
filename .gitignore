@@ -73,8 +73,15 @@ build/
 /docs/
 # vendored lvgl: 只入库编译必需 (src + env_support/cmake), 其余本地保留不入库
 components/lvgl/tests/
-components/lvgl/demos/
-components/lvgl/examples/
+# demos/ 与 examples/ 必须让目录存在: lvgl 的 env_support/cmake/esp.cmake 会把
+# 它们注册为 INCLUDE_DIRS (第 69-70 行), 目录不存在 CMake 直接报错。
+# 又因 CONFIG_LV_BUILD_DEMOS=y 会直接编译 demos/lv_demos.c, 该文件也必须入库。
+# 注意: 不能写成 "components/lvgl/demos/" —— 整个目录被排除后, 下面的 ! 取反不生效。
+components/lvgl/demos/*
+!components/lvgl/demos/lv_demos.c
+!components/lvgl/demos/lv_demos.h
+components/lvgl/examples/*
+!components/lvgl/examples/.gitkeep
 components/lvgl/docs/
 components/lvgl/scripts/
 components/lvgl/configs/
