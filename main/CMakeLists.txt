@@ -1,7 +1,6 @@
 idf_component_register(
     SRCS
         "main.c"
-        "lvgl_mem.c"
         # System
         "system/boot_init.c"
         "system/gpio_utils.c"
@@ -38,7 +37,6 @@ idf_component_register(
         "app/tap_detector.c"
         "app/pat_detector.c"
         "app/face_mapper.c"
-        "app/animation_mgr.c"
         "app/input_handler.c"
         "app/home_interaction.c"
         "app/sensor_fusion.c"
@@ -47,7 +45,6 @@ idf_component_register(
         "app/diary_sync.c"
         "drivers/storage/usb_storage.c"
         "system/config_mgr.c"
-        "app/event_bus.c"
         "app/message_handler.c"
         # Network
         "network/http_util.c"
@@ -94,7 +91,6 @@ idf_component_register(
         "app"
         "network"
         "ai"
-        "../assets/animation/zhanli"
         "ui/fonts"
         "ui/screens"
         "ui/widgets"
